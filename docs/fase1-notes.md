@@ -57,7 +57,9 @@ de pruebas más elaborado.
 
 - Buffer de línea de tamaño fijo en stack (128 bytes) — no hay heap
   todavía (Fase 2).
-- Solo ASCII: caracteres no-ASCII se ignoran silenciosamente.
+- Solo ASCII imprimible (más espacio): caracteres no-ASCII y caracteres de
+  control ASCII (como Tab, 0x09) se ignoran silenciosamente en vez de
+  insertarse en el buffer o ecoarse como glifo.
 - `ConsoleKey::Unknown` (flechas, teclas de función) se ignora en la
   shell — no hay historial de comandos ni edición más allá de backspace.
 - El reporte de mapa de memoria es puramente informativo (cuenta de

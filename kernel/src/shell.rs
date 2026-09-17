@@ -37,9 +37,12 @@ fn read_line<'a>(console: &mut dyn Console, buf: &'a mut [u8; LINE_MAX]) -> &'a 
                 }
             }
             Some(ConsoleKey::Char(c)) => {
-                // Fase 1 simplification: ASCII only, silently dropped once
-                // the fixed buffer is full.
-                if c.is_ascii() && len < buf.len() {
+                // Fase 1 simplification: printable ASCII (plus space) only,
+                // silently dropped once the fixed buffer is full. Excludes
+                // C0 control characters (e.g. Tab, 0x09) — those are ASCII
+                // too, but aren't meant to become part of a command line or
+                // be echoed as a glyph.
+                if (c.is_ascii_graphic() || c == ' ') && len < buf.len() {
                     buf[len] = c as u8;
                     len += 1;
                     console.write_str(core::str::from_utf8(&buf[len - 1..len]).unwrap_or(""));
@@ -219,5 +222,19 @@ mod tests {
         let mut buf = [0u8; LINE_MAX];
         let line = read_line(&mut console, &mut buf);
         assert_eq!(line, "a");
+    }
+
+    #[test]
+    fn read_line_drops_control_characters_but_keeps_space() {
+        let mut console = FakeConsole::from_str("");
+        console.keys.push_back(ConsoleKey::Char('h'));
+        console.keys.push_back(ConsoleKey::Char('i'));
+        console.keys.push_back(ConsoleKey::Char('\t')); // dropped: control char
+        console.keys.push_back(ConsoleKey::Char(' ')); // kept: printable space
+        console.keys.push_back(ConsoleKey::Char('!'));
+        console.keys.push_back(ConsoleKey::Enter);
+        let mut buf = [0u8; LINE_MAX];
+        let line = read_line(&mut console, &mut buf);
+        assert_eq!(line, "hi !");
     }
 }
