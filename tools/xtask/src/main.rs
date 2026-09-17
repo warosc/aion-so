@@ -14,10 +14,11 @@ use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// Must match `aion_kernel::BOOT_OK_MARKER` (kernel/src/lib.rs). Not shared
-/// via a dependency edge because xtask is host tooling, not part of the
-/// freestanding boot chain.
-const DEFAULT_MARKER: &str = "AION-PHASE0-BOOT-OK";
+/// Must match `kernel::shell::SHELL_READY_MARKER` (kernel/src/shell.rs).
+/// Not shared via a dependency edge because xtask is host tooling, not part
+/// of the freestanding boot chain. Override with `--marker` to check the
+/// older Fase 0 checkpoint (`AION-PHASE0-BOOT-OK`) instead.
+const DEFAULT_MARKER: &str = "AION-PHASE1-SHELL-READY";
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "AION OS build/run/test automation")]
@@ -48,6 +49,10 @@ enum XtaskCommand {
         timeout_secs: u64,
         #[arg(long, default_value = DEFAULT_MARKER)]
         marker: String,
+        /// Repeat the boot this many times, failing on the first attempt
+        /// that doesn't reach the marker in time.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
 }
 
@@ -64,7 +69,8 @@ fn main() -> Result<()> {
         XtaskCommand::BootTest {
             timeout_secs,
             marker,
-        } => boot_test(&root, Duration::from_secs(timeout_secs), &marker),
+            repeat,
+        } => boot_test(&root, Duration::from_secs(timeout_secs), &marker, repeat),
     }
 }
 
@@ -125,7 +131,10 @@ fn assemble_esp(root: &Path) -> Result<()> {
 }
 
 fn test(root: &Path) -> Result<()> {
-    run_cargo(root, &["test", "-p", "aion-hal", "-p", "xtask"])
+    run_cargo(
+        root,
+        &["test", "-p", "aion-hal", "-p", "aion-kernel", "-p", "xtask"],
+    )
 }
 
 fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
@@ -140,6 +149,8 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "clippy",
             "-p",
             "aion-hal",
+            "-p",
+            "aion-kernel",
             "-p",
             "xtask",
             "--all-targets",
@@ -316,8 +327,17 @@ fn debug(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn boot_test(root: &Path, timeout: Duration, marker: &str) -> Result<()> {
+fn boot_test(root: &Path, timeout: Duration, marker: &str, repeat: u32) -> Result<()> {
     build(root)?;
+    for attempt in 1..=repeat {
+        boot_test_once(root, timeout, marker)
+            .with_context(|| format!("boot-test attempt {attempt}/{repeat} failed"))?;
+    }
+    println!("boot-test: {repeat}/{repeat} consecutive successful boots (marker {marker:?})");
+    Ok(())
+}
+
+fn boot_test_once(root: &Path, timeout: Duration, marker: &str) -> Result<()> {
     let mut cfg = prepare_qemu_config(root, true, false)?;
     let log_path = root.join("target").join("boot-test.log");
     let stderr_path = root.join("target").join("boot-test-qemu-stderr.log");
