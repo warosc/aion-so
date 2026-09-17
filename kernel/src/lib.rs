@@ -1,29 +1,36 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-use aion_hal::CpuControl;
+mod shell;
+
+use aion_hal::{Console, PowerControl};
 
 /// Grepped by `cargo xtask boot-test` in the QEMU debugcon capture.
 /// Keep in sync with tools/xtask's default `--marker` value.
 pub const BOOT_OK_MARKER: &str = "AION-PHASE0-BOOT-OK";
 
-/// Placeholder boot handoff payload. Fase 1 replaces this with the real
-/// contract (memory map, framebuffer, RSDP...) — that shape change is the
-/// "sustitución del boot path" ADR trigger per ARCHITECTURE.md.
+#[cfg(target_arch = "x86_64")]
+pub const ARCH_NAME: &str = "x86_64";
+#[cfg(not(target_arch = "x86_64"))]
+pub const ARCH_NAME: &str = "unknown";
+
+/// Placeholder boot handoff payload. Fase 1 still doesn't call
+/// `ExitBootServices` or load a separate kernel image, so this stays
+/// empty; see docs/adr/0001-fase0-boot-path.md and docs/fase1-notes.md.
 #[derive(Default)]
 pub struct BootInfo {
     _private: (),
 }
 
-pub fn kmain(_boot_info: &BootInfo) -> ! {
-    log::info!("{}", BOOT_OK_MARKER);
+pub fn kmain(_boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerControl) -> ! {
+    log::info!("{BOOT_OK_MARKER}");
+    log::info!("AION: architecture = {ARCH_NAME}");
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        aion_arch_x86_64::Cpu.halt_loop()
-    }
+    console.write_str(concat!("AION OS v", env!("CARGO_PKG_VERSION"), "\n"));
+    console.write_str("Boot............ UEFI OK\n");
+    console.write_str("Architecture.... ");
+    console.write_str(ARCH_NAME);
+    console.write_str("\n");
+    console.write_str("Kernel.......... READY\n\n");
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        loop {}
-    }
+    shell::run_shell(console, power)
 }
