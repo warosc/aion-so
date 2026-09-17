@@ -18,4 +18,13 @@ impl CpuControl for Cpu {
             }
         }
     }
+
+    fn halt_once(&self) {
+        // SAFETY: same reasoning as `halt_loop` above, minus the loop: a
+        // single `hlt` parks the core until the next interrupt (e.g. the
+        // firmware timer) and then returns control here normally.
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
+    }
 }
