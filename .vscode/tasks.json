@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "AION: Build",
+      "type": "shell",
+      "command": "cargo xtask build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "AION: Run QEMU",
+      "type": "shell",
+      "command": "cargo xtask run",
+      "dependsOn": ["AION: Build"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AION: Test",
+      "type": "shell",
+      "command": "cargo xtask test",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "AION: Format + Lint",
+      "type": "shell",
+      "command": "cargo xtask fmt-lint",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "AION: Debug QEMU",
+      "type": "shell",
+      "command": "cargo xtask debug",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^never matches$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "gdbstub listening"
+        }
+      }
+    }
+  ]
+}

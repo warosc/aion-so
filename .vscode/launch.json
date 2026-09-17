@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "AION: Attach to QEMU (LLDB gdbstub)",
+      "type": "lldb",
+      "request": "custom",
+      "targetCreateCommands": [
+        "target create ${workspaceFolder}/target/x86_64-unknown-uefi/debug/aion-boot.efi"
+      ],
+      "processCreateCommands": ["gdb-remote localhost:1234"],
+      "preLaunchTask": "AION: Debug QEMU"
+    }
+  ]
+}

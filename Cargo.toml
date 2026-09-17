@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["boot", "kernel", "hal", "arch/x86_64", "tools/xtask"]
+default-members = ["tools/xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"

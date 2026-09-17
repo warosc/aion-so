@@ -1,0 +1,8 @@
+[package]
+name = "aion-arch-x86_64"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+aion-hal = { path = "../../hal" }
