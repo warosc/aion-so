@@ -1,0 +1,12 @@
+[package]
+name = "aion-kernel"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+aion-hal = { path = "../hal" }
+log = "0.4"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+aion-arch-x86_64 = { path = "../arch/x86_64" }

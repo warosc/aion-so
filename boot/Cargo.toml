@@ -1,0 +1,10 @@
+[package]
+name = "aion-boot"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+log = "0.4"
+aion-kernel = { path = "../kernel" }
+uefi = { version = "0.40.0", features = ["panic_handler", "logger", "log-debugcon"] }
