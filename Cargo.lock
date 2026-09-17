@@ -13,6 +13,8 @@ dependencies = [
 name = "aion-boot"
 version = "0.0.1"
 dependencies = [
+ "aion-arch-x86_64",
+ "aion-hal",
  "aion-kernel",
  "log",
  "uefi",
