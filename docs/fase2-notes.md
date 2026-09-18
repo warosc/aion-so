@@ -1,5 +1,65 @@
 # Notas de implementación — Fase 2
 
+## Incremento 3 — Remapeo de PIC + temporizador PIT
+
+### No se necesitó ADR
+
+No cambia el boot path ni `BootInfo`: es configuración de hardware (PIC,
+PIT) y una entrada nueva en el IDT.
+
+### Qué hace
+
+- `arch/x86_64/src/pic.rs`: `remap()` ejecuta la secuencia ICW1-4
+  (IRQ0-7 → vectores 0x20-0x27, IRQ8-15 → 0x28-0x2F, fuera del rango de
+  excepciones 0-31) y deja desenmascarado únicamente IRQ0; `send_eoi()`.
+- `arch/x86_64/src/pit.rs`: canal 0, modo 3, **100 Hz** (divisor 11931).
+- `arch/x86_64/src/interrupts.rs`: vector `0x20` con manejador real
+  (`timer_stub` → `common_trampoline`) que incrementa un `AtomicU64`
+  (`Relaxed`, único escritor), envía EOI y registra `AION: ticks=N` cada
+  100 ticks. `init_timer()` instala el vector, remapea el PIC, programa el
+  PIT y por fin ejecuta `sti`.
+- `hal::TickCounter` (solo lectura); `Cpu` lo implementa.
+
+Se eligió PIC/PIT y no APIC porque APIC requiere descubrimiento de
+hardware (ACPI/MADT o MSR+MMIO), territorio de Fase 4/5.
+
+### Hallazgo retroactivo: los Incrementos 1 y 2 dejaban la shell colgada
+
+Este incremento cierra un problema real que las pruebas automatizadas de
+los dos anteriores no podían ver. `interrupts::init()` (Incremento 1)
+ejecuta `cli` y nunca vuelve a ejecutar `sti`; el Incremento 2 además
+enmascara ambos PIC. Con IF=0 y todo enmascarado, el `hlt` de
+`idle_once()` (que la shell ejecuta en cuanto `read_key()` devuelve `None`,
+o sea siempre) solo despierta con una NMI o un reset: la shell imprimía su
+prompt y quedaba parada para siempre. `cargo xtask boot-test` no lo
+detectaba porque termina QEMU en cuanto ve el marcador de la shell, que se
+loguea *antes* de entrar al bucle. En uso interactivo (`cargo xtask run`)
+habría sido visible de inmediato.
+
+El estado corregido se verificó empíricamente: con el timer vivo, los
+ticks avanzan de forma sostenida y regular (`ticks=100` … `ticks=500`,
+≈1 s por cada 100) mientras la shell está inactiva en `hlt` — es decir,
+`hlt` vuelve a despertar 100 veces por segundo.
+
+### Verificación ejecutada
+
+- Host: 1 test nuevo (divisor del PIT para 100 Hz); `cargo xtask test`
+  ahora suma 37 pruebas en verde (14 `arch`, 8 `hal`, 11 `kernel`, 4
+  `xtask`).
+- QEMU automatizado: `cargo xtask boot-test --marker "AION: ticks=100"`
+  y `--marker "AION: ticks=500"` (el timer dispara *y* se sostiene);
+  `boot-test --repeat 10` con el marcador de la shell: 10/10.
+- Sin lógica pura que probar en host en el remapeo/programación (es
+  secuenciación de hardware): no se inventaron pruebas falsas.
+
+### Simplificaciones documentadas
+
+- Solo IRQ0 está desenmascarado; el resto de líneas del PIC (incluida la
+  cascada hacia el esclavo) sigue enmascarado hasta el Incremento 4
+  (teclado, IRQ1).
+- No se insertan esperas `io_wait` entre escrituras al PIC: innecesarias
+  en el hardware emulado que es el objetivo de esta fase.
+
 ## Incremento 2 — `ExitBootServices` + PIC enmascarado + consola VGA
 
 ### ADR
