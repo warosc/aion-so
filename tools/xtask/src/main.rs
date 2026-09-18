@@ -133,7 +133,17 @@ fn assemble_esp(root: &Path) -> Result<()> {
 fn test(root: &Path) -> Result<()> {
     run_cargo(
         root,
-        &["test", "-p", "aion-hal", "-p", "aion-kernel", "-p", "xtask"],
+        &[
+            "test",
+            "-p",
+            "aion-hal",
+            "-p",
+            "aion-arch-x86_64",
+            "-p",
+            "aion-kernel",
+            "-p",
+            "xtask",
+        ],
     )
 }
 
@@ -149,6 +159,8 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "clippy",
             "-p",
             "aion-hal",
+            "-p",
+            "aion-arch-x86_64",
             "-p",
             "aion-kernel",
             "-p",
