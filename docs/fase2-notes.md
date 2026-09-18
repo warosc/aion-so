@@ -1,5 +1,53 @@
 # Notas de implementación — Fase 2
 
+## Incremento 2 — `ExitBootServices` + PIC enmascarado + consola VGA
+
+### ADR
+
+Ver `docs/adr/0002-fase2-exit-boot-services.md` — este incremento sí
+dispara el ADR que `docs/adr/0001-fase0-boot-path.md` predijo.
+
+### Hallazgo real: OVMF usa GOP, no modo texto VGA legado
+
+El diseño original de este incremento (basado en el plan) asumía que
+escribir directamente al buffer de texto VGA en `0xB8000` bastaría para
+tener una consola visible, como en un arranque BIOS clásico. **Verificado
+con una captura de pantalla real** (vía `screendump` del monitor de QEMU,
+convertida de PPM a PNG e inspeccionada visualmente): en este entorno
+real (OVMF + QEMU), el display está controlado por un framebuffer lineal
+GOP en modo gráfico (1280×800 observado), no por el modo de texto VGA
+clásico. Escribir a `0xB8000` no corrompe nada (la memoria es válida y de
+nuestra propiedad) pero tampoco aparece en pantalla.
+
+Decisión (confirmada con el usuario): `boot/src/console_vga.rs` se queda
+como un backend correcto pero con salida visible no confirmada — mantiene
+la frontera del trait `Console` y la lógica de fila/columna/scroll, útil
+como base, pero el renderizado de texto real y visible sobre el
+framebuffer GOP (con fuente de mapa de bits) se difiere al Incremento 4,
+empaquetado junto con completar `Console` para el teclado PS/2 — así el
+trabajo de "consola visible" se hace una sola vez, en el momento en que
+además hay entrada de teclado real para ejercitarla interactivamente.
+Ninguna verificación automatizada de este incremento (`cargo xtask
+boot-test`) depende de esto — todas pasan por debugcon, un canal
+completamente distinto (ver Incremento 1 más abajo sobre por qué estos
+canales son independientes).
+
+### Verificación ejecutada
+
+- Host: 8 tests nuevos en `hal::memory_map` (clasificación de tipos de
+  memoria UEFI, manejo de capacidad agotada sin panic, suma de páginas
+  usables).
+- QEMU automatizado: `cargo xtask boot-test --marker
+  AION-PHASE2-POST-EXIT-OK` confirma la transición en sí; `cargo xtask
+  boot-test --repeat 10` (marcador por defecto, el de la shell) — 10/10
+  arranques exitosos, con el mapa de memoria real reportado (104
+  regiones, ~63911 páginas usables ≈ 249 MB de 256 MB configurados).
+- Visual, una vez, documentado aquí: captura de pantalla real
+  (`screendump`) inspeccionada para descubrir el hallazgo de GOP arriba —
+  el mismo tipo de verificación honesta que exige `AGENTS.md`/`CLAUDE.md`,
+  que llevó a encontrar una brecha real en vez de asumir que "compiló y
+  pasó boot-test" era suficiente.
+
 ## Incremento 1 — GDT + TSS/IST + IDT + manejadores de excepción
 
 ### No se necesitó ADR
