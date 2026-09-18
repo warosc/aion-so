@@ -22,10 +22,22 @@
 //! handler below) — a deliberate, documented safety net.
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
 use aion_hal::{CpuControl, InterruptControl};
+
+/// Written only by the timer ISR (`VECTOR_TIMER` below); read by
+/// `ticks()`, `hal::TickCounter`'s sole consumer today.
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Current tick count, as observed so far. `Relaxed` is sufficient: this
+/// is a monotonic counter with no other data it needs to synchronize
+/// with, single-writer (the ISR), any-reader.
+pub fn ticks() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
 
 const VECTOR_DIVIDE_ERROR: u8 = 0;
 const VECTOR_NMI: u8 = 2;
@@ -33,6 +45,12 @@ const VECTOR_BREAKPOINT: u8 = 3;
 const VECTOR_DOUBLE_FAULT: u8 = 8;
 const VECTOR_GENERAL_PROTECTION: u8 = 13;
 const VECTOR_PAGE_FAULT: u8 = 14;
+/// PIT timer, IRQ0 remapped here by `pic::remap` (Incremento 3). The same
+/// numeric value UEFI's own timer happened to use pre-remap (see the
+/// module doc comment) — coincidental, not a conflict: the PIC is masked
+/// throughout the gap between UEFI's config and ours, and `pic::remap`
+/// itself reprograms the mapping before this vector is ever unmasked.
+const VECTOR_TIMER: u8 = 0x20;
 
 static mut IDT: Idt = Idt::new();
 
@@ -116,6 +134,7 @@ macro_rules! stub_with_error_code {
 stub_no_error_code!(divide_error_stub, VECTOR_DIVIDE_ERROR);
 stub_no_error_code!(nmi_stub, VECTOR_NMI);
 stub_no_error_code!(breakpoint_stub, VECTOR_BREAKPOINT);
+stub_no_error_code!(timer_stub, VECTOR_TIMER);
 
 stub_with_error_code!(general_protection_stub, VECTOR_GENERAL_PROTECTION);
 stub_with_error_code!(page_fault_stub, VECTOR_PAGE_FAULT);
@@ -228,6 +247,19 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
         }
         VECTOR_BREAKPOINT => {
             log::info!("AION: breakpoint handler OK");
+        }
+        VECTOR_TIMER => {
+            let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // SAFETY: this handler only ever runs as a direct result of a
+            // real PIC-routed IRQ0 delivery (that's what vector 0x20 is
+            // wired to after `pic::remap`), which is exactly this
+            // function's documented precondition.
+            unsafe {
+                crate::pic::send_eoi();
+            }
+            if count.is_multiple_of(100) {
+                log::info!("AION: ticks={count}");
+            }
         }
         VECTOR_GENERAL_PROTECTION => {
             log::error!(
@@ -395,4 +427,38 @@ pub unsafe fn init() {
     unsafe {
         core::arch::asm!("int3", options(nostack));
     }
+}
+
+/// Installs the timer's IDT vector, remaps the PIC, programs the PIT for
+/// ~100 Hz, and finally enables interrupts (`sti`) — the first time
+/// they've been re-enabled since `init()` above disabled them.
+///
+/// # Safety
+///
+/// Must run after `init()` (GDT/IDT already installed, including this
+/// function's own vector 0x20 write, which happens before `pic::remap`
+/// can possibly unmask it). Not safe to call more than once or
+/// concurrently — single-core kernel in Fase 2.
+pub unsafe fn init_timer() {
+    // SAFETY: writing one more entry into the same `'static` IDT already
+    // fully populated and loaded by `init()`, before interrupts are ever
+    // enabled — the same single-threaded-init reasoning `init()` itself
+    // documents.
+    unsafe {
+        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
+            timer_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
+        // SAFETY: interrupts are still disabled here (nothing between
+        // `init()` and this call re-enables them), and the vector this
+        // unmasks was just installed immediately above.
+        crate::pic::remap();
+        // SAFETY: the timer's IDT vector exists and the PIC is
+        // remapped to deliver IRQ0 there — the preconditions `pit::init`
+        // itself documents.
+        crate::pit::init(100);
+    }
+    crate::Cpu.enable();
 }
