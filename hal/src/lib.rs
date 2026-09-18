@@ -3,6 +3,7 @@
 mod console;
 mod cpu;
 mod interrupts;
+pub mod memory_map;
 mod power;
 
 pub use console::{Console, ConsoleKey};
