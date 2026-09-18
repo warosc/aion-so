@@ -1,0 +1,128 @@
+# Notas de implementación — Fase 2
+
+## Incremento 1 — GDT + TSS/IST + IDT + manejadores de excepción
+
+### No se necesitó ADR
+
+Este incremento no llama a `ExitBootServices`, no carga una imagen de kernel
+separada y no cambia la forma de `BootInfo`. Todo ocurre dentro del mismo
+único binario `.efi` de Fase 0/1, todavía dentro de UEFI Boot Services. No
+se dispara ninguna condición de `ARCHITECTURE.md` que exija ADR. La
+transición real (`ExitBootServices`) es del Incremento 2.
+
+### Sin ABI `x86-interrupt`: trampolines naked escritas a mano
+
+`rust-toolchain.toml` fija Rust estable. `extern "x86-interrupt"` sigue
+bajo feature-gate nightly. Los manejadores usan `#[unsafe(naked)]` +
+`core::arch::naked_asm!` (estable desde ~1.88), con macros
+(`stub_no_error_code!`/`stub_with_error_code!`) que generan el prólogo
+específico de cada vector (con o sin código de error puesto por hardware)
+antes de saltar a un `common_trampoline` compartido.
+
+### Alcance deliberadamente reducido de manejadores explícitos
+
+Solo `#DE`(0), `NMI`(2), `#BP`(3), `#DF`(8), `#GP`(13) y `#PF`(14) tienen
+entradas IDT reales. El resto de 0-31 queda ausente: nada en este
+incremento ejecuta `int n` hacia ellos, y si algún bug futuro los alcanza,
+usar una puerta ausente causa una falla en cascada (`#GP`/`#NP`) que
+termina en el manejador de `#DF`, respaldado por su propia pila IST —
+una red de seguridad deliberada, no un hueco. Los vectores 32-255 (rango
+de interrupciones de hardware) sí tienen un catch-all real e instalado
+(`spurious_interrupt_stub`) — ver más abajo por qué esto resultó ser
+necesario de verdad, no solo defensivo.
+
+### Hallazgos reales durante el bring-up (los bugs que costó encontrar)
+
+Arrancar GDT/IDT/excepciones por primera vez expuso una cadena de bugs
+genuinos, cada uno enmascarando al siguiente. Se documentan en el orden en
+que se encontraron porque cada uno es una lección reusable para cualquiera
+que agregue manejadores de interrupción nuevos en fases futuras:
+
+1. **`options(nostack)` mintiéndole al compilador.** El bloque de asm de
+   `gdt::init()` que recarga los segmentos (secuencia `retfq`) hace `push`
+   dos veces — pero estaba marcado `options(nostack)`. Esa opción le dice
+   al compilador "este bloque no toca la pila", permitiéndole seguir
+   confiando en su "red zone" (128 bytes bajo RSP, válidos para funciones
+   hoja según la ABI) para variables locales propias. El `push` real
+   pisaba esa zona. Corrección: quitar `nostack` de ese bloque específico.
+
+2. **El manejador de interrupción también necesita proteger la red zone
+   ajena.** `common_trampoline` se ejecuta sobre la misma pila del código
+   interrumpido, sin cambio de pila (IST=0). Si ese código era una función
+   hoja usando su red zone, los primeros `push` del trampolín la
+   pisarían. Corrección: `sub rsp, 128` como primera instrucción,
+   liberado con `add rsp, 128` al final.
+
+3. **El struct de Rust debe reflejar ese hueco.** Agregar el `sub rsp,
+   128` sin actualizar `InterruptStackFrame` significaba que `vector`,
+   `rip`, etc. se leían 128 bytes desalineados de donde realmente estaban.
+   Corrección: campo de relleno explícito `_red_zone_guard: [u64; 16]`
+   entre `rax` y `vector`, verificado con `core::mem::offset_of!` en
+   `const` asserts — no confiar en la aritmética mental, verificarla en
+   tiempo de compilación.
+
+4. **El timer interno de UEFI/OVMF puede llegar después de `cli`.**
+   Verificado con el trace `-d int` de QEMU: una interrupción de hardware
+   real (vector `0x20` observado) llegó *después* de ejecutar `cli`,
+   aterrizando en una entrada IDT ausente (tipo de gate inválido → `#GP`
+   en cascada). `cli` bloquea la *siguiente* admisión de interrupciones;
+   no cancela retroactivamente una que el CPU ya empezó a entregar un
+   ciclo antes. Por eso el catch-all de 32-255 (`spurious_interrupt_stub`,
+   silencioso, sin EOI) no es decorativo: sin él, este incremento falla de
+   forma intermitente y difícil de reproducir.
+
+5. **`x86_64-unknown-uefi` usa la convención de llamada de Microsoft x64,
+   no SysV.** El primer bloqueo real: `common_trampoline` pasaba el
+   puntero al frame en `RDI` (SysV), pero `rust_interrupt_handler`
+   —compilado para el target UEFI— espera su primer argumento en `RCX`
+   (convención Microsoft x64, la misma que usa el propio firmware UEFI).
+   Además esa convención exige 32 bytes de "shadow space" reservados por
+   quien llama, antes de la propia alineación de 16 bytes. Sin esto,
+   `frame` llegaba como puntero nulo. Esta es la clase de bug que
+   **reaparecerá** en cualquier incremento futuro que llame desde asm
+   naked a una función Rust normal en este target — no es específico de
+   este trampolín.
+
+6. **Usar un registro *caller-saved* para sobrevivir una llamada.** Tras
+   corregir el punto 5, seguía apareciendo un *double fault* justo después
+   de que el manejador de `#BP` terminara con éxito. Causa: el valor de
+   RSP a restaurar se guardaba en `RAX` a través del `call` — pero RAX es
+   volátil (caller-saved) en ambas convenciones (SysV y Microsoft x64), así
+   que la función llamada podía pisarlo libremente, y lo hacía. RSP se
+   restauraba con basura, colapsando la pila (`#GP`→`#PF`→`#DF` en
+   cascada, verificado con `-d int`: `SP` caía a valores cercanos a cero).
+   Corrección: usar `RBX` (callee-saved en ambas convenciones) para ese
+   valor.
+
+Cada uno de estos seis puntos se verificó empíricamente con el trace
+`-d int` de QEMU o con aserciones `offset_of!` en tiempo de compilación —
+ninguno se "arregló" solo por razonamiento sin observar el comportamiento
+real. Ver `AGENTS.md`/`CLAUDE.md`: nunca declarar algo corregido sin
+haberlo observado.
+
+### Verificación ejecutada
+
+- Host: 13 tests de codificación GDT/IDT/TSS (`arch/x86_64`), agregados a
+  `cargo xtask test` y a los jobs de CI (antes solo cubrían
+  `aion-hal`/`aion-kernel`/`xtask`).
+- QEMU automatizado: `cargo xtask boot-test --repeat 10` — 10/10 arranques
+  exitosos, cada uno con el self-test de `int3` (`#BP`) pasando y logueando
+  `"breakpoint handler OK"` antes de llegar al marcador de la shell de
+  Fase 1 (sin cambios en `kernel::shell`).
+- Manual, una vez, documentado aquí (revertido antes de commitear, mismo
+  patrón que la verificación de teclado de Fase 1): se forzó un `#DE` real
+  (división entre cero) y un `#GP` real (carga de un selector inválido en
+  `GS`), cada uno por separado —ambos son fatales— confirmando que cada
+  uno loguea correctamente (mensaje, código de error cuando aplica, RIP
+  legítimo) y detiene el sistema de forma segura en vez de corromper
+  memoria o colgarse silenciosamente.
+
+### Simplificaciones documentadas de este incremento
+
+- No se remapea el PIC todavía (Incremento 3) — por eso `cli` se ejecuta
+  antes de tocar el IDT, y por eso el catch-all de 32-255 es la mitigación
+  real mientras tanto.
+- `NMI` tiene un manejador no fatal (log + retorno) como mitigación barata
+  adicional, dado que las NMI no se enmascaran con `cli`.
+- El `#DF` es incondicionalmente fatal — no se intenta preservar registros
+  ni reanudar ejecución, siguiendo la práctica estándar de kernels.
