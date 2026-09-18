@@ -30,6 +30,12 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     unsafe {
         aion_arch_x86_64::interrupts::init();
     }
+    // SAFETY: called exactly once, immediately after `init()` above (GDT/
+    // IDT already installed) and before anything else runs.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        aion_arch_x86_64::interrupts::init_timer();
+    }
 
     log::info!("{BOOT_OK_MARKER}");
     log::info!("AION: architecture = {ARCH_NAME}");
