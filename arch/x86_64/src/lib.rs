@@ -1,6 +1,10 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-use aion_hal::CpuControl;
+mod gdt;
+mod idt;
+pub mod interrupts;
+
+use aion_hal::{CpuControl, InterruptControl};
 
 pub struct Cpu;
 
@@ -26,5 +30,39 @@ impl CpuControl for Cpu {
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack));
         }
+    }
+}
+
+impl InterruptControl for Cpu {
+    fn disable(&self) -> bool {
+        let was_enabled = self.are_enabled();
+        // SAFETY: `cli` only affects this core's interrupt flag; no memory
+        // or stack side effects.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        was_enabled
+    }
+
+    fn enable(&self) {
+        // SAFETY: `sti` only affects this core's interrupt flag; no memory
+        // or stack side effects. The one-instruction delay before `sti`
+        // takes effect (Intel SDM Vol. 3 §6.8.3) is not a correctness
+        // concern for any caller in this codebase.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    fn are_enabled(&self) -> bool {
+        let flags: u64;
+        // SAFETY: `pushfq`/`pop` is a standard read-only read of RFLAGS;
+        // it uses the stack (hence no `nostack`) but does not modify any
+        // flag itself (`pop` does not affect flags), so `preserves_flags`
+        // is accurate.
+        unsafe {
+            core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        }
+        (flags & (1 << 9)) != 0 // IF is RFLAGS bit 9 (Intel SDM Vol. 1 §3.4.3)
     }
 }
