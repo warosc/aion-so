@@ -3,6 +3,8 @@
 mod gdt;
 mod idt;
 pub mod interrupts;
+pub mod pic;
+pub mod port;
 
 use aion_hal::{CpuControl, InterruptControl};
 
