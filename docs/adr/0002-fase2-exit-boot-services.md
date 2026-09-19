@@ -40,6 +40,29 @@ cualquier otro uso de Boot Services. Inmediatamente después:
    binario `.efi` — no se adopta una imagen de kernel separada en esta
    fase.
 
+## Actualización (Incremento 4)
+
+Dos puntos de la decisión original cambiaron; el resto (una sola llamada a
+`exit_boot_services`, PIC enmascarado inmediatamente después, `BootInfo`
+con mapa de memoria real, `UefiPower` intacto, un único binario `.efi`) se
+mantiene.
+
+- **Consola**: el punto 3 quedó superado. `VgaConsole` resultó invisible en
+  el objetivo real (OVMF + QEMU usa un framebuffer GOP gráfico, no modo
+  texto VGA; ver `docs/fase2-notes.md`, Incremento 2) y se eliminó. Su
+  lugar lo ocupa `HardwareConsole`: salida sobre el framebuffer GOP
+  (`drivers/fbcon`) y entrada por el teclado PS/2 (IRQ1).
+- **Paso nuevo antes de salir**: el protocolo GOP es un objeto de Boot
+  Services y solo se puede consultar antes de `exit_boot_services`
+  (`boot/src/framebuffer.rs`). Lo capturado es un dato plano
+  (`aion_hal::framebuffer::FramebufferInfo`), y el protocolo se cierra antes
+  de la llamada. Supuesto que esto introduce: la memoria del framebuffer
+  sigue siendo utilizable después del exit. Verificado en OVMF/QEMU (texto
+  visible tras el exit); la especificación UEFI no lo garantiza, así que
+  hay que revalidarlo en hardware físico (Fase 5).
+- `BootInfo` **no** cambia: el framebuffer viaja solo hasta
+  `HardwareConsole`, no hasta el kernel.
+
 ## Alternativas consideradas
 
 - **Quedarse indefinidamente en Boot Services**: rechazada — no existe
