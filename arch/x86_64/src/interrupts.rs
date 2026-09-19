@@ -6,7 +6,9 @@
 //! Scope for Incremento 1: explicit exception handlers exist only for
 //! `#DE`(0), `NMI`(2), `#BP`(3), `#DF`(8), `#GP`(13), `#PF`(14). Every
 //! vector in 32-255 (the hardware-interrupt range) shares one silent
-//! catch-all, `spurious_interrupt_stub`, installed for all of them. This
+//! catch-all, `spurious_interrupt_stub`, installed for all of them; the
+//! timer (0x20, Incremento 3) and keyboard (0x21, Incremento 4) later
+//! overwrite their own slots with real handlers. This
 //! is load-bearing, not defensive-only padding: empirically, on real QEMU
 //! and OVMF, UEFI's own periodic timer interrupt (observed at vector 0x20)
 //! can still be "in flight" at the exact instant `cli` executes — `cli`
@@ -22,10 +24,22 @@
 //! handler below) — a deliberate, documented safety net.
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
 use aion_hal::{CpuControl, InterruptControl};
+
+/// Written only by the timer ISR (`VECTOR_TIMER` below); read by
+/// `ticks()`, `hal::TickCounter`'s sole consumer today.
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Current tick count, as observed so far. `Relaxed` is sufficient: this
+/// is a monotonic counter with no other data it needs to synchronize
+/// with, single-writer (the ISR), any-reader.
+pub fn ticks() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
 
 const VECTOR_DIVIDE_ERROR: u8 = 0;
 const VECTOR_NMI: u8 = 2;
@@ -33,6 +47,14 @@ const VECTOR_BREAKPOINT: u8 = 3;
 const VECTOR_DOUBLE_FAULT: u8 = 8;
 const VECTOR_GENERAL_PROTECTION: u8 = 13;
 const VECTOR_PAGE_FAULT: u8 = 14;
+/// PIT timer, IRQ0 remapped here by `pic::remap` (Incremento 3). The same
+/// numeric value UEFI's own timer happened to use pre-remap (see the
+/// module doc comment) — coincidental, not a conflict: the PIC is masked
+/// throughout the gap between UEFI's config and ours, and `pic::remap`
+/// itself reprograms the mapping before this vector is ever unmasked.
+const VECTOR_TIMER: u8 = 0x20;
+/// PS/2 keyboard, IRQ1 remapped here by `pic::remap` (Incremento 4).
+const VECTOR_KEYBOARD: u8 = 0x21;
 
 static mut IDT: Idt = Idt::new();
 
@@ -116,6 +138,8 @@ macro_rules! stub_with_error_code {
 stub_no_error_code!(divide_error_stub, VECTOR_DIVIDE_ERROR);
 stub_no_error_code!(nmi_stub, VECTOR_NMI);
 stub_no_error_code!(breakpoint_stub, VECTOR_BREAKPOINT);
+stub_no_error_code!(timer_stub, VECTOR_TIMER);
+stub_no_error_code!(keyboard_stub, VECTOR_KEYBOARD);
 
 stub_with_error_code!(general_protection_stub, VECTOR_GENERAL_PROTECTION);
 stub_with_error_code!(page_fault_stub, VECTOR_PAGE_FAULT);
@@ -228,6 +252,29 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
         }
         VECTOR_BREAKPOINT => {
             log::info!("AION: breakpoint handler OK");
+        }
+        VECTOR_TIMER => {
+            let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // SAFETY: this handler only ever runs as a direct result of a
+            // real PIC-routed IRQ0 delivery (that's what vector 0x20 is
+            // wired to after `pic::remap`), which is exactly this
+            // function's documented precondition.
+            unsafe {
+                crate::pic::send_eoi();
+            }
+            if count.is_multiple_of(100) {
+                log::info!("AION: ticks={count}");
+            }
+        }
+        VECTOR_KEYBOARD => {
+            // SAFETY: this handler only ever runs as a direct result of a
+            // real PIC-routed IRQ1 delivery (vector 0x21 after
+            // `pic::remap`), which is exactly what both callees document
+            // as their precondition. Not reentrant: the gate cleared IF.
+            unsafe {
+                crate::keyboard::on_irq();
+                crate::pic::send_eoi();
+            }
         }
         VECTOR_GENERAL_PROTECTION => {
             log::error!(
@@ -395,4 +442,80 @@ pub unsafe fn init() {
     unsafe {
         core::arch::asm!("int3", options(nostack));
     }
+}
+
+/// Installs the timer's IDT vector, remaps the PIC (all lines masked),
+/// programs the PIT for ~100 Hz and unmasks IRQ0. Does **not** enable
+/// interrupts: with the whole set of devices this kernel uses configured
+/// first, the caller does that once, explicitly (`InterruptControl::enable`).
+///
+/// # Safety
+///
+/// Must run after `init()` (GDT/IDT already installed, including this
+/// function's own vector 0x20 write, which happens before the line is
+/// unmasked), with interrupts still disabled. Not safe to call more than
+/// once or concurrently — single-core kernel in Fase 2.
+pub unsafe fn init_timer() {
+    // SAFETY: writing one more entry into the same `'static` IDT already
+    // fully populated and loaded by `init()`, before interrupts are ever
+    // enabled — the same single-threaded-init reasoning `init()` itself
+    // documents.
+    unsafe {
+        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
+            timer_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
+        // SAFETY: interrupts are still disabled here (nothing between
+        // `init()` and this call re-enables them).
+        crate::pic::remap();
+        // SAFETY: the timer's IDT vector exists and the PIC is
+        // remapped to deliver IRQ0 there — the preconditions `pit::init`
+        // itself documents.
+        crate::pit::init(100);
+        // SAFETY: `remap` ran above, the handler for vector 0x20 was
+        // installed at the top of this function, and interrupts are
+        // still disabled (the read-modify-write precondition).
+        crate::pic::unmask(0);
+    }
+}
+
+/// Installs the keyboard's IDT vector, configures the i8042 and unmasks
+/// IRQ1. Like `init_timer`, does not enable interrupts.
+///
+/// If the controller doesn't respond, returns the error **without**
+/// unmasking IRQ1: the gate installed first is then never reachable, and
+/// the kernel keeps running (just without input) instead of hanging on it.
+///
+/// # Safety
+///
+/// Must run after `init_timer()` (which remaps the PIC) and before
+/// interrupts are enabled — the i8042 setup polls the output buffer the
+/// IRQ1 handler would otherwise consume. Once only, single-core.
+pub unsafe fn init_keyboard() -> Result<(), crate::keyboard::InitError> {
+    // SAFETY: as in `init_timer`: one more entry in the same `'static`
+    // IDT, before interrupts are ever enabled. Installed before the
+    // controller is touched, so a handler exists before the hardware can
+    // possibly raise the line.
+    unsafe {
+        IDT.0[VECTOR_KEYBOARD as usize] = IdtEntry::new(
+            keyboard_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
+    }
+    // SAFETY: interrupts are disabled and IRQ1 is still masked (`remap`
+    // masked everything and nothing has unmasked line 1 yet), which is
+    // exactly `init_controller`'s contract.
+    unsafe {
+        crate::keyboard::init_controller()?;
+    }
+    // SAFETY: `remap` ran (in `init_timer`), the vector-0x21 handler is
+    // installed, and interrupts are disabled.
+    unsafe {
+        crate::pic::unmask(1);
+    }
+    Ok(())
 }

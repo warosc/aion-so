@@ -1,5 +1,202 @@
 # Notas de implementación — Fase 2
 
+## Incremento 4 — Teclado PS/2 por IRQ, consola de framebuffer, shell restaurada
+
+### No se necesitó un ADR nuevo
+
+`BootInfo` no cambia y el boot path sigue siendo el de
+`docs/adr/0002-fase2-exit-boot-services.md`. Sí se añadió un paso a ese
+camino (consultar GOP *antes* de salir de Boot Services), así que el ADR
+0002 recibe una sección de actualización en vez de un ADR aparte. El
+framebuffer deliberadamente **no** entra en `BootInfo`: el kernel solo ve
+`&mut dyn Console`. Si algún día un consumidor del kernel necesita los
+píxeles directamente, eso sí sería un cambio de `BootInfo` y pediría ADR.
+
+### Qué hace
+
+- `hal::framebuffer::FramebufferInfo`: dato puro (base, ancho, alto,
+  stride, tamaño de la región). Sin campo de formato de píxel: solo se
+  dibuja blanco y negro, cuyo valor de 32 bits es idéntico en RGB y BGR.
+- `drivers/fbcon` (`aion-fbcon`, primer crate bajo `drivers/`): la lógica
+  de cursor (`TextConsole<S: Surface>`: salto de línea, ajuste al borde,
+  scroll, retroceso que cruza un ajuste de línea) está separada de la única
+  parte que toca memoria cruda (`FramebufferSurface`), de modo que la
+  primera se prueba entera en host contra una superficie falsa. Fuente 8×8
+  del crate `font8x8` (elegido con el usuario), dibujada a 2×: celdas de
+  16 px, 80×50 caracteres en 1280×800, blanco sobre negro.
+  `FramebufferSurface::new` valida el descriptor (tamaño, stride,
+  alineación, desbordamiento aritmético) y devuelve `None` en vez de
+  escribir fuera de límites.
+- `arch/x86_64/src/keyboard.rs`: el manejador de IRQ1 (`on_irq`) solo lee
+  bytes crudos del i8042 y los encola; `ScancodeQueue` (anillo SPSC de 64
+  entradas sobre atómicos) los pasa al lado consumidor, donde `Decoder`
+  (máquina de estados pura, scancode set 1, US QWERTY + Shift) produce
+  `ConsoleKey`. `init_controller` deja el i8042 en un estado conocido.
+- `pic::remap` ahora deja **todo** enmascarado; cada driver desenmascara su
+  línea con `pic::unmask(irq)` una vez instalado su vector (`init_timer` →
+  IRQ0, `init_keyboard` → IRQ1). `init_timer` ya no ejecuta `sti`: lo hace
+  `kmain` una sola vez, con todos los dispositivos ya configurados.
+- `boot/src/framebuffer.rs` consulta GOP antes de `ExitBootServices`;
+  `boot/src/console_hw.rs` (`HardwareConsole`) une pantalla + teclado
+  detrás de `Console`. `console_vga.rs` (el marcador de posición invisible
+  del Incremento 2) se elimina.
+- `kernel/src/shell.rs` y el trait `Console` **no cambian ni una línea**
+  respecto a Fase 1 (`git diff` vacío): es la prueba de que la frontera HAL
+  valía la pena. Solo `kmain` cambia (orden de inicialización).
+
+### Desviaciones del plan original
+
+1. **Cola de teclado**: el plan la protegía con `InterruptControl`. Se
+   implementó como anillo SPSC de atómicos — sin `unsafe` y sin enmascarar
+   interrupciones, más simple y correcto también con más de un núcleo.
+   `InterruptControl` sigue esperando su primer consumidor real (el
+   candado del heap, Incremento 7).
+2. **Alcance de la decodificación**: el plan decía letras, dígitos, espacio,
+   Enter y Backspace. Se cubrió todo el ASCII imprimible de un teclado US
+   (+ Shift) porque la shell acepta `is_ascii_graphic()` y su propia prueba
+   teclea `!`; con solo letras no habría quedado "restaurada". Sigue sin
+   haber Caps Lock, Ctrl/Alt, teclado numérico ni layouts (todo eso →
+   `Unknown`, que la shell ignora): no hay consumidor que los pida.
+3. La decodificación corre en el lado consumidor, no en la ISR: el código
+   que se ejecuta con interrupciones deshabilitadas se reduce a "leer un
+   byte y encolarlo".
+
+### Hallazgos reales
+
+- **El i8042 ya venía configurado**: OVMF lo deja con byte de
+  configuración `0x67` (IRQ1 habilitada, traducción a set 1 activa).
+  `init_controller` escribe el mismo valor (es idempotente) en vez de
+  depender de que el firmware lo haya dejado así, y el resultado se loguea
+  (`i8042 config 0x67 -> 0x67`) para que un cambio en otro entorno sea
+  visible.
+- **`open_protocol_exclusive::<GraphicsOutput>` funciona en OVMF**, y el
+  puntero al framebuffer (`0x80000000`, 1280×800, stride 1280, 4 096 000
+  bytes) sigue siendo utilizable después de `ExitBootServices` (observado
+  en pantalla, no asumido). La especificación UEFI no lo garantiza —el
+  crate `uefi` lo advierte— pero es el supuesto que usan en la práctica
+  todos los cargadores; queda anotado como riesgo para hardware real
+  (Fase 5).
+- **Un IRQ1 puede quedar "enganchado" mientras la línea está enmascarada**:
+  el ACK del comando de habilitar escaneo (0xF4) levanta IRQ1 antes de que
+  se desenmascare, y se entrega justo después con el búfer de salida ya
+  vacío. Leer `0x60` sin mirar antes el registro de estado devolvería un
+  byte viejo (una tecla fantasma), así que `on_irq` comprueba el bit de
+  "salida llena".
+- **Falsa alarma propia, descartada con datos**: en la primera captura
+  parecían faltar el `_` de `x86_64` y el borde superior de la primera
+  línea. Se leyeron los píxeles del volcado (`_` presente en las filas
+  46-47, x 320-335; fila 0 del glifo `A` iluminada): eran artefactos del
+  visor de imágenes, no defectos.
+
+### Verificación ejecutada
+
+- Host: `cargo xtask test` — 73 pruebas en verde (33 `arch`, 17 `fbcon`,
+  8 `hal`, 11 `kernel`, 4 `xtask`). Nuevas: 16 de teclado (cola FIFO/llena/
+  vuelta del índice, decodificación, Shift izquierdo/derecho
+  independientes, prefijo `E0` incluido el "falso Shift", filas del teclado
+  contrastadas con la disposición física US) y 17 de `fbcon` (cursor,
+  ajuste, scroll, retroceso a través de un ajuste, dibujo de glifos en
+  búfer real con stride mayor que el ancho, rechazo de descriptores
+  mentirosos). `cargo xtask fmt-lint` limpio, incluidos los objetivos UEFI
+  y freestanding.
+- QEMU automatizado: `boot-test --repeat 10` (marcador de la shell) 10/10 y
+  `--marker "AION: ticks=300" --repeat 10` 10/10.
+- QEMU interactivo, con `sendkey` y `screendump` por el monitor y capturas
+  inspeccionadas: `help`; mayúsculas y todos los símbolos US (`Hello,
+  World! 0-9 [a] {b}`, la fila de dígitos, `!@#$%^&*()_+{}|:"<>?~`);
+  retroceso (`abc`⌫⌫ → `a`); `clear`; `shutdown` desde el teclado termina
+  QEMU; 30 comandos seguidos (60 filas en una pantalla de 50) → scroll
+  correcto; línea de 91 caracteres que se ajusta al borde y 15 retrocesos
+  que cruzan el ajuste, sin restos; `reboot` → segundo arranque con banner
+  limpio y teclado funcionando.
+- Ruta de error: QEMU con `-machine pc,i8042=off` (sin controlador) →
+  `AION: PS/2 keyboard unavailable: ControllerTimeout`, el kernel sigue
+  (shell lista, ticks sostenidos hasta 2200+), sin cuelgue.
+- **No verificado**: hardware físico, teclados USB (Fase 5).
+
+### Simplificaciones y riesgos documentados
+
+- Solo US QWERTY y Shift. Sin repetición configurable, Caps Lock, Ctrl/Alt
+  ni teclas extendidas.
+- Ventana de "despertar perdido" en `idle_once`: si un IRQ llega entre que
+  `read_key()` devuelve `None` y el `hlt`, la tecla espera al siguiente
+  tick (≤10 ms con el PIT a 100 Hz). Latencia acotada, no cuelgue.
+- Cola de 64 scancodes: si se llena, se descarta el más nuevo y se loguea.
+  En ese caso extremo se podría perder un "soltar Shift" y dejarlo
+  pegado hasta el siguiente Shift.
+- Sin cursor visible, sin scrollback, sin color. Cada scroll copia ~3,9 MB
+  con `ptr::copy` (no volátil; el framebuffer es solo-escritura para el
+  programa): aceptable en QEMU, a revisar con hardware real, donde leer un
+  framebuffer write-combining es lento.
+- Solo formatos GOP `Rgb`/`Bgr`. Con `BltOnly`/`Bitmask` (o un descriptor
+  inconsistente) el kernel arranca **sin pantalla** —entrada y debugcon
+  siguen funcionando— y lo loguea.
+- Comentario obsoleto conocido en `kernel/src/shell.rs` (dice que el prompt
+  sale por la consola UEFI): se deja tal cual para mantener el archivo
+  idéntico a Fase 1.
+
+## Incremento 3 — Remapeo de PIC + temporizador PIT
+
+### No se necesitó ADR
+
+No cambia el boot path ni `BootInfo`: es configuración de hardware (PIC,
+PIT) y una entrada nueva en el IDT.
+
+### Qué hace
+
+- `arch/x86_64/src/pic.rs`: `remap()` ejecuta la secuencia ICW1-4
+  (IRQ0-7 → vectores 0x20-0x27, IRQ8-15 → 0x28-0x2F, fuera del rango de
+  excepciones 0-31) y deja desenmascarado únicamente IRQ0; `send_eoi()`.
+- `arch/x86_64/src/pit.rs`: canal 0, modo 3, **100 Hz** (divisor 11931).
+- `arch/x86_64/src/interrupts.rs`: vector `0x20` con manejador real
+  (`timer_stub` → `common_trampoline`) que incrementa un `AtomicU64`
+  (`Relaxed`, único escritor), envía EOI y registra `AION: ticks=N` cada
+  100 ticks. `init_timer()` instala el vector, remapea el PIC, programa el
+  PIT y por fin ejecuta `sti`. *(Actualizado en el Incremento 4: `sti` pasó
+  a `kmain`, y `remap()` deja todo enmascarado mientras que `init_timer`
+  desenmascara IRQ0 con `pic::unmask`.)*
+- `hal::TickCounter` (solo lectura); `Cpu` lo implementa.
+
+Se eligió PIC/PIT y no APIC porque APIC requiere descubrimiento de
+hardware (ACPI/MADT o MSR+MMIO), territorio de Fase 4/5.
+
+### Hallazgo retroactivo: los Incrementos 1 y 2 dejaban la shell colgada
+
+Este incremento cierra un problema real que las pruebas automatizadas de
+los dos anteriores no podían ver. `interrupts::init()` (Incremento 1)
+ejecuta `cli` y nunca vuelve a ejecutar `sti`; el Incremento 2 además
+enmascara ambos PIC. Con IF=0 y todo enmascarado, el `hlt` de
+`idle_once()` (que la shell ejecuta en cuanto `read_key()` devuelve `None`,
+o sea siempre) solo despierta con una NMI o un reset: la shell imprimía su
+prompt y quedaba parada para siempre. `cargo xtask boot-test` no lo
+detectaba porque termina QEMU en cuanto ve el marcador de la shell, que se
+loguea *antes* de entrar al bucle. En uso interactivo (`cargo xtask run`)
+habría sido visible de inmediato.
+
+El estado corregido se verificó empíricamente: con el timer vivo, los
+ticks avanzan de forma sostenida y regular (`ticks=100` … `ticks=500`,
+≈1 s por cada 100) mientras la shell está inactiva en `hlt` — es decir,
+`hlt` vuelve a despertar 100 veces por segundo.
+
+### Verificación ejecutada
+
+- Host: 1 test nuevo (divisor del PIT para 100 Hz); `cargo xtask test`
+  ahora suma 37 pruebas en verde (14 `arch`, 8 `hal`, 11 `kernel`, 4
+  `xtask`).
+- QEMU automatizado: `cargo xtask boot-test --marker "AION: ticks=100"`
+  y `--marker "AION: ticks=500"` (el timer dispara *y* se sostiene);
+  `boot-test --repeat 10` con el marcador de la shell: 10/10.
+- Sin lógica pura que probar en host en el remapeo/programación (es
+  secuenciación de hardware): no se inventaron pruebas falsas.
+
+### Simplificaciones documentadas
+
+- Solo IRQ0 está desenmascarado; el resto de líneas del PIC (incluida la
+  cascada hacia el esclavo) sigue enmascarado hasta el Incremento 4
+  (teclado, IRQ1).
+- No se insertan esperas `io_wait` entre escrituras al PIC: innecesarias
+  en el hardware emulado que es el objetivo de esta fase.
+
 ## Incremento 2 — `ExitBootServices` + PIC enmascarado + consola VGA
 
 ### ADR

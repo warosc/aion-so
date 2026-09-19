@@ -3,10 +3,12 @@
 mod gdt;
 mod idt;
 pub mod interrupts;
+pub mod keyboard;
 pub mod pic;
+pub mod pit;
 pub mod port;
 
-use aion_hal::{CpuControl, InterruptControl};
+use aion_hal::{CpuControl, InterruptControl, TickCounter};
 
 pub struct Cpu;
 
@@ -66,5 +68,11 @@ impl InterruptControl for Cpu {
             core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
         }
         (flags & (1 << 9)) != 0 // IF is RFLAGS bit 9 (Intel SDM Vol. 1 §3.4.3)
+    }
+}
+
+impl TickCounter for Cpu {
+    fn ticks(&self) -> u64 {
+        interrupts::ticks()
     }
 }

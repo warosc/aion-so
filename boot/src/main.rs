@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 
-mod console_vga;
+mod console_hw;
+mod framebuffer;
 mod memory;
 mod panic;
 mod power;
 
-use console_vga::VgaConsole;
+use console_hw::HardwareConsole;
 use power::UefiPower;
 use uefi::boot;
 use uefi::prelude::*;
@@ -17,14 +18,19 @@ fn efi_main() -> Status {
 
     log::info!("AION OS - Fase 2 boot");
 
+    // The GOP protocol is a Boot Services object: it can only be queried
+    // now. What it describes (the framebuffer memory) outlives the exit.
+    let framebuffer = framebuffer::query();
+
     // SAFETY: this is the only call site, on a single linear,
     // non-reentrant path. No Boot-Services-backed resource is held past
     // this point: the old `UefiConsole` (which wrapped
     // `system::with_stdin`/`with_stdout`, both documented to panic once
     // boot services exit) is gone entirely, replaced below by
-    // `VgaConsole`, a direct hardware backend. `UefiPower` is unaffected —
-    // `uefi::runtime` services are documented available both before and
-    // after this call.
+    // `HardwareConsole`, a direct hardware backend, and the GOP protocol
+    // handle `framebuffer::query` opened is already closed. `UefiPower` is
+    // unaffected — `uefi::runtime` services are documented available both
+    // before and after this call.
     let uefi_memory_map = unsafe { boot::exit_boot_services(None) };
     // The `log`/debugcon pipeline (port 0xE9) is unconditional in the
     // `uefi` crate's logger and keeps working unchanged across this
@@ -46,7 +52,13 @@ fn efi_main() -> Status {
 
     let memory_map = memory::build_memory_map(&uefi_memory_map);
     let boot_info = aion_kernel::BootInfo { memory_map };
-    let mut console = VgaConsole::new();
+    // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
+    // was current when it was queried, and nothing changes the display
+    // mode after that (boot services are gone). Firmware's own console
+    // stopped drawing at the exit, and this is the only writer from here
+    // on. The memory stays mapped: UEFI's identity mapping is still what's
+    // live (no page tables are touched by exiting boot services).
+    let mut console = unsafe { HardwareConsole::new(framebuffer) };
     let power = UefiPower;
     aion_kernel::kmain(&boot_info, &mut console, &power)
 }
