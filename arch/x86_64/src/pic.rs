@@ -1,6 +1,6 @@
 //! Legacy 8259 PIC.
 
-use crate::port::outb;
+use crate::port::{inb, outb};
 
 const MASTER_PIC_CMD: u16 = 0x20;
 const MASTER_PIC_DATA: u16 = 0x21;
@@ -31,17 +31,14 @@ pub unsafe fn mask_all() {
 }
 
 /// Remaps both PICs off the CPU-exception vector range (0-31) and onto
-/// 0x20-0x2F, then leaves only IRQ0 (the PIT timer) unmasked.
+/// 0x20-0x2F, and leaves every IRQ line masked. Each device driver unmasks
+/// its own line with `unmask` once its IDT vector is installed.
 ///
 /// # Safety
 ///
 /// The caller must hold interrupts disabled (`cli`) for the entire ICW1-4
 /// sequence: an IRQ arriving mid-sequence would be routed through a
-/// half-configured vector mapping. The caller must also have already
-/// installed a real IDT handler for vector 0x20 (the timer) before this
-/// returns and interrupts are next enabled — this function unmasks IRQ0
-/// as its last step, and a masked-but-unhandled vector is far safer than
-/// an unmasked-and-unhandled one.
+/// half-configured vector mapping.
 pub unsafe fn remap() {
     unsafe {
         // ICW1: begin initialization on both PICs, ICW4 will follow.
@@ -61,13 +58,40 @@ pub unsafe fn remap() {
         // ICW4: 8086/88 mode on both.
         outb(MASTER_PIC_DATA, ICW4_8086_MODE);
         outb(SLAVE_PIC_DATA, ICW4_8086_MODE);
-        // Final mask state (OCW1): unmask only IRQ0 on the master: every
-        // other line, including the master's own IRQ2-to-slave cascade
-        // line, stays masked — nothing has an IDT handler beyond the
-        // timer yet. Fully mask the slave: no slave-routed IRQ is used in
+        // Final mask state (OCW1): everything masked, on both chips. ICW1
+        // clears the mask register, so without this write every line
+        // would be live the moment ICW4 lands. The master's IRQ2-to-slave
+        // cascade line stays masked too: no slave-routed IRQ is used in
         // Fase 2.
-        outb(MASTER_PIC_DATA, 0b1111_1110);
+        outb(MASTER_PIC_DATA, 0xFF);
         outb(SLAVE_PIC_DATA, 0xFF);
+    }
+}
+
+/// Unmasks one master-PIC IRQ line (0-7), leaving every other line as it
+/// was.
+///
+/// # Safety
+///
+/// `remap` must already have run, and the IDT must already hold a real
+/// handler for vector `0x20 + irq` — a masked-but-unhandled vector is far
+/// safer than an unmasked-and-unhandled one. The caller must also hold
+/// interrupts disabled: this is a read-modify-write of the mask register,
+/// and an interrupt handler that touched the mask in between would have
+/// its change silently overwritten.
+///
+/// # Panics
+///
+/// If `irq >= 8`. Slave lines (8-15) would additionally need the master's
+/// IRQ2 cascade line unmasked, which nothing in Fase 2 does.
+pub unsafe fn unmask(irq: u8) {
+    assert!(irq < 8, "only master-PIC IRQ lines (0-7) are supported");
+    // SAFETY: `0x21` is the master PIC's fixed data/mask port (see
+    // `mask_all`); the read-modify-write is race-free under the caller's
+    // interrupts-disabled contract above.
+    unsafe {
+        let mask = inb(MASTER_PIC_DATA);
+        outb(MASTER_PIC_DATA, mask & !(1 << irq));
     }
 }
 

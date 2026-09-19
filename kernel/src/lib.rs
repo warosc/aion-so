@@ -36,6 +36,25 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     unsafe {
         aion_arch_x86_64::interrupts::init_timer();
     }
+    // SAFETY: called exactly once, right after `init_timer()` (the PIC is
+    // remapped) and with interrupts still disabled — nothing above
+    // enabled them.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Err(err) = unsafe { aion_arch_x86_64::interrupts::init_keyboard() } {
+            // Not fatal: the kernel is still useful (and debuggable via
+            // debugcon) without input, and must never hang on a device.
+            log::error!("AION: PS/2 keyboard unavailable: {err:?}");
+        }
+    }
+    // Every device is configured; this is the one place interrupts come
+    // on. Before this point nothing can fire, so no handler can observe a
+    // half-initialized device.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use aion_hal::InterruptControl;
+        aion_arch_x86_64::Cpu.enable();
+    }
 
     log::info!("{BOOT_OK_MARKER}");
     log::info!("AION: architecture = {ARCH_NAME}");
