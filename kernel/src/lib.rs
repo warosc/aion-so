@@ -1,29 +1,76 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-use aion_hal::CpuControl;
+mod shell;
+
+use aion_hal::memory_map::MemoryMap;
+use aion_hal::{Console, PowerControl};
 
 /// Grepped by `cargo xtask boot-test` in the QEMU debugcon capture.
 /// Keep in sync with tools/xtask's default `--marker` value.
 pub const BOOT_OK_MARKER: &str = "AION-PHASE0-BOOT-OK";
 
-/// Placeholder boot handoff payload. Fase 1 replaces this with the real
-/// contract (memory map, framebuffer, RSDP...) — that shape change is the
-/// "sustitución del boot path" ADR trigger per ARCHITECTURE.md.
-#[derive(Default)]
+#[cfg(target_arch = "x86_64")]
+pub const ARCH_NAME: &str = "x86_64";
+#[cfg(not(target_arch = "x86_64"))]
+pub const ARCH_NAME: &str = "unknown";
+
+/// Boot handoff payload. Since Fase 2 Incremento 2, built from the real
+/// UEFI memory map at the `ExitBootServices` transition — see
+/// docs/adr/0002-fase2-exit-boot-services.md. `kernel` still has zero
+/// dependency on the `uefi` crate: `MemoryMap` is `hal`'s own,
+/// firmware-agnostic type.
 pub struct BootInfo {
-    _private: (),
+    pub memory_map: MemoryMap,
 }
 
-pub fn kmain(_boot_info: &BootInfo) -> ! {
-    log::info!("{}", BOOT_OK_MARKER);
-
+pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerControl) -> ! {
+    // SAFETY: called exactly once, as the first thing kmain does, before
+    // any other arch-specific state is touched.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        aion_arch_x86_64::interrupts::init();
+    }
+    // SAFETY: called exactly once, immediately after `init()` above (GDT/
+    // IDT already installed) and before anything else runs.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        aion_arch_x86_64::interrupts::init_timer();
+    }
+    // SAFETY: called exactly once, right after `init_timer()` (the PIC is
+    // remapped) and with interrupts still disabled — nothing above
+    // enabled them.
     #[cfg(target_arch = "x86_64")]
     {
-        aion_arch_x86_64::Cpu.halt_loop()
+        if let Err(err) = unsafe { aion_arch_x86_64::interrupts::init_keyboard() } {
+            // Not fatal: the kernel is still useful (and debuggable via
+            // debugcon) without input, and must never hang on a device.
+            log::error!("AION: PS/2 keyboard unavailable: {err:?}");
+        }
+    }
+    // Every device is configured; this is the one place interrupts come
+    // on. Before this point nothing can fire, so no handler can observe a
+    // half-initialized device.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use aion_hal::InterruptControl;
+        aion_arch_x86_64::Cpu.enable();
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        loop {}
-    }
+    log::info!("{BOOT_OK_MARKER}");
+    log::info!("AION: architecture = {ARCH_NAME}");
+    log::info!("AION: GDT/IDT installed, breakpoint self-test OK");
+    log::info!(
+        "AION: memory map = {} region(s), {} usable pages",
+        boot_info.memory_map.len(),
+        boot_info.memory_map.total_usable_pages()
+    );
+
+    console.write_str(concat!("AION OS v", env!("CARGO_PKG_VERSION"), "\n"));
+    console.write_str("Boot............ UEFI OK\n");
+    console.write_str("Architecture.... ");
+    console.write_str(ARCH_NAME);
+    console.write_str("\n");
+    console.write_str("Kernel.......... READY\n\n");
+
+    shell::run_shell(console, power)
 }

@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: cargo clippy -p aion-hal -p xtask --all-targets -- -D warnings
+      - run: cargo clippy -p aion-hal -p aion-arch-x86_64 -p aion-fbcon -p aion-kernel -p xtask --all-targets -- -D warnings
       - run: cargo clippy -p aion-kernel --target x86_64-unknown-none -- -D warnings
       - run: cargo clippy -p aion-boot --target x86_64-unknown-uefi -- -D warnings
 
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: cargo test -p aion-hal -p xtask
+      - run: cargo test -p aion-hal -p aion-arch-x86_64 -p aion-fbcon -p aion-kernel -p xtask
 
   build-freestanding:
     runs-on: ubuntu-latest
@@ -48,4 +48,4 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
-      - run: cargo xtask boot-test --timeout-secs 30
+      - run: cargo xtask boot-test --timeout-secs 30 --repeat 10

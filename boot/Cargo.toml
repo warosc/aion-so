@@ -7,4 +7,9 @@ publish = false
 [dependencies]
 log = "0.4"
 aion-kernel = { path = "../kernel" }
-uefi = { version = "0.40.0", features = ["panic_handler", "logger", "log-debugcon"] }
+uefi = { version = "0.40.0", features = ["logger", "log-debugcon"] }
+aion-hal = { path = "../hal" }
+aion-fbcon = { path = "../drivers/fbcon" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+aion-arch-x86_64 = { path = "../arch/x86_64" }
