@@ -33,7 +33,8 @@ enum XtaskCommand {
     Build,
     /// Build and run AION OS interactively in QEMU (opens a window).
     Run,
-    /// Run host-runnable unit tests (aion-hal, xtask).
+    /// Run host-runnable unit tests (every crate except `aion-boot`, which
+    /// only builds for UEFI).
     Test,
     /// Run cargo fmt and cargo clippy across every target.
     FmtLint {
@@ -140,6 +141,8 @@ fn test(root: &Path) -> Result<()> {
             "-p",
             "aion-arch-x86_64",
             "-p",
+            "aion-fbcon",
+            "-p",
             "aion-kernel",
             "-p",
             "xtask",
@@ -161,6 +164,8 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "aion-hal",
             "-p",
             "aion-arch-x86_64",
+            "-p",
+            "aion-fbcon",
             "-p",
             "aion-kernel",
             "-p",
