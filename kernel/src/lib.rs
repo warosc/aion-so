@@ -85,11 +85,46 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         frames.covered_frames() * FRAME_SIZE / MIB,
         frames.uncovered_usable_frames()
     );
-    // Virtual and physical addresses still coincide (the firmware's
-    // identity mapping is live; Incremento 6 asserts it), so the address
-    // of a local is a physical address on the live stack.
+    // Virtual and physical addresses coincide (the firmware's identity map;
+    // `KernelPageTable::take_over` checks it before writing anything), so
+    // the address of a local is a physical address on the live stack. This
+    // self-test writes no frame, so it can run before that check.
     let stack_probe = 0u8;
     memory::self_test(&mut frames, core::ptr::addr_of!(stack_probe) as u64);
+
+    // The kernel takes the root page table over from the firmware
+    // (docs/adr/0005-fase2-kernel-page-tables.md). Not fatal if refused: it
+    // keeps running on the firmware's tables, just without a page mapper.
+    #[cfg(target_arch = "x86_64")]
+    let mut page_mapper = {
+        use harlan_arch_x86_64::paging::KernelPageTable;
+        // SAFETY: called once, here, on the only core, before anything else
+        // creates page tables; the firmware's tables are still the active
+        // ones, and no interrupt handler touches page tables.
+        match unsafe { KernelPageTable::take_over(&mut frames) } {
+            Ok(mapper) => {
+                log::info!(
+                    "HARLAN: paging = kernel root table at {:#x}, firmware identity map shared read-only",
+                    mapper.root()
+                );
+                Some(mapper)
+            }
+            Err(err) => {
+                log::error!(
+                    "HARLAN: paging take-over refused ({err:?}); staying on the firmware's page tables"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    if let Some(mapper) = &mut page_mapper {
+        let test_page = harlan_hal::paging::Page::from_start_address(
+            harlan_arch_x86_64::paging::KERNEL_SPACE_START,
+        )
+        .expect("kernel space starts on a page boundary");
+        memory::paging_self_test(mapper, &mut frames, test_page);
+    }
 
     console.write_str(identity::PRODUCT_NAME);
     console.write_str(" ");

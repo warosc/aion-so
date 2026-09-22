@@ -25,7 +25,7 @@
 //! No `unsafe`: this only flips bits in a slice. Nothing here reads or
 //! writes the frames themselves.
 
-use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
+use harlan_hal::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind};
 
 const BITS_PER_WORD: u64 = u64::BITS as u64;
@@ -172,6 +172,14 @@ impl<'a> BitmapFrameAllocator<'a> {
         } else {
             *word &= !mask;
         }
+    }
+}
+
+/// How architecture code (page-table creation) draws frames from this
+/// allocator without depending on the `kernel` crate.
+impl FrameAllocator for BitmapFrameAllocator<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        self.allocate()
     }
 }
 

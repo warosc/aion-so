@@ -1,10 +1,12 @@
-//! Physical memory management. Incremento 5 adds the frame allocator; the
-//! page mapper (Incremento 6) and the kernel heap (Incremento 7) build on it.
+//! Memory management. Incremento 5 adds the frame allocator, Incremento 6
+//! checks the architecture's page mapper at boot; the kernel heap
+//! (Incremento 7) builds on both.
 
 pub mod frame_allocator;
 
 use frame_allocator::{BitmapFrameAllocator, DeallocError};
 use harlan_hal::frame::PhysFrame;
+use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
 
 /// Size of the boot frame allocator's bitmap, in 64-frame words: 1024
 /// words = 65 536 frames = 256 MiB of physical address space, matching the
@@ -45,4 +47,60 @@ pub fn self_test(frames: &mut BitmapFrameAllocator<'_>, live_stack_addr: u64) {
     assert_eq!(frames.deallocate(b), Ok(()));
     assert_eq!(frames.free_frames(), before);
     log::info!("HARLAN: frame allocator self-test OK");
+}
+
+/// Boot-time check of the page mapper on the real page tables: maps a
+/// fresh frame at `test_page` (a kernel-space page nothing else uses),
+/// writes through that mapping and reads the value back through the
+/// frame's identity address, which proves the CPU really walks the tables
+/// the mapper built; then unmaps it and frees the frame. The page tables
+/// built on the way stay (three frames), ready for the next mapping
+/// nearby. Panics on a broken mapper.
+pub fn paging_self_test(
+    mapper: &mut dyn PageMapper,
+    frames: &mut BitmapFrameAllocator<'_>,
+    test_page: Page,
+) {
+    let Some(frame) = frames.allocate() else {
+        log::warn!("HARLAN: page mapper self-test skipped: no free frame");
+        return;
+    };
+    let data = PageFlags {
+        writable: true,
+        executable: false,
+    };
+    // SAFETY: `frame` was just allocated, so nothing else uses it; the only
+    // other access is the deliberate read through its identity address
+    // below.
+    unsafe { mapper.map(test_page, frame, data, frames) }
+        .expect("mapping a fresh kernel-space page failed");
+    let addr = test_page.start_address();
+    assert_eq!(mapper.translate(addr), Some(frame.start_address()));
+    // SAFETY: same page and frame as above; refused without writing.
+    let again = unsafe { mapper.map(test_page, frame, data, frames) };
+    assert_eq!(again, Err(MapError::AlreadyMapped));
+
+    const PATTERN: u64 = u64::from_le_bytes(*b"HARLANOS");
+    // SAFETY: `test_page` is mapped writable to `frame`, which nothing else
+    // uses; a page-aligned address is aligned for `u64`.
+    unsafe { core::ptr::write_volatile(addr as *mut u64, PATTERN) };
+    // SAFETY: the same frame through the firmware's identity map (checked
+    // by the paging take-over before it wrote anything); a read, after the
+    // write above.
+    let seen = unsafe { core::ptr::read_volatile(frame.start_address() as *const u64) };
+    assert_eq!(
+        seen, PATTERN,
+        "a write through the new mapping missed its frame"
+    );
+
+    // SAFETY: nothing refers to `test_page` past this point.
+    assert_eq!(unsafe { mapper.unmap(test_page) }, Ok(frame));
+    assert_eq!(mapper.translate(addr), None);
+    // SAFETY: nothing is mapped at `test_page` any more.
+    assert_eq!(
+        unsafe { mapper.unmap(test_page) },
+        Err(UnmapError::NotMapped)
+    );
+    assert_eq!(frames.deallocate(frame), Ok(()));
+    log::info!("HARLAN: page mapper self-test OK");
 }
