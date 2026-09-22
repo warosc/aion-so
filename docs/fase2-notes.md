@@ -7,6 +7,142 @@
 > equivalen hoy a `HARLAN` / `harlan-*` / `harlan_*`; tabla completa en
 > `docs/adr/0003-brand-migration-harlan.md`.
 
+## Incremento 5 — Administrador de frames físicos (bitmap)
+
+### No se necesitó un ADR nuevo
+
+`BootInfo` conserva su forma (`memory_map: MemoryMap`) y el boot path no
+cambia. `MemoryRegionKind` gana una variante: es un tipo interno de `hal`,
+no una ABI, y el único productor (`boot/src/memory.rs`) y el único
+consumidor (`kernel`) viven en este mismo workspace.
+
+### Hallazgo real: la pila y las tablas de páginas viven en memoria de boot services
+
+Desde el Incremento 2, `hal::memory_map::classify_memory_type` trataba
+`BootServicesCode`/`BootServicesData` como `Usable` tras
+`ExitBootServices`, "como hace el stub EFI de Linux". Pero Linux solo
+reutiliza esa memoria **después** de pasar a su propia pila y a sus propias
+tablas de páginas, y este kernel todavía no ha hecho ninguna de las dos
+cosas. Antes de construir el asignador se midió, con instrumentación
+temporal (revertida; nunca se commiteó), sobre el mapa real de OVMF:
+
+- **La pila en uso** (RSP `0xfe86f70` al entrar en `kmain`) está en una
+  región `BootServicesData` de 32 páginas (128 KiB, `0xfe6b000`).
+- **Todas las tablas de páginas activas** están en `BootServicesData`. Se
+  recorrió la jerarquía completa desde CR3 (`0xf801000`): 1 034 páginas
+  (1 PML4, 2 PDPT, 1 024 PD y 7 PT).
+- **La página física 0** es `Conventional` (`0x0`-`0x87000`): un asignador
+  ingenuo entregaría la dirección `0x0`.
+- El búfer del propio mapa de memoria es `LOADER_DATA` (verificado en el
+  código de `uefi` 0.40: es el tipo por defecto de `exit_boot_services`),
+  así que ya quedaba reservado.
+- 104 descriptores, ninguno solapado ni desalineado. Totales:
+  `Conventional` 52 905 páginas (206,7 MiB), `BootServicesCode` 998,
+  `BootServicesData` 10 000 (≈43 MiB entre ambas). El resto es reservado,
+  runtime, ACPI o MMIO.
+
+Consecuencia: con la clasificación anterior, el primer consumidor que
+escribiera en un frame recién asignado (las tablas nuevas del Incremento 6
+o el heap del Incremento 7) podía pisar la pila en ejecución o una tabla de
+páginas viva. Hoy no se manifestaba solo porque nada asignaba memoria
+todavía. Corrección: `MemoryRegionKind::BootServices` como variante propia,
+el clasificador pierde el parámetro `post_exit` (que ya no significaba
+nada) y el asignador solo gestiona `Usable`. Esos ≈43 MiB (≈17 % de la RAM
+de QEMU) quedan retenidos hasta que el kernel tenga pila y tablas propias
+(Fase 3, con un CR3 por espacio de direcciones). Recuperarlos será entonces
+una decisión explícita, no un efecto de la clasificación.
+
+### Qué hace
+
+- `hal::frame`: `FRAME_SIZE` (4 KiB, igual que la página UEFI) y
+  `PhysFrame`, una dirección física alineada. Vive en `hal` y no en
+  `kernel` porque la paginación del Incremento 6 (en `arch/x86_64`, que no
+  depende de `kernel`) la necesitará.
+- `hal::memory_map`: variante `BootServices` y `total_pages(kind)`.
+- `kernel::memory::frame_allocator::BitmapFrameAllocator`: un bit por
+  frame desde la dirección física 0, sobre almacenamiento que le pasa el
+  llamador. Las reglas se inclinan siempre hacia retener: solo regiones
+  `Usable`, redondeadas hacia dentro; cualquier frame que toque una región
+  no usable queda retenido, redondeado hacia fuera, y gana incluso si se
+  solapa con una usable; la página 0 nunca se entrega; lo que queda fuera
+  de la cobertura se ignora y se cuenta. La aritmética de las regiones es
+  saturada, porque el mapa es un dato del firmware. `allocate` es next-fit
+  a nivel de palabra de 64 bits. `deallocate` valida contra las mismas
+  reglas (`NotManaged`) y detecta la doble liberación (`NotAllocated`).
+  Sin `unsafe`: solo cambia bits de un slice y nunca toca el contenido de
+  los frames.
+- `kernel::memory::FRAME_BITMAP_WORDS = 1024`: 65 536 frames = 256 MiB, el
+  `-m 256M` de `cargo xtask`.
+- `kmain` construye el asignador con el bitmap en su propia pila (8 KiB de
+  los 128 KiB; al entrar en `kmain` se usaban ≈16,5 KiB). `kmain` no
+  retorna nunca, así que vive para siempre, y esa pila está en memoria de
+  boot services, que el asignador retiene. Después registra las cifras y
+  ejecuta `memory::self_test`: comprueba que el frame de la pila viva **no**
+  es asignable (sobre el mapa real) y hace un ciclo de asignar, liberar y
+  detectar la doble liberación.
+
+### Desviaciones del plan original
+
+1. El plan no preveía el problema de la memoria de boot services: es el
+   hallazgo de arriba.
+2. Página 0 retenida y liberación validada (`NotManaged`/`NotAllocated`):
+   el plan solo pedía `free()`.
+3. Palabras `u64` en vez de `&mut [u8]`: permite saltar palabras llenas y
+   usar `trailing_zeros`.
+4. Bitmap en la pila de `kmain` y no en un `static`: así no hace falta
+   `unsafe`, y todavía no hay un consumidor que necesite acceso global.
+5. `PhysFrame` entra ya en `hal`; el trait `FrameAllocator` que usará
+   `arch` **no**: llegará con su primer consumidor, en el Incremento 6.
+
+### Verificación ejecutada
+
+- Host: `cargo xtask test` pasa 94 pruebas en verde (33 `arch`, 17
+  `fbcon`, 13 `hal`, 27 `kernel`, 4 `xtask`). Nuevas: 16 del asignador
+  (entre ellas un extracto del mapa real de OVMF, un modelo de referencia
+  con 10 000 operaciones pseudoaleatorias deterministas, la coherencia
+  frame a frame entre el bitmap y `manages()`, y regiones corruptas cerca
+  de `u64::MAX`), 4 de `PhysFrame` y 1 de `total_pages`. Las pruebas del
+  clasificador se actualizaron.
+- Pruebas de mutación (a mano, revertidas): se introdujeron 5 bugs
+  deliberados, uno cada vez: página 0 entregable; boot services tratada
+  como usable; `manages()` ignorando las regiones retenidas; usable
+  redondeada hacia fuera; y sin detección de doble liberación. Las pruebas
+  detectaron los 5.
+- `cargo xtask fmt-lint` limpio en host, freestanding y UEFI.
+- QEMU: `memory map = 104 region(s), 52902 usable pages, 10998
+  boot-services pages held back` y `frame allocator = 52901 free frame(s)
+  (206 MiB) in the 256 MiB covered, 0 usable frame(s) beyond it ignored`.
+  52 902 − 52 901 = la página 0, porque no hay solapes. `boot-test
+  --repeat 10` (marcador de la shell) dio 10/10; `--marker "HARLAN: frame
+  allocator self-test OK" --repeat 10` dio 10/10; y los ticks siguen
+  avanzando (`ticks=500`).
+- QEMU interactivo (`sendkey` + `screendump`, captura inspeccionada), con
+  el bitmap ya en la pila de `kmain`: banner, `help`, `version` y un
+  comando desconocido responden igual que antes.
+
+### Simplificaciones y riesgos documentados
+
+- Cobertura fija de 256 MiB: la RAM por encima se ignora y se registra.
+  En hardware real (Fase 5) hay que dimensionarla desde el mapa, por
+  ejemplo colocando el bitmap en una región usable.
+- ≈43 MiB de boot services retenidos (ver el hallazgo).
+- El asignador toma prestados el mapa y su almacenamiento, así que vive
+  mientras viva `kmain`. Un asignador global (`'static`, con candado) hará
+  falta cuando lo pidan un manejador de fallos de página o las syscalls
+  (Fase 3).
+- `manages()` recorre el mapa en cada liberación: O(regiones), unas 100
+  hoy.
+- Sin preferencia por memoria baja ni zonas DMA (<16 MiB, <4 GiB): no hay
+  ningún consumidor que las pida.
+- **Los frames se entregan sin poner a cero**: el asignador nunca toca su
+  contenido. Quien los use (las tablas de páginas del Incremento 6) tiene
+  que ponerlos a cero.
+- La comprobación de la pila en `self_test` supone que la dirección
+  virtual coincide con la física (el mapeo de identidad del firmware); el
+  Incremento 6 afirma ese mapeo en tiempo de ejecución.
+- Un solo núcleo y sin candado: el asignador se usa como `&mut` solo desde
+  `kmain`, y ningún manejador de interrupción lo toca.
+
 ## Incremento 4 — Teclado PS/2 por IRQ, consola de framebuffer, shell restaurada
 
 ### No se necesitó un ADR nuevo
