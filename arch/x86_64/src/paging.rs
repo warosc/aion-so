@@ -1,0 +1,712 @@
+//! x86_64 4-level paging: the kernel's page mapper.
+//!
+//! The kernel boots on the firmware's page tables: an identity map of the
+//! first 1 TiB (PML4 slots 0-1, 2 MiB pages) whose own table pages are
+//! mapped read-only, with CR0.WP set (measured on OVMF, see
+//! docs/adr/0005-fase2-kernel-page-tables.md). Writing any of those tables
+//! would fault, so the kernel never does. `KernelPageTable::take_over`
+//! copies the firmware's root table into a frame of the kernel's own and
+//! loads it into CR3: every translation stays the same, the lower-level
+//! firmware tables are shared read-only, and from then on each table the
+//! kernel writes is its own.
+//!
+//! The mapper only maps and unmaps in kernel space (the higher half, PML4
+//! slots 256-511), which the firmware leaves empty. The lower half keeps
+//! the firmware's identity map and is reserved for user space later.
+//!
+//! The walking logic (`PageTables`) is generic over how table memory is
+//! reached (`TableAccess`), so it is host-tested against simulated
+//! physical memory. Only `IdentityAccess` and the register accessors touch
+//! the hardware.
+
+use core::arch::asm;
+
+use harlan_hal::frame::{FrameAllocator, PhysFrame};
+use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
+
+/// First address of kernel space: PML4 slot 256, the start of the
+/// canonical higher half.
+pub const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
+
+const ENTRIES: usize = 512;
+
+const PRESENT: u64 = 1 << 0;
+const WRITABLE: u64 = 1 << 1;
+/// In a PDPT or PD entry: this entry maps a 1 GiB or 2 MiB page itself.
+const HUGE: u64 = 1 << 7;
+const NO_EXECUTE: u64 = 1 << 63;
+/// Bits 12-51: the physical address of the next table or of the page.
+const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+const CR3_FLAGS: u64 = 0x18; // PWT | PCD
+const CR4_PCIDE: u64 = 1 << 17;
+const CR4_LA57: u64 = 1 << 12;
+const IA32_EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+
+/// PML4, PDPT, PD and PT indices of `va`, in walk order.
+fn table_indices(va: u64) -> [usize; 4] {
+    [39, 30, 21, 12].map(|shift| ((va >> shift) & 0x1FF) as usize)
+}
+
+/// Bits 48-63 must repeat bit 47 (4-level paging).
+fn is_canonical(va: u64) -> bool {
+    matches!(va >> 47, 0 | 0x1_FFFF)
+}
+
+/// Why `take_over` refused. The kernel keeps running on the firmware's
+/// tables, without a page mapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagingError {
+    FiveLevelPaging,
+    PcidEnabled,
+    /// EFER.NXE is off: the no-execute bit would be a reserved-bit fault.
+    NoExecuteDisabled,
+    /// A translation the walker relies on is not the identity.
+    NotIdentityMapped,
+    /// The firmware already maps something in kernel space.
+    KernelSpaceInUse,
+    OutOfFrames,
+    TableFrameNotWritable,
+}
+
+/// How the walker reaches table memory, given a table's physical address.
+trait TableAccess {
+    fn read(&self, table: u64, index: usize) -> u64;
+    fn write(&mut self, table: u64, index: usize, value: u64);
+    /// Drops any cached translation of `va`.
+    fn flush(&mut self, va: u64);
+}
+
+struct Translation {
+    phys: u64,
+    writable: bool,
+}
+
+struct PageTables<A: TableAccess> {
+    root: u64,
+    access: A,
+}
+
+impl<A: TableAccess> PageTables<A> {
+    /// Page tables whose root is a fresh copy of `old_root`: the same
+    /// translations, with the lower-level tables shared. Only the new root
+    /// is written.
+    fn adopt(
+        access: A,
+        old_root: u64,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<Self, PagingError> {
+        let mut tables = Self {
+            root: old_root,
+            access,
+        };
+        let kernel_slots = table_indices(KERNEL_SPACE_START)[0]..ENTRIES;
+        if kernel_slots
+            .into_iter()
+            .any(|slot| tables.access.read(old_root, slot) & PRESENT != 0)
+        {
+            return Err(PagingError::KernelSpaceInUse);
+        }
+        let new_root = tables.new_table(frames).map_err(|err| match err {
+            MapError::OutOfFrames => PagingError::OutOfFrames,
+            _ => PagingError::TableFrameNotWritable,
+        })?;
+        for slot in 0..ENTRIES {
+            let entry = tables.access.read(old_root, slot);
+            tables.access.write(new_root, slot, entry);
+        }
+        tables.root = new_root;
+        Ok(tables)
+    }
+
+    fn translate(&self, va: u64) -> Option<Translation> {
+        if !is_canonical(va) {
+            return None;
+        }
+        let mut table = self.root;
+        let mut writable = true;
+        for (level, index) in table_indices(va).into_iter().enumerate() {
+            let entry = self.access.read(table, index);
+            if entry & PRESENT == 0 || (level == 0 && entry & HUGE != 0) {
+                return None;
+            }
+            writable &= entry & WRITABLE != 0;
+            if level == 3 || entry & HUGE != 0 {
+                // 4 KiB, 2 MiB or 1 GiB. Masking with the page size also
+                // drops the PAT bit (bit 12) of large-page entries.
+                let size = 1u64 << (39 - 9 * level);
+                let base = entry & ADDRESS_MASK & !(size - 1);
+                return Some(Translation {
+                    phys: base + (va & (size - 1)),
+                    writable,
+                });
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        None
+    }
+
+    fn map(
+        &mut self,
+        page: u64,
+        frame: PhysFrame,
+        flags: PageFlags,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<(), MapError> {
+        if page < KERNEL_SPACE_START {
+            return Err(MapError::OutsideKernelSpace);
+        }
+        let indices = table_indices(page);
+        let mut table = self.root;
+        for &index in &indices[..3] {
+            let entry = self.access.read(table, index);
+            table = if entry & PRESENT == 0 {
+                let new = self.new_table(frames)?;
+                // Linked only once fully zeroed: the hardware walker never
+                // sees a half-built table.
+                self.access.write(table, index, new | PRESENT | WRITABLE);
+                new
+            } else if entry & HUGE != 0 {
+                return Err(MapError::HugePageInTheWay);
+            } else {
+                entry & ADDRESS_MASK
+            };
+        }
+        if self.access.read(table, indices[3]) & PRESENT != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+        let mut leaf = frame.start_address() | PRESENT;
+        if flags.writable {
+            leaf |= WRITABLE;
+        }
+        if !flags.executable {
+            leaf |= NO_EXECUTE;
+        }
+        self.access.write(table, indices[3], leaf);
+        self.access.flush(page);
+        Ok(())
+    }
+
+    fn unmap(&mut self, page: u64) -> Result<PhysFrame, UnmapError> {
+        if page < KERNEL_SPACE_START {
+            return Err(UnmapError::OutsideKernelSpace);
+        }
+        let indices = table_indices(page);
+        let mut table = self.root;
+        for &index in &indices[..3] {
+            let entry = self.access.read(table, index);
+            if entry & PRESENT == 0 {
+                return Err(UnmapError::NotMapped);
+            }
+            if entry & HUGE != 0 {
+                return Err(UnmapError::HugePageInTheWay);
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        let leaf = self.access.read(table, indices[3]);
+        if leaf & PRESENT == 0 {
+            return Err(UnmapError::NotMapped);
+        }
+        self.access.write(table, indices[3], 0);
+        self.access.flush(page);
+        Ok(PhysFrame::containing_address(leaf & ADDRESS_MASK))
+    }
+
+    /// A zeroed page table in a fresh frame. Tables are written through
+    /// their physical address, so a frame that address does not reach
+    /// writably is refused (and not returned to `frames`, which has no way
+    /// back; that is one leaked frame on a path the checks in `take_over`
+    /// make unexpected).
+    fn new_table(&mut self, frames: &mut dyn FrameAllocator) -> Result<u64, MapError> {
+        let frame = frames
+            .allocate_frame()
+            .ok_or(MapError::OutOfFrames)?
+            .start_address();
+        match self.translate(frame) {
+            Some(t) if t.phys == frame && t.writable => {}
+            _ => return Err(MapError::TableFrameNotWritable),
+        }
+        for index in 0..ENTRIES {
+            self.access.write(frame, index, 0);
+        }
+        Ok(frame)
+    }
+}
+
+/// Reaches a table through its physical address, which the firmware's
+/// identity map (checked by `take_over`) makes a valid virtual address.
+/// Private to this module: `PageTables` only hands it tables reached from
+/// the active root or new tables `new_table` verified identity-mapped and
+/// writable, with indices below 512, and only ever writes the kernel's own
+/// tables (the host tests check that no firmware table is written).
+struct IdentityAccess;
+
+impl TableAccess for IdentityAccess {
+    fn read(&self, table: u64, index: usize) -> u64 {
+        // SAFETY: `table` is the physical address of a page table, valid as
+        // a virtual address under the identity map; `index < 512` keeps the
+        // 8-byte-aligned read inside that 4 KiB page. Volatile because the
+        // CPU's page walker also reads (and sets accessed bits in) this
+        // memory behind the compiler's back.
+        unsafe { core::ptr::read_volatile((table as *const u64).add(index)) }
+    }
+
+    fn write(&mut self, table: u64, index: usize, value: u64) {
+        // SAFETY: as for `read`, and `table` is one of the kernel's own
+        // tables, mapped writable (see the type's documentation), which no
+        // Rust reference points into.
+        unsafe { core::ptr::write_volatile((table as *mut u64).add(index), value) }
+    }
+
+    fn flush(&mut self, va: u64) {
+        // SAFETY: `invlpg` only drops a cached translation; the next access
+        // re-walks the tables. Not `nomem`: it must also order the entry
+        // write before it.
+        unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) }
+    }
+}
+
+/// The kernel's page tables, once it has taken over the root from the
+/// firmware.
+pub struct KernelPageTable {
+    tables: PageTables<IdentityAccess>,
+}
+
+impl KernelPageTable {
+    /// Checks the paging mode, copies the firmware's root table into a
+    /// frame from `frames` and loads it into CR3.
+    ///
+    /// # Safety
+    ///
+    /// - Called at most once, on the only running core, before anything
+    ///   else creates or changes page tables.
+    /// - The firmware's page tables are still the active ones (nothing has
+    ///   loaded CR3 since boot), and no interrupt handler touches page
+    ///   tables.
+    pub unsafe fn take_over(frames: &mut dyn FrameAllocator) -> Result<Self, PagingError> {
+        let cr4 = read_cr4();
+        if cr4 & CR4_LA57 != 0 {
+            return Err(PagingError::FiveLevelPaging);
+        }
+        if cr4 & CR4_PCIDE != 0 {
+            return Err(PagingError::PcidEnabled);
+        }
+        if read_efer() & EFER_NXE == 0 {
+            return Err(PagingError::NoExecuteDisabled);
+        }
+
+        let cr3 = read_cr3();
+        let firmware = PageTables {
+            root: cr3 & ADDRESS_MASK,
+            access: IdentityAccess,
+        };
+        // The walker reads tables through their physical addresses, so the
+        // identity map must hold where it matters: the root table itself
+        // and the stack. (Unlikely garbage from a broken identity map would
+        // also have to translate back to exactly these addresses.)
+        let stack_probe = 0u8;
+        let stack_addr = &raw const stack_probe as u64;
+        for addr in [firmware.root, stack_addr] {
+            if firmware.translate(addr).map(|t| t.phys) != Some(addr) {
+                return Err(PagingError::NotIdentityMapped);
+            }
+        }
+
+        let tables = PageTables::adopt(IdentityAccess, firmware.root, frames)?;
+        // SAFETY: the new root holds the same 512 entries as the active
+        // one, so every translation (code, stack, data, the firmware's
+        // runtime services) is unchanged across the switch; the old root is
+        // left intact. The CR3 cache-control bits are carried over.
+        unsafe { write_cr3(tables.root | (cr3 & CR3_FLAGS)) };
+        Ok(Self { tables })
+    }
+
+    /// Physical address of the kernel's root table (PML4).
+    pub fn root(&self) -> u64 {
+        self.tables.root
+    }
+}
+
+impl PageMapper for KernelPageTable {
+    unsafe fn map(
+        &mut self,
+        page: Page,
+        frame: PhysFrame,
+        flags: PageFlags,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<(), MapError> {
+        self.tables.map(page.start_address(), frame, flags, frames)
+    }
+
+    unsafe fn unmap(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
+        self.tables.unmap(page.start_address())
+    }
+
+    fn translate(&self, addr: u64) -> Option<u64> {
+        self.tables.translate(addr).map(|t| t.phys)
+    }
+}
+
+fn read_cr3() -> u64 {
+    let value;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn read_cr4() -> u64 {
+    let value;
+    // SAFETY: reading CR4 has no side effects.
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn read_efer() -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: IA32_EFER exists on every x86_64 CPU (long mode is enabled
+    // through it) and reading an MSR has no side effects.
+    unsafe {
+        asm!("rdmsr", in("ecx") IA32_EFER, out("eax") low, out("edx") high,
+             options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// # Safety
+///
+/// `value` must name a root table under which the code, stack and data in
+/// use stay mapped exactly as before.
+unsafe fn write_cr3(value: u64) {
+    // SAFETY: forwarded from the caller. Not `nomem`: it changes what every
+    // later memory access means.
+    unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// What a frame holds before the kernel writes it: present-looking
+    /// junk, so a table that is not fully zeroed shows up in a walk.
+    const JUNK: u64 = 0xDEAD_BEEF_DEAD_B0A7;
+    const USER: u64 = 1 << 2;
+
+    /// Simulated physical memory holding page tables. Reading a frame that
+    /// holds no table fails the test (the walker must never read
+    /// non-table memory), and so does writing a firmware table.
+    #[derive(Default)]
+    struct FakeMemory {
+        tables: BTreeMap<u64, [u64; ENTRIES]>,
+        firmware: BTreeSet<u64>,
+        writes: Vec<(u64, usize, u64)>,
+        flushed: Vec<u64>,
+    }
+
+    impl TableAccess for FakeMemory {
+        fn read(&self, table: u64, index: usize) -> u64 {
+            self.tables
+                .get(&table)
+                .unwrap_or_else(|| panic!("read {table:#x}, which holds no table"))[index]
+        }
+
+        fn write(&mut self, table: u64, index: usize, value: u64) {
+            assert!(
+                !self.firmware.contains(&table),
+                "wrote firmware table {table:#x}"
+            );
+            self.tables.entry(table).or_insert([JUNK; ENTRIES])[index] = value;
+            self.writes.push((table, index, value));
+        }
+
+        fn flush(&mut self, va: u64) {
+            self.flushed.push(va);
+        }
+    }
+
+    struct Frames(Vec<u64>);
+
+    impl FrameAllocator for Frames {
+        fn allocate_frame(&mut self) -> Option<PhysFrame> {
+            (!self.0.is_empty()).then(|| PhysFrame::from_start_address(self.0.remove(0)).unwrap())
+        }
+    }
+
+    const FW_ROOT: u64 = 0x20_0000;
+    const FW_PDPT: u64 = 0x20_1000;
+    const FW_PD: u64 = 0x20_2000;
+    const MIB: u64 = 1 << 20;
+    const DATA: PageFlags = PageFlags {
+        writable: true,
+        executable: false,
+    };
+
+    /// Firmware-style tables: identity map of the first 16 MiB in 2 MiB
+    /// pages, with the 2 MiB page that holds the tables themselves mapped
+    /// read-only, as OVMF does.
+    fn firmware() -> FakeMemory {
+        let mut root = [0; ENTRIES];
+        root[0] = FW_PDPT | PRESENT | WRITABLE;
+        let mut pdpt = [0; ENTRIES];
+        pdpt[0] = FW_PD | PRESENT | WRITABLE;
+        let mut pd = [0; ENTRIES];
+        for (k, entry) in pd.iter_mut().enumerate().take(8) {
+            *entry = (k as u64 * 2 * MIB) | PRESENT | WRITABLE | HUGE;
+        }
+        pd[1] &= !WRITABLE;
+        let mut memory = FakeMemory::default();
+        for (addr, table) in [(FW_ROOT, root), (FW_PDPT, pdpt), (FW_PD, pd)] {
+            memory.tables.insert(addr, table);
+            memory.firmware.insert(addr);
+        }
+        memory
+    }
+
+    fn adopted(frames: &mut Frames) -> PageTables<FakeMemory> {
+        PageTables::adopt(firmware(), FW_ROOT, frames).unwrap()
+    }
+
+    fn page(offset: u64) -> u64 {
+        KERNEL_SPACE_START + offset
+    }
+
+    fn frame(addr: u64) -> PhysFrame {
+        PhysFrame::from_start_address(addr).unwrap()
+    }
+
+    #[test]
+    fn table_indices_split_an_address_in_walk_order() {
+        assert_eq!(table_indices(KERNEL_SPACE_START), [256, 0, 0, 0]);
+        let va = KERNEL_SPACE_START + (1 << 39) + (2 << 30) + (3 << 21) + (4 << 12) + 0x123;
+        assert_eq!(table_indices(va), [257, 2, 3, 4]);
+        assert_eq!(table_indices(0x0000_7FFF_FFFF_F000), [255, 511, 511, 511]);
+    }
+
+    #[test]
+    fn canonical_addresses_repeat_bit_47() {
+        assert!(is_canonical(0x0000_7FFF_FFFF_FFFF));
+        assert!(!is_canonical(0x0000_8000_0000_0000));
+        assert!(is_canonical(KERNEL_SPACE_START));
+        assert!(!is_canonical(0xFFFF_7FFF_FFFF_FFFF));
+    }
+
+    #[test]
+    fn translate_follows_the_firmware_identity_map() {
+        let tables = PageTables {
+            root: FW_ROOT,
+            access: firmware(),
+        };
+        let t = tables.translate(0x5_4321).unwrap();
+        assert_eq!((t.phys, t.writable), (0x5_4321, true));
+        let t = tables.translate(FW_PD + 8).unwrap();
+        assert_eq!((t.phys, t.writable), (FW_PD + 8, false));
+        assert!(tables.translate(16 * MIB).is_none());
+        assert!(tables.translate(1 << 47).is_none());
+    }
+
+    #[test]
+    fn translate_handles_1_gib_pages_and_ignores_their_pat_bit() {
+        let mut memory = firmware();
+        memory.tables.get_mut(&FW_PDPT).unwrap()[1] =
+            (1 << 30) | PRESENT | WRITABLE | HUGE | (1 << 12);
+        let tables = PageTables {
+            root: FW_ROOT,
+            access: memory,
+        };
+        assert_eq!(
+            tables.translate((1 << 30) + 0x1234).unwrap().phys,
+            (1 << 30) + 0x1234
+        );
+    }
+
+    #[test]
+    fn adopt_copies_the_root_into_a_frame_of_its_own() {
+        let mut frames = Frames(vec![0x40_0000]);
+        let tables = adopted(&mut frames);
+        assert_eq!(tables.root, 0x40_0000);
+        assert_eq!(
+            tables.access.tables[&0x40_0000],
+            tables.access.tables[&FW_ROOT]
+        );
+        assert_eq!(tables.translate(0x5_4321).unwrap().phys, 0x5_4321);
+        // Every write went to the new root (FakeMemory also rejects
+        // writes to firmware tables outright).
+        assert!(tables.access.writes.iter().all(|&(t, _, _)| t == 0x40_0000));
+    }
+
+    #[test]
+    fn adopt_refuses_a_root_frame_it_cannot_write() {
+        let mut frames = Frames(vec![FW_ROOT + 0x3000]); // in the read-only 2 MiB page
+        let err = PageTables::adopt(firmware(), FW_ROOT, &mut frames).err();
+        assert_eq!(err, Some(PagingError::TableFrameNotWritable));
+    }
+
+    #[test]
+    fn adopt_refuses_firmware_tables_that_use_kernel_space() {
+        let mut memory = firmware();
+        memory.tables.get_mut(&FW_ROOT).unwrap()[300] = FW_PDPT | PRESENT;
+        let err = PageTables::adopt(memory, FW_ROOT, &mut Frames(vec![0x40_0000])).err();
+        assert_eq!(err, Some(PagingError::KernelSpaceInUse));
+    }
+
+    #[test]
+    fn map_builds_zeroed_tables_and_a_no_execute_data_leaf() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        tables
+            .map(page(0x5000), frame(0x90_0000), DATA, &mut frames)
+            .unwrap();
+
+        assert!(frames.0.is_empty(), "PDPT, PD and PT should all be new");
+        let t = tables.translate(page(0x5010)).unwrap();
+        assert_eq!((t.phys, t.writable), (0x90_0010, true));
+        let leaf = tables.access.tables[&0x40_3000][5];
+        assert_eq!(leaf, 0x90_0000 | PRESENT | WRITABLE | NO_EXECUTE);
+        assert_eq!(leaf & USER, 0);
+        for table in [0x40_1000, 0x40_2000, 0x40_3000] {
+            let linked = tables.access.tables[&table]
+                .iter()
+                .filter(|&&e| e != 0)
+                .count();
+            assert_eq!(linked, 1, "table {table:#x} holds junk");
+        }
+        assert_eq!(tables.access.flushed, [page(0x5000)]);
+    }
+
+    #[test]
+    fn tables_are_fully_zeroed_before_they_are_linked() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        tables
+            .map(page(0), frame(0x90_0000), DATA, &mut frames)
+            .unwrap();
+        let writes = &tables.access.writes;
+        for table in [0x40_1000u64, 0x40_2000, 0x40_3000] {
+            // The write that makes another table point at this one...
+            let link = writes
+                .iter()
+                .position(|&(t, _, v)| t != table && v & ADDRESS_MASK == table)
+                .unwrap();
+            // ...comes after every one of its entries was zeroed.
+            let zeroed: BTreeSet<usize> = writes[..link]
+                .iter()
+                .filter(|&&(t, _, v)| t == table && v == 0)
+                .map(|&(_, index, _)| index)
+                .collect();
+            assert_eq!(
+                zeroed.len(),
+                ENTRIES,
+                "{table:#x} linked before it was zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_neighbouring_page_reuses_the_tables() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000]);
+        let mut tables = adopted(&mut frames);
+        tables
+            .map(page(0), frame(0x90_0000), DATA, &mut frames)
+            .unwrap();
+        tables
+            .map(page(0x1000), frame(0x91_0000), DATA, &mut frames)
+            .unwrap();
+        assert_eq!(frames.0, [0x40_4000]);
+        assert_eq!(tables.translate(page(0x1000)).unwrap().phys, 0x91_0000);
+    }
+
+    #[test]
+    fn read_only_executable_flags_give_a_bare_present_leaf() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        let flags = PageFlags {
+            writable: false,
+            executable: true,
+        };
+        tables
+            .map(page(0), frame(0x90_0000), flags, &mut frames)
+            .unwrap();
+        assert_eq!(tables.access.tables[&0x40_3000][0], 0x90_0000 | PRESENT);
+        assert!(!tables.translate(page(0)).unwrap().writable);
+    }
+
+    #[test]
+    fn mapping_an_already_mapped_page_is_refused_without_allocating() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000]);
+        let mut tables = adopted(&mut frames);
+        tables
+            .map(page(0), frame(0x90_0000), DATA, &mut frames)
+            .unwrap();
+        let err = tables.map(page(0), frame(0x91_0000), DATA, &mut frames);
+        assert_eq!(err, Err(MapError::AlreadyMapped));
+        assert_eq!(frames.0, [0x40_4000]);
+        assert_eq!(tables.translate(page(0)).unwrap().phys, 0x90_0000);
+    }
+
+    #[test]
+    fn pages_outside_kernel_space_are_refused_without_writing() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000]);
+        let mut tables = adopted(&mut frames);
+        let writes_before = tables.access.writes.len();
+        let err = tables.map(0x60_0000, frame(0x90_0000), DATA, &mut frames);
+        assert_eq!(err, Err(MapError::OutsideKernelSpace));
+        assert_eq!(tables.unmap(0x60_0000), Err(UnmapError::OutsideKernelSpace));
+        assert_eq!(tables.access.writes.len(), writes_before);
+        assert_eq!(frames.0, [0x40_1000]);
+    }
+
+    #[test]
+    fn running_out_of_frames_leaves_only_complete_tables_behind() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000]);
+        let mut tables = adopted(&mut frames);
+        let err = tables.map(page(0), frame(0x90_0000), DATA, &mut frames);
+        assert_eq!(err, Err(MapError::OutOfFrames));
+        // The PDPT that was built is linked and fully zeroed; nothing else.
+        assert_eq!(tables.access.tables[&0x40_1000], [0; ENTRIES]);
+        assert!(tables.translate(page(0)).is_none());
+        // A later attempt with frames to spare reuses it.
+        let mut more = Frames(vec![0x40_2000, 0x40_3000]);
+        tables
+            .map(page(0), frame(0x90_0000), DATA, &mut more)
+            .unwrap();
+        assert_eq!(tables.translate(page(0)).unwrap().phys, 0x90_0000);
+    }
+
+    #[test]
+    fn a_table_frame_that_cannot_be_written_is_refused_and_not_linked() {
+        let mut frames = Frames(vec![0x40_0000, FW_ROOT + 0x3000]);
+        let mut tables = adopted(&mut frames);
+        let err = tables.map(page(0), frame(0x90_0000), DATA, &mut frames);
+        assert_eq!(err, Err(MapError::TableFrameNotWritable));
+        assert_eq!(tables.access.tables[&0x40_0000][256], 0);
+    }
+
+    #[test]
+    fn unmap_returns_the_frame_and_flushes_the_translation() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        tables
+            .map(page(0x7000), frame(0x90_0000), DATA, &mut frames)
+            .unwrap();
+        assert_eq!(tables.unmap(page(0x7000)), Ok(frame(0x90_0000)));
+        assert!(tables.translate(page(0x7000)).is_none());
+        assert_eq!(tables.access.flushed, [page(0x7000), page(0x7000)]);
+        assert_eq!(tables.unmap(page(0x7000)), Err(UnmapError::NotMapped));
+        assert_eq!(tables.unmap(page(1 << 39)), Err(UnmapError::NotMapped));
+    }
+
+    #[test]
+    fn large_pages_in_kernel_space_are_not_split() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000]);
+        let mut tables = adopted(&mut frames);
+        tables.access.tables.insert(0x40_1000, [0; ENTRIES]);
+        tables.access.tables.get_mut(&0x40_1000).unwrap()[0] =
+            0x4000_0000 | PRESENT | WRITABLE | HUGE;
+        tables.access.tables.get_mut(&0x40_0000).unwrap()[256] = 0x40_1000 | PRESENT | WRITABLE;
+        let err = tables.map(page(0), frame(0x90_0000), DATA, &mut frames);
+        assert_eq!(err, Err(MapError::HugePageInTheWay));
+        assert_eq!(tables.unmap(page(0)), Err(UnmapError::HugePageInTheWay));
+        assert_eq!(tables.translate(page(0x1234)).unwrap().phys, 0x4000_1234);
+    }
+}
