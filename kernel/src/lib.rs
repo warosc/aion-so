@@ -146,6 +146,13 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         }
     }
 
+    // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
+    // heap stress rounds until QEMU is stopped.
+    #[cfg(target_arch = "x86_64")]
+    if cfg!(feature = "soak") {
+        memory::heap::soak();
+    }
+
     console.write_str(identity::PRODUCT_NAME);
     console.write_str(" ");
     console.write_str(identity::VERSION);

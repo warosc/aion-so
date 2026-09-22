@@ -224,6 +224,25 @@ impl SplitMix64 {
     }
 }
 
+/// Stress cycles per round of `soak`.
+pub const SOAK_ROUND_CYCLES: u64 = 20_000;
+
+/// Soak builds only (`soak` feature, `cargo xtask soak-test`): endless
+/// rounds of `stress` over the global heap, each with a different seed,
+/// instead of the shell. Interrupts stay live throughout, so the timer
+/// keeps firing between (and never inside) the heap's critical sections.
+/// Logs a running total after every round; any corruption panics.
+#[cfg(target_arch = "x86_64")]
+pub fn soak() -> ! {
+    log::info!("HARLAN: soak mode: heap stress rounds instead of the shell");
+    let (mut round, mut total) = (0u64, 0u64);
+    loop {
+        round += 1;
+        total += stress(&HEAP, SOAK_ROUND_CYCLES, 0x534F_414B ^ round).cycles;
+        log::info!("HARLAN: soak round {round}: {total} heap cycles, 0 corruption");
+    }
+}
+
 /// Boot-time check of the global heap: ordinary `alloc` types land inside
 /// the heap's range and behave, then `STRESS_CYCLES` of `stress`.
 #[cfg(target_arch = "x86_64")]

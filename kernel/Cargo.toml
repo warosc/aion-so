@@ -7,6 +7,8 @@ publish = false
 [features]
 # Long heap stress run at boot instead of the quick one (see memory::heap).
 heap-stress = []
+# Heap stress rounds forever instead of the shell (cargo xtask soak-test).
+soak = []
 
 [dependencies]
 harlan-hal = { path = "../hal" }

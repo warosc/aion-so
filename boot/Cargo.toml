@@ -6,6 +6,7 @@ publish = false
 
 [features]
 heap-stress = ["harlan-kernel/heap-stress"]
+soak = ["harlan-kernel/soak"]
 
 [dependencies]
 log = "0.4"
