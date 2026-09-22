@@ -21,7 +21,7 @@
 
 use core::arch::asm;
 
-use harlan_hal::frame::{FrameAllocator, PhysFrame};
+use harlan_hal::frame::{FrameAllocator, PhysFrame, PhysRange};
 use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
 
 /// First address of kernel space: PML4 slot 256, the start of the
@@ -96,6 +96,9 @@ pub struct IdentityMapStats {
     pub tables: u64,
     /// Physical address space it covers, from 0.
     pub limit: u64,
+    /// 4 KiB pages left executable; everything else in the map is
+    /// no-execute.
+    pub executable_pages: u64,
 }
 
 /// How the walker reaches table memory, given a table's physical address.
@@ -252,6 +255,7 @@ impl<A: TableAccess> PageTables<A> {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
+        executable: &[PhysRange],
     ) -> Result<IdentityMapStats, PagingError> {
         if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
             return Err(PagingError::BadIdentityLimit);
@@ -265,26 +269,49 @@ impl<A: TableAccess> PageTables<A> {
         // end, so the map in use never loses a translation it is running
         // on.
         let pdpt = self.new_table(frames).map_err(to_paging)?;
-        let mut tables = 1;
+        let (mut tables, mut executable_pages) = (1, 0);
         for slot in 0..(limit / GIB) as usize {
             let directory = self.new_table(frames).map_err(to_paging)?;
             tables += 1;
             for entry in 0..ENTRIES {
                 let base = slot as u64 * GIB + entry as u64 * LARGE_PAGE;
-                self.access
-                    .write(directory, entry, base | PRESENT | WRITABLE | HUGE);
-            }
-            if slot == 0 {
-                // The first 2 MiB at 4 KiB granularity, so that the null
-                // page can be left out: a null dereference then faults
-                // instead of reading or writing real memory.
+                // A 2 MiB page will do wherever the whole range is data.
+                // The first 2 MiB (the null page has to be left out) and
+                // anything holding code need 4 KiB granularity.
+                let fine_grained = base == 0
+                    || executable
+                        .iter()
+                        .any(|range| range.overlaps(base, base + LARGE_PAGE));
+                if !fine_grained {
+                    self.access.write(
+                        directory,
+                        entry,
+                        base | PRESENT | WRITABLE | HUGE | NO_EXECUTE,
+                    );
+                    continue;
+                }
                 let table = self.new_table(frames).map_err(to_paging)?;
                 tables += 1;
-                for entry in 1..ENTRIES {
-                    let page = entry as u64 * PAGE;
-                    self.access.write(table, entry, page | PRESENT | WRITABLE);
+                for index in 0..ENTRIES {
+                    let page = base + index as u64 * PAGE;
+                    // The null page stays out, so a null dereference faults
+                    // instead of reading or writing real memory.
+                    if page == 0 {
+                        continue;
+                    }
+                    let runs_code = executable
+                        .iter()
+                        .any(|range| range.overlaps(page, page + PAGE));
+                    executable_pages += u64::from(runs_code);
+                    let flags = if runs_code {
+                        PRESENT | WRITABLE
+                    } else {
+                        PRESENT | WRITABLE | NO_EXECUTE
+                    };
+                    self.access.write(table, index, page | flags);
                 }
-                self.access.write(directory, 0, table | PRESENT | WRITABLE);
+                self.access
+                    .write(directory, entry, table | PRESENT | WRITABLE);
             }
             self.access
                 .write(pdpt, slot, directory | PRESENT | WRITABLE);
@@ -295,7 +322,11 @@ impl<A: TableAccess> PageTables<A> {
             self.access.write(self.root, slot, 0);
         }
         self.access.flush_all();
-        Ok(IdentityMapStats { tables, limit })
+        Ok(IdentityMapStats {
+            tables,
+            limit,
+            executable_pages,
+        })
     }
 
     /// A zeroed page table in a fresh frame. Tables are written through
@@ -422,15 +453,20 @@ impl KernelPageTable {
     }
 
     /// Replaces the firmware's identity map with one built from the
-    /// kernel's own frames, covering `0..limit` and leaving the null page
-    /// unmapped. After this the kernel no longer reads or depends on any
-    /// page table the firmware built.
+    /// kernel's own frames, covering `0..limit`, leaving the null page
+    /// unmapped and every page no-execute except the `executable` ranges.
+    /// After this the kernel no longer reads or depends on any page table
+    /// the firmware built.
     ///
     /// # Safety
     ///
     /// - Everything the kernel runs on or reaches through the identity map
     ///   — its image, its page tables, the framebuffer, and every frame the
     ///   allocator can hand out — must lie below `limit`.
+    /// - `executable` must list every range of code the kernel still runs
+    ///   through this map: its own image, and the firmware's runtime
+    ///   services code. Leaving one out turns the next call into it into a
+    ///   fault.
     /// - Nothing may depend on the null page being mapped, or on anything
     ///   the firmware mapped in the lower half above `limit`.
     /// - Called on the only core, with no interrupt handler touching page
@@ -439,8 +475,9 @@ impl KernelPageTable {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
+        executable: &[PhysRange],
     ) -> Result<IdentityMapStats, PagingError> {
-        self.tables.rebuild_identity(frames, limit)
+        self.tables.rebuild_identity(frames, limit, executable)
     }
 }
 
@@ -829,12 +866,13 @@ mod tests {
         let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
         let mut tables = adopted(&mut frames);
         // 1 GiB: one PDPT, one page directory and one page table.
-        let stats = tables.rebuild_identity(&mut frames, GIB).unwrap();
+        let stats = tables.rebuild_identity(&mut frames, GIB, &[]).unwrap();
         assert_eq!(
             stats,
             IdentityMapStats {
                 tables: 3,
-                limit: GIB
+                limit: GIB,
+                executable_pages: 0,
             }
         );
 
@@ -855,6 +893,43 @@ mod tests {
         );
     }
 
+    /// Everything is no-execute but the ranges that hold code, and only the
+    /// 2 MiB regions those fall in are split into 4 KiB pages.
+    #[test]
+    fn only_the_ranges_that_hold_code_stay_executable() {
+        let image = PhysRange::new(0x40_0000 + 0x2000, 2 * PAGE);
+        let mut frames = Frames(vec![
+            0x80_0000, 0x80_1000, 0x80_2000, 0x80_3000, 0x80_4000, 0x80_5000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        let stats = tables
+            .rebuild_identity(&mut frames, GIB, core::slice::from_ref(&image))
+            .unwrap();
+        // PDPT, page directory, the first 2 MiB, and the 2 MiB with the image.
+        assert_eq!((stats.tables, stats.executable_pages), (4, 2));
+
+        let executable = |addr: u64| {
+            let mut table = tables.root;
+            for (level, index) in table_indices(addr).into_iter().enumerate() {
+                let entry = tables.access.read(table, index);
+                assert_ne!(entry & PRESENT, 0, "{addr:#x} is not mapped");
+                if entry & NO_EXECUTE != 0 {
+                    return false;
+                }
+                if level == 3 || entry & HUGE != 0 {
+                    return true;
+                }
+                table = entry & ADDRESS_MASK;
+            }
+            unreachable!()
+        };
+        assert!(executable(image.start) && executable(image.end() - 1));
+        assert!(!executable(image.start - PAGE), "the page below the image");
+        assert!(!executable(image.end()), "the page above the image");
+        assert!(!executable(0x1000), "low memory is data");
+        assert!(!executable(0x2000_0000), "a plain 2 MiB page");
+    }
+
     #[test]
     fn rebuilding_keeps_kernel_space_and_drops_the_rest_of_the_lower_half() {
         let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000]);
@@ -868,7 +943,7 @@ mod tests {
             .access
             .write(tables.root, 200, 0x60_0000 | PRESENT | WRITABLE);
 
-        tables.rebuild_identity(&mut frames, GIB).unwrap();
+        tables.rebuild_identity(&mut frames, GIB, &[]).unwrap();
 
         let root = tables.access.tables[&tables.root];
         assert_eq!(root[300], 0x50_0000 | PRESENT | WRITABLE, "kernel space");
@@ -886,16 +961,16 @@ mod tests {
         let before = tables.access.tables[&tables.root][0];
 
         assert_eq!(
-            tables.rebuild_identity(&mut frames, GIB + PAGE),
+            tables.rebuild_identity(&mut frames, GIB + PAGE, &[]),
             Err(PagingError::BadIdentityLimit)
         );
         assert_eq!(
-            tables.rebuild_identity(&mut frames, 1024 * GIB),
+            tables.rebuild_identity(&mut frames, 1024 * GIB, &[]),
             Err(PagingError::BadIdentityLimit)
         );
         // One frame short of the PDPT, directory and page table it needs.
         assert_eq!(
-            tables.rebuild_identity(&mut frames, GIB),
+            tables.rebuild_identity(&mut frames, GIB, &[]),
             Err(PagingError::OutOfFrames)
         );
         assert_eq!(tables.access.tables[&tables.root][0], before);
