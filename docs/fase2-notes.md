@@ -9,12 +9,16 @@
 
 ## Incremento 5 — Administrador de frames físicos (bitmap)
 
-### No se necesitó un ADR nuevo
+### ADR
 
-`BootInfo` conserva su forma (`memory_map: MemoryMap`) y el boot path no
-cambia. `MemoryRegionKind` gana una variante: es un tipo interno de `hal`,
-no una ABI, y el único productor (`boot/src/memory.rs`) y el único
-consumidor (`kernel`) viven en este mismo workspace.
+`docs/adr/0004-fase2-physical-memory-policy.md`. La primera versión de este
+incremento sostenía que no hacía falta ADR, porque `BootInfo` conserva su
+forma y `MemoryRegionKind` es un tipo interno de `hal`. La revisión
+cruzada (Codex) lo corrigió: el incremento fija qué memoria física es del
+kernel (layout de memoria, que `CLAUDE.md` pone entre los cambios que
+exigen ADR) y cambia la semántica del mapa que `boot` entrega en
+`BootInfo`. El ADR 0004 registra la decisión y sus alternativas; estas
+notas conservan la medición y la verificación.
 
 ### Hallazgo real: la pila y las tablas de páginas viven en memoria de boot services
 
