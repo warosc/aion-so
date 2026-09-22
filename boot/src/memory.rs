@@ -13,7 +13,7 @@ pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
         let region = MemoryRegion {
             start_phys_addr: descriptor.phys_start,
             page_count: descriptor.page_count,
-            kind: classify_memory_type(descriptor.ty.0, true),
+            kind: classify_memory_type(descriptor.ty.0),
         };
         if !map.push(region) {
             dropped += 1;
