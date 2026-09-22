@@ -49,3 +49,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
       - run: cargo xtask boot-test --timeout-secs 30 --repeat 10
+      - run: cargo xtask boot-test --timeout-secs 120 --heap-stress --marker "HARLAN: heap stress complete, 200000 cycles"

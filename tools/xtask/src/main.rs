@@ -54,6 +54,10 @@ enum XtaskCommand {
         /// that doesn't reach the marker in time.
         #[arg(long, default_value_t = 1)]
         repeat: u32,
+        /// Build with the `heap-stress` feature: the boot self-test runs the
+        /// long heap stress workload instead of the quick one.
+        #[arg(long)]
+        heap_stress: bool,
     },
 }
 
@@ -62,7 +66,7 @@ fn main() -> Result<()> {
     let root = workspace_root();
 
     match cli.command {
-        XtaskCommand::Build => build(&root),
+        XtaskCommand::Build => build(&root, false),
         XtaskCommand::Run => run(&root),
         XtaskCommand::Test => test(&root),
         XtaskCommand::FmtLint { fix } => fmt_lint(&root, fix),
@@ -71,7 +75,14 @@ fn main() -> Result<()> {
             timeout_secs,
             marker,
             repeat,
-        } => boot_test(&root, Duration::from_secs(timeout_secs), &marker, repeat),
+            heap_stress,
+        } => boot_test(
+            &root,
+            Duration::from_secs(timeout_secs),
+            &marker,
+            repeat,
+            heap_stress,
+        ),
     }
 }
 
@@ -102,16 +113,23 @@ fn run_cargo(root: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn build(root: &Path) -> Result<()> {
-    run_cargo(
-        root,
-        &["build", "-p", "harlan-kernel", "--target", KERNEL_TARGET],
-    )?;
-    run_cargo(
-        root,
-        &["build", "-p", "harlan-boot", "--target", UEFI_TARGET],
-    )?;
+fn build(root: &Path, heap_stress: bool) -> Result<()> {
+    for args in build_commands(heap_stress) {
+        run_cargo(root, &args)?;
+    }
     assemble_esp(root)
+}
+
+/// The cargo invocations `build` runs. Pure so the feature plumbing is
+/// unit-testable: `harlan-boot` forwards `heap-stress` to `harlan-kernel`.
+fn build_commands(heap_stress: bool) -> [Vec<&'static str>; 2] {
+    let mut kernel = vec!["build", "-p", "harlan-kernel", "--target", KERNEL_TARGET];
+    let mut boot = vec!["build", "-p", "harlan-boot", "--target", UEFI_TARGET];
+    if heap_stress {
+        kernel.extend(["--features", "heap-stress"]);
+        boot.extend(["--features", "heap-stress"]);
+    }
+    [kernel, boot]
 }
 
 fn assemble_esp(root: &Path) -> Result<()> {
@@ -319,7 +337,7 @@ fn prepare_qemu_config(root: &Path, headless: bool, debug_stub: bool) -> Result<
 }
 
 fn run(root: &Path) -> Result<()> {
-    build(root)?;
+    build(root, false)?;
     let cfg = prepare_qemu_config(root, false, false)?;
     let args = build_qemu_args(&cfg);
     let status = Command::new(qemu_binary())
@@ -333,7 +351,7 @@ fn run(root: &Path) -> Result<()> {
 }
 
 fn debug(root: &Path) -> Result<()> {
-    build(root)?;
+    build(root, false)?;
     let cfg = prepare_qemu_config(root, false, true)?;
     let args = build_qemu_args(&cfg);
     println!("QEMU paused at reset; gdbstub listening on tcp::1234 (see .vscode/launch.json)");
@@ -347,8 +365,14 @@ fn debug(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn boot_test(root: &Path, timeout: Duration, marker: &str, repeat: u32) -> Result<()> {
-    build(root)?;
+fn boot_test(
+    root: &Path,
+    timeout: Duration,
+    marker: &str,
+    repeat: u32,
+    heap_stress: bool,
+) -> Result<()> {
+    build(root, heap_stress)?;
     for attempt in 1..=repeat {
         boot_test_once(root, timeout, marker)
             .with_context(|| format!("boot-test attempt {attempt}/{repeat} failed"))?;
@@ -460,6 +484,21 @@ mod tests {
         let args = build_qemu_args(&cfg);
         assert!(args.contains(&"-s".to_string()));
         assert!(args.contains(&"-S".to_string()));
+    }
+
+    #[test]
+    fn heap_stress_builds_both_crates_with_the_feature() {
+        for command in build_commands(true) {
+            assert!(
+                command
+                    .windows(2)
+                    .any(|w| w == ["--features", "heap-stress"]),
+                "{command:?}"
+            );
+        }
+        for command in build_commands(false) {
+            assert!(!command.contains(&"--features"), "{command:?}");
+        }
     }
 
     #[test]
