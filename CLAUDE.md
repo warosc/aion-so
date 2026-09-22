@@ -2,7 +2,7 @@
 
 ## Misión
 
-Construir o revisar subsistemas de AION OS sin romper los contratos definidos en `ARCHITECTURE.md`.
+Construir o revisar subsistemas de HARLAN OS sin romper los contratos definidos en `ARCHITECTURE.md`.
 
 ## Inicio de cada tarea
 

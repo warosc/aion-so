@@ -1,5 +1,11 @@
 # ADR 0002: Fase 2 sale de UEFI Boot Services
 
+> **Nota (ADR 0003):** documento anterior a la migración de marca AION OS →
+> HARLAN OS. Se conserva sin reescribir porque registra lo que se decidió y
+> observó entonces. `AION` / `aion-*` / `aion_*` equivalen hoy a `HARLAN` /
+> `harlan-*` / `harlan_*`; tabla completa en
+> `docs/adr/0003-brand-migration-harlan.md`.
+
 ## Contexto
 
 `docs/adr/0001-fase0-boot-path.md` predijo este momento: "Cuando Fase 1

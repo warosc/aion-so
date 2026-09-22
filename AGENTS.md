@@ -2,7 +2,7 @@
 
 ## Misión
 
-Implementar AION OS de forma incremental, verificable y segura conforme a `ARCHITECTURE.md` y `ROADMAP.md`.
+Implementar HARLAN OS de forma incremental, verificable y segura conforme a `ARCHITECTURE.md` y `ROADMAP.md`.
 
 ## Antes de editar
 
@@ -42,4 +42,4 @@ Al terminar, reporta:
 - pasos exactos para reproducir;
 - revisión recomendada para Claude.
 
-Nunca afirmes que AION arranca si no fue observado en QEMU o en el hardware indicado.
+Nunca afirmes que HARLAN OS arranca si no fue observado en QEMU o en el hardware indicado.
