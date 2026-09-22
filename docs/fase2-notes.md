@@ -55,6 +55,65 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 9 — Los frames se entregan a cero (endurecimiento)
+
+Primero de los tres incrementos de endurecimiento que pidió el usuario tras
+cerrar la Fase 2, con la estrategia completa en `docs/memory-safety.md`.
+Los otros dos: guard pages, y pila y tablas propias (que además permitirán
+recuperar la memoria de boot services y dejar la página 0 sin mapear).
+
+### ADR
+
+No hay ADR nuevo: es una actualización del ADR 0004, que decía
+explícitamente que los frames se entregaban sin poner a cero.
+
+### Qué hace
+
+- `PhysWindow`: el único sitio que convierte un frame físico en un puntero
+  (`base + dirección física`). Hoy es el mapa de identidad (base 0), que la
+  toma de control de la paginación verifica; en la Fase 3 solo cambiará la
+  base. `frame_ptr` comprueba el desbordamiento.
+- `ZeroedFrames<A>`: envuelve un asignador y pone a cero cada frame antes de
+  entregarlo, de modo que **ningún consumidor puede olvidarlo**: ni una
+  tabla nueva con entradas basura, ni un frame que conserve lo que escribió
+  su dueño anterior. El asignador de bitmap sigue siendo puro y sin
+  `unsafe`; todo el acceso a memoria de este camino vive en el envoltorio.
+- `KernelFrames` (el alias que usa el kernel) expone además las operaciones
+  del bitmap: liberar, contar y consultar.
+- La autoprueba de arranque escribe un patrón en un frame, lo libera y
+  exige que **vuelva a cero** al reutilizarse.
+- `cargo xtask boot-test`/`soak-test` aceptan `--memory`, así que el
+  arranque y el soak se prueban con varias cantidades de RAM (punto 10 de
+  la estrategia).
+
+### Verificación ejecutada
+
+- Host: 150 pruebas en verde (4 nuevas de `ZeroedFrames`/`PhysWindow` y 1
+  de los argumentos de memoria). Las nuevas usan páginas reales del proceso
+  de prueba, así que ejercitan el mismo código `unsafe` que el kernel.
+- Pruebas de mutación (a mano, revertidas): entregar el frame sin ponerlo a
+  cero; poner a cero solo un byte; y que la ventana ignore la dirección del
+  frame o su base. Las 4 detectadas (una de ellas tumbando el proceso de
+  pruebas, que también es detección). El detector de mutaciones mira ahora
+  el código de salida, no solo la cadena `test result: FAILED`: dos de
+  estas mutaciones no fallan "limpiamente".
+- QEMU con 256 MiB, 512 MiB y 1 GiB: arranca en los tres casos. Con 512 MiB
+  quedan 56 939 marcos usables ignorados por encima de la cobertura y con
+  1 GiB, 188 011: la limitación de cobertura fija se comporta como está
+  documentada, sin pánico y registrada en el log.
+- `boot-test --repeat 10` 10/10; `--memory 1G --repeat 3` 3/3; soak de
+  120 s con 256 MiB y con 512 MiB: PASS.
+- Log de arranque: `frame allocator self-test OK (frames arrive zeroed)` y
+  `heap = 4096 KiB …, 1036 zeroed so far`.
+
+### Riesgos y límites
+
+- Poner a cero cuesta una escritura de 4 KiB por frame. En el arranque son
+  ~1 036 frames (4 MiB), imperceptible; si algún día se asignan muchos
+  frames por segundo, habrá que medirlo.
+- La ventana sigue siendo el mapa de identidad del firmware: mientras siga
+  vigente, el kernel depende de él para tocar memoria física.
+
 ## Incremento 8 — Soak test y cierre de la fase
 
 ### No se necesitó ADR
