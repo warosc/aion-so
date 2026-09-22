@@ -7,6 +7,122 @@
 > equivalen hoy a `HARLAN` / `harlan-*` / `harlan_*`; tabla completa en
 > `docs/adr/0003-brand-migration-harlan.md`.
 
+## Cierre de Fase 2
+
+**Criterio de salida de `ROADMAP.md`**: "prueba prolongada sin corrupción
+de memoria ni panic inesperado". Se cumple con `cargo xtask soak-test`
+(Incremento 8):
+
+- 120 s en cada PR (CI);
+- una corrida manual de 30 minutos, que `WORKFLOW.md` exige antes de
+  promover `develop` a `main` (resultado en el Incremento 8).
+
+La corrida larga mantiene el heap bajo estrés continuo, verificando el
+contenido de cada bloque, mientras el temporizador interrumpe 100 veces por
+segundo. Se exige que no haya pánico, excepción ni reinicio de CPU.
+
+Lo que dejó la fase: GDT/IDT con manejadores de excepción, salida de Boot
+Services, PIC/PIT a 100 Hz, teclado PS/2 por IRQ, consola sobre el
+framebuffer GOP, asignador de frames, mapper con raíz propia en la mitad
+alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
+0005 y 0006.
+
+### Límites que hereda la Fase 3 y siguientes
+
+- **Memoria física**: cobertura fija de 256 MiB. La memoria de boot
+  services (≈43 MiB) está retenida porque la pila y las tablas inferiores
+  del firmware viven ahí. Los frames se entregan sin poner a cero. No hay
+  zonas DMA. El asignador no es `'static` ni tiene candado. (ADR 0004)
+- **Memoria virtual**: la página 0 está mapeada con escritura, así que una
+  desreferencia nula no falla. La raíz del kernel está en `0x1000`
+  (memoria baja; revisar al llegar SMP). No se parten páginas grandes ni se
+  liberan tablas intermedias. El mapper vive en `kmain`. Recuperar la
+  memoria de boot services y desmapear la página 0 requieren reconstruir
+  el mapa de identidad (Fase 3). (ADR 0005)
+- **Heap**: 4 MiB fijos, primer ajuste lineal, metadatos dentro del heap
+  (acotados por comprobación de límites y `check()`). Ningún manejador de
+  interrupción debe asignar memoria. Sin heap si `take_over` se rechaza.
+  (ADR 0006)
+- **Interrupciones**: PIC/PIT, no APIC; un solo núcleo. `IrqLock` provoca
+  un pánico ante reentrada: con SMP tendrá que girar en espera. Solo
+  algunos vectores de excepción tienen manejador explícito (el resto cae en
+  `#DF`).
+- **Consola y teclado**: US QWERTY y Shift. La latencia de hasta 10 ms por
+  despertar perdido en `idle_once`. Sin cursor, scrollback ni color. Solo
+  GOP RGB/BGR. El framebuffer se usa tras `ExitBootServices`, algo que la
+  especificación UEFI no garantiza (revalidar en la Fase 5).
+- **Verificación**: todo en QEMU/TCG con OVMF; nada en hardware físico ni
+  con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
+  ejercita el teclado.
+
+## Incremento 8 — Soak test y cierre de la fase
+
+### No se necesitó ADR
+
+No cambia el layout de memoria, la ABI ni el boot path. La feature `soak`
+solo cambia lo que `kmain` hace después de todas las autopruebas, y solo en
+las compilaciones de prueba.
+
+### Qué hace
+
+- Feature `soak` (`harlan-boot` la reenvía a `harlan-kernel`): después de
+  las autopruebas, `kmain` ejecuta `memory::heap::soak()` en lugar de la
+  shell. Son rondas infinitas de `stress`, de 20 000 ciclos cada una y con
+  una semilla distinta por ronda, con las interrupciones vivas. Tras cada
+  ronda registra `HARLAN: soak round R: T heap cycles, 0 corruption`.
+- `cargo xtask soak-test --duration-secs --min-ticks --min-heap-cycles`:
+  compila con `soak` y deja correr QEMU (sin pantalla) toda la duración,
+  con `-d guest_errors,cpu_reset -D target/soak-test-qemu.log`. Después,
+  `analyze_soak` (función pura, con pruebas unitarias) exige:
+  - que QEMU siga vivo todo el tiempo;
+  - ninguna línea de pánico, excepción o NMI;
+  - los tres marcadores de arranque exactamente una vez (detecta bucles de
+    reinicio);
+  - ticks estrictamente crecientes y por encima del mínimo;
+  - rondas consecutivas y un total de ciclos por encima del mínimo;
+  - **ningún reinicio de CPU después del arranque**.
+- `build_commands` acepta una lista de features, y `--heap-stress` la usa.
+- CI: nuevo job `soak-test`, de 120 s con al menos 10 000 ticks y 50 000
+  ciclos.
+
+### Hallazgos reales
+
+- **Formato de `-d cpu_reset` medido en QEMU 11.1.0**, no supuesto: cada
+  reinicio empieza con `CPU Reset (CPU 0)` seguido de un volcado de
+  registros. Al crear la máquina salen 2; un `reboot` del invitado añade 1;
+  un arranque normal no produce ninguna línea de `guest_errors`. Como la CI
+  usa otra versión de QEMU (la de Ubuntu), no se fija ese "2": xtask cuenta
+  los reinicios en el momento en que aparece el marcador del soak, y
+  cualquier aumento posterior es un fallo. Sirve con cualquier versión.
+- **Prueba negativa de extremo a extremo**: un triple fault provocado a
+  propósito en la ronda 30 (IDT vacío más `int3`) **no deja rastro en el
+  log del kernel**, porque ningún manejador puede ejecutarse. El soak-test
+  falla igualmente por seis vías: marcadores ×3, ticks que retroceden,
+  rondas no consecutivas y "2 CPU reset(s) after the kernel booted". Es
+  justo el caso que justificaba la señal ortogonal de QEMU. La mutación se
+  revirtió.
+
+### Verificación ejecutada
+
+- Host: `cargo xtask test` pasa 145 pruebas en verde (51 `arch`, 17
+  `fbcon`, 15 `hal`, 49 `kernel`, 13 `xtask`). Nuevas: 8 de `xtask`
+  (features, argumentos `-d`, y el analizador ante un soak sano, progreso
+  insuficiente, pánico o excepción, segundo arranque, arranque ausente,
+  ticks estancados o rondas saltadas, y reinicio tras el arranque).
+- `cargo xtask fmt-lint` limpio; `clippy` de `harlan-boot` con
+  `--features soak,heap-stress` sin avisos.
+- `cargo xtask soak-test --duration-secs 120 --min-ticks 10000
+  --min-heap-cycles 50000`: **PASS**, con 11 700 ticks, **4 580 000 ciclos
+  de heap en 229 rondas**, 2 reinicios de CPU al crear la máquina y ninguno
+  después.
+- Prueba negativa del triple fault: **FAIL** como se esperaba (ver arriba).
+- **Corrida manual de 30 minutos** (`--duration-secs 1800 --min-ticks
+  150000 --min-heap-cycles 10000000`): **PASS**, con **179 400 ticks** (1 794 s
+  a 100 Hz), **68 600 000 ciclos de heap en 3 430 rondas**, 0 corrupción, 0
+  pánicos o excepciones, y ningún reinicio de CPU tras el arranque.
+- Tras añadir la feature, el arranque normal se volvió a verificar:
+  `boot-test --repeat 10` 10/10 y `--heap-stress` correcto.
+
 ## Incremento 7 — Heap del kernel
 
 ### ADR
