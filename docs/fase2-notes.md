@@ -55,6 +55,59 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 13 — Cada marco sabe para qué se usa (endurecimiento)
+
+El punto 2 de la estrategia de `docs/memory-safety.md`: estado explícito por
+marco, con transiciones que fallan en vez de continuar en silencio.
+
+### Qué hace
+
+- `FramePurpose`: para qué tiene el kernel cada marco —`Boot`, `PageTable`,
+  `Heap`, `Stack`, `Kernel`—, guardado en una tabla de un byte por marco que
+  vive en el heap (64 KiB).
+- `allocate_for(purpose)` registra el propósito al entregar el marco.
+  Las asignaciones que llegan por el trait `FrameAllocator` —el único
+  consumidor es la creación de tablas de páginas en `arch`— se registran
+  como `PageTable`.
+- `deallocate_as(frame, purpose)` **falla si el propósito no coincide**
+  (`WrongPurpose { expected, actual }`) y no libera nada: devolver una tabla
+  de páginas como si fuera una página del heap es un error, no un descuido
+  silencioso.
+- `label(frame, purpose)` rellena lo que se asignó antes de que la tabla
+  existiera, y solo toca marcos que el kernel tiene de verdad.
+- El heap y las pilas se etiquetan después, preguntando a las tablas de
+  páginas a qué marco va cada una de sus páginas
+  (`label_mapped_frames`).
+- El arranque registra el desglose.
+
+### Verificación ejecutada
+
+- Host: 169 pruebas en verde. Nuevas: 6, sobre propósitos registrados y
+  consultados; liberar con el propósito equivocado (no libera nada); lo
+  asignado antes de la tabla queda como `Boot`, y ni los marcos libres ni
+  los retenidos guardan propósito; etiquetar solo afecta a marcos que el
+  kernel tiene; y las asignaciones por el trait cuentan como tablas de
+  páginas.
+- Pruebas de mutación (a mano, revertidas): etiquetar marcos que nadie
+  tiene; permitir liberar con el propósito equivocado; no limpiar el
+  propósito al liberar; marcar todo como `Boot`; y registrar las tablas de
+  páginas como otra cosa. Las 5 detectadas.
+- QEMU: `frames in use: 11 for boot, 10 for page tables, 1024 for heap, 20
+  for stacks` y `frames = 62805 free, 1065 in use`. La autoprueba de
+  arranque comprueba además que liberar con un propósito equivocado da
+  error.
+- `boot-test --repeat 10` 10/10; soak de 120 s PASS; `fmt-lint` limpio.
+
+### Riesgos y límites
+
+- La tabla existe solo desde que hay heap: lo anterior queda como `Boot` (u
+  etiquetado después, como el heap y las pilas).
+- El propósito es información del kernel, no una protección del hardware:
+  impide confusiones en el código, no accesos indebidos.
+- El trait `FrameAllocator` no lleva propósito, así que todo lo que venga
+  por ahí se cuenta como tabla de páginas. Si algún día `arch` pide marcos
+  para otra cosa, habrá que llevar el propósito en el trait.
+
 ## Incremento 12 — La mitad baja deja de ser ejecutable (endurecimiento)
 
 Cierra el hueco que el Incremento 11 dejó anotado. Decisión en

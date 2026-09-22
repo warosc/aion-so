@@ -6,7 +6,7 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 | # | Medida | Dónde | Estado |
 | --- | --- | --- | --- |
 | 1 | Rust seguro por defecto; `unsafe` pequeño, localizado y con invariantes escritas | todo el árbol; `kernel` casi no tiene `unsafe` fuera de `memory` | ✅ |
-| 2 | Propiedad explícita de cada frame, con transiciones válidas | `kernel::memory::frame_allocator` (libre / no libre + `manages()` derivado del mapa) | ⚠️ parcial |
+| 2 | Propiedad explícita de cada frame, con transiciones válidas | `frame_allocator`: libre / retenido / en uso con `FramePurpose` (boot, tablas, heap, pilas, kernel); `deallocate_as` falla si no coincide | ✅ |
 | 3 | Retención conservadora ante mapas dudosos | `frame_allocator` (lo reservado gana los solapes, redondeo hacia fuera, aritmética saturada, página 0); ADR 0004 y 0007 | ✅ |
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
 | 5 | Validación centralizada de rangos | `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |
@@ -24,7 +24,7 @@ mapa de memoria, bitmap y consola propios, y la página 0 está sin mapear
 
 ## Lo que falta, por orden
 
-1. **Estado por frame** (punto 2) y tipos `PhysAddr`/`VirtAddr` (punto 6).
+1. **Tipos `PhysAddr`/`VirtAddr`** (punto 6).
 2. **W^X dentro de la imagen del kernel**: la mitad baja ya es no ejecutable
    salvo el código (ADR 0008), pero la imagen misma sigue siendo escribible
    y ejecutable entera. Separar sus secciones exige interpretar el PE.
@@ -36,9 +36,9 @@ mapa de memoria, bitmap y consola propios, y la página 0 está sin mapear
 
 - **Pruebas de mutación**: en cada incremento de memoria se introducen
   bugs deliberados, uno a uno, y se exige que las pruebas los detecten. Han
-  sido 45 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
-  cero, guard pages, mapa de identidad, recuperación de memoria y permisos
-  de ejecución), todas detectadas. Una de ellas destapó un hueco real de pruebas, que se cerró
+  sido 50 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
+  cero, guard pages, mapa de identidad, recuperación de memoria, permisos de
+  ejecución y propósito por marco), todas detectadas. Una de ellas destapó un hueco real de pruebas, que se cerró
   antes de cerrar el incremento. Quedan registradas en
   `docs/fase2-notes.md`.
 - **Pruebas negativas de extremo a extremo**: ejecutar desde un marco de
