@@ -7,6 +7,141 @@
 > equivalen hoy a `HARLAN` / `harlan-*` / `harlan_*`; tabla completa en
 > `docs/adr/0003-brand-migration-harlan.md`.
 
+## Incremento 6 — Page mapper: el kernel toma la raíz de las tablas de páginas
+
+### ADR
+
+`docs/adr/0005-fase2-kernel-page-tables.md`: fija el layout virtual de
+Fase 2 y que la tabla raíz pasa a ser del kernel.
+
+### Hallazgo real: las tablas del firmware son de solo lectura
+
+El plan preveía mapear "sobre la tabla de páginas única y activa heredada
+de UEFI". Antes de escribir código se midió, con instrumentación temporal
+que no se commiteó:
+
+- `CR0 = 0x80010033`: **WP activo**, así que ring 0 respeta el "solo
+  lectura".
+- La PML4 (`0xf801000`), las PDPT y las PD están en páginas de 2 MiB
+  **sin bit de escritura** (entrada `0xf8000e1`): es la autoprotección de
+  tablas de EDK2. La primera escritura en la PML4 del firmware habría dado
+  un #PF. El plan original no era ejecutable.
+- `CR4 = 0x668`: 4 niveles (sin LA57), sin PCID ni PGE.
+  `EFER = 0xd00`: NXE activo.
+- PML4 con solo las ranuras 0 y 1: identidad de 0 a 1 TiB, 524 281 páginas
+  de 2 MiB (4 en solo lectura: las de las tablas) y 7 PT de 4 KiB con
+  permisos finos (código en solo lectura, datos con NX). No hay páginas de
+  1 GiB. A partir de 1 TiB y en toda la mitad alta no hay nada.
+- La página 0 está mapeada con escritura permitida (entrada `0xe3`): una
+  desreferencia nula no falla.
+
+Solución (ADR 0005): el kernel copia la PML4 en un frame propio y carga
+CR3. Traducciones idénticas, tablas inferiores del firmware compartidas y
+nunca escritas, y el mapper limitado a la mitad alta, donde todas las
+tablas son del kernel.
+
+### Qué hace
+
+- `hal::frame::FrameAllocator` (trait): la paginación de `arch` saca frames
+  del asignador del kernel sin depender del crate `kernel`.
+  `BitmapFrameAllocator` lo implementa.
+- `hal::paging`: `Page`, `PAGE_SIZE`, `PageFlags { writable, executable }`
+  (NX salvo que se pida lo contrario; sin bit de usuario), `MapError`,
+  `UnmapError` y el trait `PageMapper` (`map`/`unmap` son `unsafe` por el
+  aliasing de frames; `translate` es segura).
+- `arch/x86_64/src/paging.rs`:
+  - `PageTables<A: TableAccess>`: la lógica de recorrido (`adopt`,
+    `translate`, `map`, `unmap`, `new_table`), genérica sobre cómo se
+    llega a la memoria de las tablas, igual que `fbcon` separa
+    `TextConsole` de `Surface`.
+  - `IdentityAccess`: el único acceso crudo, a través del mapa de
+    identidad.
+  - `KernelPageTable::take_over`: comprueba CR4 y EFER, verifica la
+    identidad de la raíz del firmware y de la pila, adopta la raíz y
+    escribe CR3.
+  - `KERNEL_SPACE_START = 0xFFFF_8000_0000_0000`.
+- `kernel::memory::paging_self_test`: mapea un frame nuevo en
+  `KERNEL_SPACE_START`, comprueba `translate` y `AlreadyMapped`, **escribe
+  por el mapeo nuevo y lee por la dirección de identidad del frame** (lo
+  que prueba que la CPU recorre las tablas que construyó el kernel),
+  desmapea, comprueba `NotMapped` y libera el frame.
+- `kmain`: primero la autoprueba del asignador (no escribe ningún frame),
+  luego `take_over` (verifica la identidad antes de la primera escritura) y
+  por último la autoprueba de paginación. Un rechazo de `take_over` no es
+  fatal.
+
+### Desviaciones del plan original
+
+1. CR3 cambia ya en Fase 2 (solo la raíz; las traducciones son idénticas):
+   lo impone el hallazgo de arriba.
+2. El mapper solo actúa en el espacio del kernel (mitad alta).
+3. El recorrido de tablas **sí** se prueba en el host (el plan decía que
+   no se podía), gracias a la separación `TableAccess`.
+4. `PageFlags::executable` en vez de `no_execute`: NX por defecto.
+5. No se parten páginas grandes, y `unmap` no libera tablas intermedias.
+
+### Verificación ejecutada
+
+- Host: `cargo xtask test` pasa 113 pruebas en verde (50 `arch`, 17
+  `fbcon`, 15 `hal`, 27 `kernel`, 4 `xtask`). Nuevas: 17 del mapper y 2
+  de `Page`. El mapper se prueba sobre memoria física simulada **en la que
+  escribir una tabla del firmware o leer memoria que no es una tabla hace
+  fallar la prueba**. Cubren:
+  - índices y direcciones canónicas;
+  - traducción por identidad, páginas de 1 GiB con el bit PAT, y
+    direcciones sin mapear;
+  - `adopt`: la copia y sus rechazos;
+  - tablas nuevas puestas a cero, que se enlazan solo después de estar a
+    cero del todo, y la hoja con NX;
+  - reutilización de tablas y los flags de solo lectura con ejecución;
+  - `AlreadyMapped` sin asignar marcos, y `OutsideKernelSpace` sin
+    escribir;
+  - quedarse sin frames deja solo tablas completas;
+  - un frame no escribible se rechaza sin enlazarse;
+  - `unmap` con invalidación de la TLB;
+  - las páginas grandes no se parten.
+- Pruebas de mutación (a mano, revertidas): se introdujeron 9 bugs
+  deliberados, uno cada vez: tablas sin poner a cero; sin NX; entradas
+  intermedias sin escritura; sin comprobar identidad y escritura de los
+  frames de tabla; sin el límite del espacio del kernel; sin quitar el bit
+  PAT; `adopt` ignorando ranuras ocupadas; bajar dentro de una página
+  grande; y `unmap` sin `invlpg`. Las pruebas detectaron los 9.
+- `cargo xtask fmt-lint` limpio; builds release correctos.
+- QEMU: `paging = kernel root table at 0x1000, firmware identity map shared
+  read-only` y `page mapper self-test OK`. `boot-test --repeat 10` dio
+  10/10; `--marker "HARLAN: page mapper self-test OK" --repeat 10` dio
+  10/10; `ticks=500` correcto.
+- QEMU interactivo, con la raíz del kernel ya cargada: `help` y `version`
+  correctos; **`shutdown` apaga QEMU** por sí solo; **`reboot` produce un
+  segundo arranque completo** (la autoprueba de paginación sale OK dos
+  veces). Los *runtime services* de UEFI funcionan bajo la raíz del kernel.
+- Ruta de error real: con `-cpu qemu64,-nx`, el log registra `paging
+  take-over refused (NoExecuteDisabled); staying on the firmware's page
+  tables`, la shell arranca y los ticks siguen avanzando.
+
+### Simplificaciones y riesgos documentados
+
+- La página 0 sigue mapeada con escritura, así que una desreferencia nula
+  no falla. Desmapearla exige escribir una tabla del firmware: queda para
+  cuando el kernel reconstruya el mapa de identidad (Fase 3).
+- La raíz del kernel quedó en `0x1000` (memoria baja). El arranque de otros
+  núcleos (SMP) necesitará memoria por debajo de 1 MiB; habrá que
+  revisarlo entonces.
+- Las tres tablas intermedias que construye la autoprueba se quedan en
+  memoria (3 frames).
+- Si un frame de tabla resulta no escribible, ese frame se pierde: el trait
+  `FrameAllocator` no tiene forma de devolverlo. Es un caso que las
+  comprobaciones de `take_over` hacen inesperado.
+- La seguridad de `IdentityAccess` depende de la disciplina de
+  `PageTables`: solo tablas alcanzadas desde la raíz o frames nuevos ya
+  verificados. Las pruebas de host lo imponen (una escritura en una tabla
+  del firmware las hace fallar).
+- El mapper vive en `kmain` (no es `'static`) y no tiene candado: un solo
+  núcleo, y ninguna interrupción toca las tablas. Un manejador de fallos de
+  página o las syscalls necesitarán acceso global (Fase 3).
+- La PML4 original del firmware queda sin usar, en memoria de boot
+  services retenida.
+
 ## Incremento 5 — Administrador de frames físicos (bitmap)
 
 ### ADR
