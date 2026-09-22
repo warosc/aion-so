@@ -28,6 +28,10 @@ use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
 /// canonical higher half.
 pub const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
 
+/// Where the kernel heap starts: PML4 slot 257, a slot of its own (see
+/// docs/adr/0006-fase2-kernel-heap.md).
+pub const KERNEL_HEAP_START: u64 = KERNEL_SPACE_START + (1 << 39);
+
 const ENTRIES: usize = 512;
 
 const PRESENT: u64 = 1 << 0;
@@ -481,6 +485,12 @@ mod tests {
         let va = KERNEL_SPACE_START + (1 << 39) + (2 << 30) + (3 << 21) + (4 << 12) + 0x123;
         assert_eq!(table_indices(va), [257, 2, 3, 4]);
         assert_eq!(table_indices(0x0000_7FFF_FFFF_F000), [255, 511, 511, 511]);
+    }
+
+    #[test]
+    fn the_heap_has_a_kernel_space_slot_of_its_own() {
+        assert!(is_canonical(KERNEL_HEAP_START));
+        assert_eq!(table_indices(KERNEL_HEAP_START), [257, 0, 0, 0]);
     }
 
     #[test]
