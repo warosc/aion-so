@@ -1,8 +1,9 @@
-//! Memory management. Incremento 5 adds the frame allocator, Incremento 6
-//! checks the architecture's page mapper at boot; the kernel heap
-//! (Incremento 7) builds on both.
+//! Memory management: the frame allocator (Incremento 5), the boot check
+//! of the architecture's page mapper (Incremento 6) and the kernel heap
+//! built on both (Incremento 7).
 
 pub mod frame_allocator;
+pub mod heap;
 
 use frame_allocator::{BitmapFrameAllocator, DeallocError};
 use harlan_hal::frame::PhysFrame;

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+heap-stress = ["harlan-kernel/heap-stress"]
+
 [dependencies]
 log = "0.4"
 harlan-kernel = { path = "../kernel" }

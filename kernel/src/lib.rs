@@ -1,8 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub mod identity;
 mod memory;
 mod shell;
+mod sync;
 
 use harlan_hal::frame::FRAME_SIZE;
 use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
@@ -124,6 +127,23 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         )
         .expect("kernel space starts on a page boundary");
         memory::paging_self_test(mapper, &mut frames, test_page);
+
+        // The kernel heap (docs/adr/0006-fase2-kernel-heap.md). Without it
+        // any allocation panics; nothing outside this block allocates yet.
+        let heap_start = harlan_arch_x86_64::paging::KERNEL_HEAP_START;
+        let heap_page = harlan_hal::paging::Page::from_start_address(heap_start)
+            .expect("the heap starts on a page boundary");
+        let heap_bytes = memory::heap::init(&memory::heap::HEAP, mapper, &mut frames, heap_page);
+        if heap_bytes > 0 {
+            log::info!(
+                "HARLAN: heap = {} KiB at {heap_start:#x}; {} frame(s) left",
+                heap_bytes / 1024,
+                frames.free_frames()
+            );
+            memory::heap::self_test(heap_start, heap_bytes);
+        } else {
+            log::error!("HARLAN: no kernel heap: every allocation will panic");
+        }
     }
 
     console.write_str(identity::PRODUCT_NAME);

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Long heap stress run at boot instead of the quick one (see memory::heap).
+heap-stress = []
+
 [dependencies]
 harlan-hal = { path = "../hal" }
 log = "0.4"
