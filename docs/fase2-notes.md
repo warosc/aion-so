@@ -55,6 +55,74 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 12 — La mitad baja deja de ser ejecutable (endurecimiento)
+
+Cierra el hueco que el Incremento 11 dejó anotado. Decisión en
+`docs/adr/0008-fase2-write-xor-execute.md`.
+
+### El problema
+
+El mapa de identidad propio quedaba escribible **y ejecutable** entero, como
+lo dejaba el firmware. Un salto erróneo a una página de datos —el heap visto
+por su alias de identidad, un marco recién asignado, el framebuffer—
+ejecutaría lo que hubiera allí en lugar de fallar.
+
+### Qué hace
+
+- `boot` pregunta a `LoadedImage` dónde está cargada la imagen (antes de
+  salir de boot services, como el framebuffer) y la entrega en
+  `BootInfo::kernel_image`.
+- `hal` distingue `MemoryRegionKind::RuntimeCode` (tipo UEFI 5): el código
+  del firmware que sigue vivo. Sus datos siguen siendo `Reserved`.
+- El mapa de identidad se construye **no ejecutable**, salvo las páginas de
+  los rangos que se le pasan: la imagen del kernel y las regiones
+  `RuntimeCode`. Solo los bloques de 2 MiB que las contienen se parten en
+  páginas de 4 KiB.
+- Si no se conoce ningún rango ejecutable, el kernel no reconstruye el mapa
+  y lo registra: un mapa sin código ejecutable haría fallar la instrucción
+  siguiente.
+
+### Hallazgo
+
+Marcar toda la mitad baja como no ejecutable **rompe `reboot` y
+`shutdown`**: saltan al código de los runtime services de UEFI, que vive en
+esa mitad. Por eso hizo falta el tipo `RuntimeCode` en el clasificador. Lo
+habría detectado la prueba interactiva, pero se vio al diseñarlo.
+
+### Verificación ejecutada
+
+- Host: 164 pruebas en verde. Nuevas: 3 (rangos físicos y su saturación,
+  `RuntimeCode` en el clasificador) y 1 del constructor del mapa, que
+  comprueba página a página qué queda ejecutable y que solo se parten los
+  bloques necesarios.
+- **Prueba negativa de extremo a extremo** (temporal, revertida): escribir
+  una instrucción en un marco de datos y saltar a él produce
+  `#PF accessing 0x580000, error_code=0x11, rip=0x580000`. El código 0x11 es
+  exactamente "página presente, fallo al buscar instrucción": NX aplicado.
+- QEMU: `identity map rebuilt from 10 table(s) of the kernel's own, covering
+  4 GiB, null page unmapped, 327 page(s) executable of 2 range(s),
+  everything else no-execute`. Son 71 páginas de la imagen del kernel y 256
+  del código runtime del firmware.
+- `shutdown` apaga y `reboot` rearranca, con el mapa ya no ejecutable.
+- Pruebas de mutación (a mano, revertidas): 5 bugs deliberados: dejar
+  ejecutables las páginas grandes; dejar ejecutables todas las de 4 KiB;
+  marcar no ejecutable también el código; no partir en 4 KiB los bloques
+  con código; y clasificar el código runtime del firmware como simple
+  memoria reservada. Las 5 detectadas.
+- `boot-test --repeat 10` 10/10; `--memory 1G --repeat 2` 2/2; soak de 120 s
+  PASS; `fmt-lint` limpio; builds release OK.
+
+### Riesgos y límites
+
+- **Dentro de la imagen del kernel no hay W^X**: es escribible y ejecutable
+  entera. Separar código de datos exige interpretar sus secciones PE; queda
+  anotado como el siguiente paso de este frente.
+- Si el firmware no dice dónde está la imagen, el kernel se queda con el
+  mapa del firmware (y con todo ejecutable), pero arranca.
+- Cualquier código futuro que se ejecute desde memoria que no esté en esos
+  rangos (por ejemplo, el arranque de otros núcleos con un trampolín en
+  memoria baja) tendrá que añadirse a la lista.
+
 ## Incremento 11 — Tablas propias, memoria del firmware recuperada y página 0 fuera (endurecimiento)
 
 Tercero y último de los incrementos de endurecimiento que pidió el usuario.
