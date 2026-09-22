@@ -55,6 +55,67 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 14 — Direcciones físicas y virtuales con tipos distintos (endurecimiento)
+
+El punto 6 de `docs/memory-safety.md`, y el cierre del programa de
+endurecimiento previo a Fase 3. La decisión y sus límites quedan en
+`docs/adr/0009-fase2-typed-addresses.md`.
+
+### Qué hace
+
+- `hal::addr` define `PhysAddr` y `VirtAddr`: dos envoltorios de `u64` sin
+  conversión entre ellos. Traen lo justo —`new`, `as_u64`, `is_aligned_to`,
+  `align_down`, `checked_add`, `saturating_sub`, `+ u64`, `Debug`, `Display`
+  y `LowerHex`— para que los registros de arranque sigan imprimiendo
+  exactamente lo mismo que antes.
+- `VirtAddr::as_ptr::<T>()` es la **única** conversión de entero a puntero
+  del árbol: crear el puntero es seguro, desreferenciarlo sigue siendo
+  `unsafe` y queda en las pocas funciones que saben que la página está
+  mapeada.
+- Los tipos que ya existían se apoyan en ellos: `PhysFrame` y `PhysRange`
+  sobre `PhysAddr`; `Page` sobre `VirtAddr`; `PageMapper::translate` pasa de
+  `u64 -> u64` a `VirtAddr -> PhysAddr`; `MemoryRegion::start_phys_addr`,
+  `FramebufferInfo::base_addr`, `Stack::{bottom, top}` y
+  `KERNEL_{SPACE,HEAP,STACKS}_START` quedan tipados.
+- Las tres fronteras donde físico y virtual coinciden de verdad —el mapa de
+  identidad del firmware— son ahora conversiones explícitas y comentadas:
+  `PhysWindow::frame_ptr`, la lectura de comprobación del mapper y el
+  framebuffer del GOP. Antes eran invisibles.
+- El interior del walker de `arch::paging` sigue en `u64`: ahí las
+  direcciones se enmascaran y desplazan a nivel de bits, y tipar cada paso
+  intermedio no aportaría nada. Los tipos entran y salen en sus bordes.
+
+### Verificación ejecutada
+
+- Host: 173 pruebas en verde (169 previas + 4 de los tipos nuevos).
+- Pruebas de mutación (a mano, revertidas): comprobación de alineación que
+  siempre dice que sí; `align_down` que no redondea; `checked_add` que da la
+  vuelta en vez de negarse; `saturating_sub` que baja de cero; `as_ptr`
+  desplazado un byte; y formateo hexadecimal que ignora el `#`. Las 6
+  detectadas.
+- Mutación de tipos: pasar una dirección física donde se espera una virtual
+  **no compila** (`no method named as_ptr found for struct PhysAddr`). Esa
+  era la confusión que este incremento venía a hacer imposible.
+- QEMU: `boot-test --repeat 10` 10/10; con `--memory 512` 1/1; soak de 120 s
+  PASS (11 700 ticks, 5 720 000 ciclos de heap, sin reinicios después del
+  arranque); `shutdown` apaga y `reboot` rearranca (2 marcadores
+  shell-ready, 2 autopruebas del mapper).
+- El registro de arranque es idéntico al del Incremento 13 —mismas
+  direcciones, mismo desglose: 11 marcos de arranque, 10 de tablas, 1024 de
+  heap, 20 de pilas, 1065 en uso—, que es justo lo que debe pasar: este
+  incremento no cambia comportamiento, cambia lo que el compilador acepta.
+- `fmt-lint` limpio; imagen arrancable construida.
+
+### Riesgos y límites
+
+- Los tipos separan físico de virtual, no aciertan por ti: un `VirtAddr`
+  equivocado sigue siendo un `VirtAddr`.
+- `VirtAddr::new` y `PhysAddr::new` no validan nada (ni canonicidad ni
+  límites); la validación sigue donde estaba, en `from_start_address`,
+  `manages`, `translate` y compañía.
+- El paso por `as_u64()` en los bordes es donde podría colarse una
+  confusión; están contados y comentados uno a uno.
+
 ## Incremento 13 — Cada marco sabe para qué se usa (endurecimiento)
 
 El punto 2 de la estrategia de `docs/memory-safety.md`: estado explícito por

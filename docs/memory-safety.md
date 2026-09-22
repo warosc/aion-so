@@ -10,35 +10,74 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 | 3 | Retención conservadora ante mapas dudosos | `frame_allocator` (lo reservado gana los solapes, redondeo hacia fuera, aritmética saturada, página 0); ADR 0004 y 0007 | ✅ |
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
 | 5 | Validación centralizada de rangos | `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |
-| 6 | Separar físico y virtual con tipos | `hal::frame::PhysFrame` y `PhysRange`, `hal::paging::Page` | ⚠️ falta `PhysAddr`/`VirtAddr` |
+| 6 | Separar físico y virtual con tipos | `hal::addr::PhysAddr`/`VirtAddr`, y sobre ellos `PhysFrame`, `PhysRange`, `Page`, `PageMapper::translate`, `Stack`, `KERNEL_*_START` | ✅ |
 | 7 | Frames a cero antes de reutilizarlos | `kernel::memory::zeroed_frames::ZeroedFrames` (todo el kernel los recibe así) | ✅ |
 | 8 | Liberación comprobada | `frame_allocator::deallocate` (`NotManaged`, `NotAllocated`), `FreeListHeap::deallocate` (doble liberación, memoria ajena) | ✅ |
 | 9 | Pruebas de propiedades contra un modelo | `frame_allocator` (10 000 operaciones), `FreeListHeap` (20 000), `heap::stress` (100 000 en host) | ✅ |
 | 10 | Estrés en QEMU, con distintas cantidades de RAM | `cargo xtask soak-test`, `boot-test --heap-stress --memory` | ✅ |
-| 11 | Concurrencia controlada y contextos documentados | `kernel::sync::IrqLock` (pánico ante reentrada); "ningún manejador de interrupción asigna memoria" | ⚠️ un solo núcleo |
+| 11 | Concurrencia controlada y contextos documentados | `kernel::sync::IrqLock` (pánico ante reentrada) y la tabla de contextos de más abajo | ⚠️ un solo núcleo |
 | 12 | Fallos visibles, nunca éxito fingido | pánicos con dirección y operación; `check()` del heap; autopruebas de arranque | ✅ |
 
 El kernel ya no depende de la memoria del firmware: tiene tablas, pila,
 mapa de memoria, bitmap y consola propios, y la página 0 está sin mapear
 (ADR 0007).
 
+## Contextos de ejecución y concurrencia
+
+El kernel corre en un solo núcleo. Hay dos contextos:
+
+- **Contexto de kernel**: `kmain` y, tras el cambio de pila,
+  `kernel_main_on_stack` y el shell. Puede asignar, mapear y liberar.
+- **Contexto de interrupción**: `rust_interrupt_handler` y lo que llama.
+  Entra por una puerta de interrupción, así que `IF` está a 0 y no es
+  reentrante (salvo NMI, que solo registra un aviso y vuelve).
+
+La regla que sostiene todo lo demás: **ningún manejador de interrupción
+asigna memoria ni toca las tablas de páginas**. Hoy se cumple por
+construcción —el temporizador incrementa un `AtomicU64` y el teclado escribe
+en un anillo de atómicos; ninguno de los dos llama al heap, al asignador de
+marcos ni al mapper—, y debe seguir cumpliéndose:
+
+| Componente | Quién puede llamarlo |
+| --- | --- |
+| `BitmapFrameAllocator`, `ZeroedFrames`, `PageTables`, `stacks` | solo contexto de kernel |
+| `KernelHeap` (`alloc`, `Box`, `Vec`, formateo que asigne) | solo contexto de kernel |
+| `TICK_COUNT`, anillo del teclado (`AtomicU8`/`AtomicUsize`) | ambos |
+| `log::` sobre debugcon y framebuffer | ambos; no asigna |
+
+`IrqLock` protege el heap: tomarlo desactiva las interrupciones, de modo que
+en un solo núcleo no hay contención posible salvo por reentrada, y la
+reentrada **entra en pánico en vez de girar** (un giro con las interrupciones
+desactivadas colgaría la máquina en silencio). Es decir: si algún día un
+manejador asignara memoria, no corrompería el heap —se detendría con un
+mensaje.
+
+Con varios núcleos (Fase 3 o más adelante) esto cambia: `IrqLock` tendrá que
+girar además de desactivar interrupciones, el asignador de marcos necesitará
+su propio candado y habrá que decidir explícitamente si se permite asignar
+desde un manejador.
+
 ## Lo que falta, por orden
 
-1. **Tipos `PhysAddr`/`VirtAddr`** (punto 6).
-2. **W^X dentro de la imagen del kernel**: la mitad baja ya es no ejecutable
+1. **W^X dentro de la imagen del kernel**: la mitad baja ya es no ejecutable
    salvo el código (ADR 0008), pero la imagen misma sigue siendo escribible
    y ejecutable entera. Separar sus secciones exige interpretar el PE.
-3. **Concurrencia** (punto 11): `IrqLock` tendrá que girar en espera cuando
-   haya varios núcleos, y habrá que decidir si se permite asignar desde
-   manejadores de interrupción.
+2. **Varios núcleos** (punto 11): mientras haya uno solo, `IrqLock` basta;
+   ver la sección anterior para lo que habrá que cambiar.
+3. **Validación de rangos** (punto 5): la validación existe en cada frontera
+   (`from_start_address`, `PhysWindow::frame_ptr`, `hole_ptr`, `manages`),
+   pero no en un único sitio; queda como estaba hasta que haya user space y
+   un punto natural donde centralizarla.
 
 ## Cómo se comprueba que esto funciona de verdad
 
 - **Pruebas de mutación**: en cada incremento de memoria se introducen
   bugs deliberados, uno a uno, y se exige que las pruebas los detecten. Han
-  sido 50 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
+  sido 56 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
   cero, guard pages, mapa de identidad, recuperación de memoria, permisos de
-  ejecución y propósito por marco), todas detectadas. Una de ellas destapó un hueco real de pruebas, que se cerró
+  ejecución, propósito por marco y tipos de dirección), todas detectadas.
+  A partir del Incremento 14 se añade una comprobación que no necesita
+  pruebas: confundir una dirección física con una virtual ya no compila. Una de ellas destapó un hueco real de pruebas, que se cerró
   antes de cerrar el incremento. Quedan registradas en
   `docs/fase2-notes.md`.
 - **Pruebas negativas de extremo a extremo**: ejecutar desde un marco de
