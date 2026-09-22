@@ -124,6 +124,10 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
     let mut kernel_stack_top = None;
     #[cfg(target_arch = "x86_64")]
     let mut heap_ready = false;
+    #[cfg(target_arch = "x86_64")]
+    let mut kernel_stacks = None;
+    #[cfg(target_arch = "x86_64")]
+    let mut heap_range = None;
 
     // The kernel takes the root page table over from the firmware
     // (docs/adr/0005-fase2-kernel-page-tables.md). Not fatal if refused: it
@@ -172,6 +176,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
                 frames.free_frames(),
                 frames.zeroed_frames()
             );
+            heap_range = Some((heap_start, heap_bytes as u64));
             memory::heap::self_test(heap_start, heap_bytes);
         } else {
             log::error!("HARLAN: no kernel heap: every allocation will panic");
@@ -199,6 +204,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
                     double_fault.bottom()
                 );
                 kernel_stack_top = Some(kernel.top());
+                kernel_stacks = Some((kernel, double_fault));
             }
             Err(err) => log::error!(
                 "HARLAN: no guarded kernel stacks ({err:?}); staying on the firmware's stack"
@@ -221,6 +227,8 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             frames: heap_frames,
             map: heap_map,
             kernel_image: boot_info.kernel_image,
+            heap_range,
+            kernel_stacks,
             mapper,
             console: alloc::boxed::Box::leak(alloc::boxed::Box::new(console)),
             power: alloc::boxed::Box::leak(alloc::boxed::Box::new(power)),
@@ -253,6 +261,9 @@ struct KernelContext {
     frames: memory::zeroed_frames::KernelFrames<'static>,
     map: &'static MemoryMap,
     kernel_image: Option<PhysRange>,
+    /// Where the heap is and how big, to label its frames.
+    heap_range: Option<(u64, u64)>,
+    kernel_stacks: Option<(memory::stacks::Stack, memory::stacks::Stack)>,
     mapper: harlan_arch_x86_64::paging::KernelPageTable,
     console: &'static mut dyn Console,
     power: &'static dyn PowerControl,
@@ -347,6 +358,43 @@ fn kernel_main(context: &mut KernelContext) -> ! {
         log::info!("HARLAN: frame pool self-test OK ({exercised} frames written and verified)");
     } else {
         log::warn!("HARLAN: boot-services memory stays held back");
+    }
+
+    // What the kernel is holding, and what for. The heap and the stacks
+    // were taken before there was anywhere to write purposes down, so they
+    // are filled in here, from the page tables.
+    {
+        use memory::frame_allocator::FramePurpose;
+        if let Some((start, len)) = context.heap_range {
+            memory::label_mapped_frames(
+                &context.mapper,
+                &mut context.frames,
+                start,
+                len,
+                FramePurpose::Heap,
+            );
+        }
+        for stack in context.kernel_stacks.iter().flat_map(|(a, b)| [a, b]) {
+            memory::label_mapped_frames(
+                &context.mapper,
+                &mut context.frames,
+                stack.bottom(),
+                stack.size(),
+                FramePurpose::Stack,
+            );
+        }
+        let mut held = 0;
+        for purpose in FramePurpose::ALL {
+            let frames = context.frames.frames_for(purpose);
+            held += frames;
+            if frames > 0 {
+                log::info!("HARLAN: frames in use: {frames} for {}", purpose.name());
+            }
+        }
+        log::info!(
+            "HARLAN: frames = {} free, {held} in use",
+            context.frames.free_frames()
+        );
     }
 
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run

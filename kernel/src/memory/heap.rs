@@ -11,6 +11,7 @@ use free_list::{FreeListHeap, HeapCorruption, HeapStats};
 use harlan_hal::InterruptControl;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
 
+use super::frame_allocator::FramePurpose;
 use super::zeroed_frames::KernelFrames;
 use crate::sync::IrqLock;
 
@@ -96,7 +97,7 @@ pub fn init<I: InterruptControl>(
     let mut mapped = 0;
     while mapped < HEAP_SIZE {
         let page = Page::containing_address(start.start_address() + mapped as u64);
-        let Some(frame) = frames.allocate() else {
+        let Some(frame) = frames.allocate_for(FramePurpose::Heap) else {
             log::warn!("HARLAN: heap: out of frames after {mapped} bytes");
             break;
         };

@@ -13,6 +13,7 @@
 
 use harlan_hal::paging::{MapError, PAGE_SIZE, Page, PageFlags, PageMapper};
 
+use super::frame_allocator::FramePurpose;
 use super::zeroed_frames::KernelFrames;
 
 /// 64 KiB for the kernel's own stack.
@@ -58,7 +59,9 @@ pub fn map_with_guard(
     let bottom = guard.start_address() + PAGE_SIZE;
     for index in 0..pages {
         let page = Page::containing_address(bottom + index * PAGE_SIZE);
-        let frame = frames.allocate().ok_or(MapError::OutOfFrames)?;
+        let frame = frames
+            .allocate_for(FramePurpose::Stack)
+            .ok_or(MapError::OutOfFrames)?;
         // SAFETY: the frame is fresh from the allocator, so nothing else
         // uses it, and this area of kernel space belongs to the stacks
         // alone.

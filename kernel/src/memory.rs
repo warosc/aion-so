@@ -11,11 +11,11 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 use alloc::vec::Vec;
-use frame_allocator::{BitmapFrameAllocator, DeallocError};
+use frame_allocator::{BitmapFrameAllocator, DeallocError, FramePurpose};
 
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
 use harlan_hal::memory_map::MemoryMap;
-use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
+use harlan_hal::paging::{MapError, PAGE_SIZE, Page, PageFlags, PageMapper, UnmapError};
 use zeroed_frames::{KernelFrames, ZeroedFrames};
 
 /// Size of the boot frame allocator's bitmap, in 64-frame words: 1024
@@ -38,6 +38,10 @@ pub fn move_off_firmware_memory(
     let mut bitmap = vec![0u64; FRAME_BITMAP_WORDS].into_boxed_slice();
     bitmap.copy_from_slice(frames.bitmap());
     let storage: &'static mut [u64] = Box::leak(bitmap);
+    // One byte per covered frame, so that from here on the kernel can say
+    // what every frame it holds is for.
+    let purposes: &'static mut [u8] =
+        Box::leak(vec![0u8; FRAME_BITMAP_WORDS * 64].into_boxed_slice());
     // SAFETY: the same window, over the same frames, as the allocator this
     // one replaces.
     let moved = unsafe {
@@ -45,6 +49,7 @@ pub fn move_off_firmware_memory(
             BitmapFrameAllocator::adopt(storage, heap_map, frames.boot_services_reclaimed()),
             frames.window(),
         )
+        .with_purposes(purposes)
     };
     (moved, heap_map)
 }
@@ -59,7 +64,7 @@ pub fn frame_pool_self_test(frames: &mut KernelFrames<'_>, sample: usize) -> usi
     let window = frames.window();
     let mut taken: Vec<PhysFrame> = Vec::with_capacity(sample);
     while taken.len() < sample {
-        let Some(frame) = frames.allocate() else {
+        let Some(frame) = frames.allocate_for(FramePurpose::Kernel) else {
             break;
         };
         let fill = taken.len() as u8 | 1;
@@ -89,7 +94,8 @@ pub fn frame_pool_self_test(frames: &mut KernelFrames<'_>, sample: usize) -> usi
     }
     let exercised = taken.len();
     for frame in taken {
-        assert_eq!(frames.deallocate(frame), Ok(()));
+        // Freed as what it was taken for: a mismatch would be an error.
+        assert_eq!(frames.deallocate_as(frame, FramePurpose::Kernel), Ok(()));
     }
     exercised
 }
@@ -113,11 +119,22 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: u64) {
         return;
     }
     let a = frames
-        .allocate()
+        .allocate_for(FramePurpose::Kernel)
         .expect("free frames counted but none handed out");
     let b = frames
         .allocate()
         .expect("free frames counted but none handed out");
+    // Once purposes are being recorded, giving a frame back as something
+    // else is an error and frees nothing.
+    if frames.purpose_of(a) == Some(FramePurpose::Kernel) {
+        assert_eq!(
+            frames.deallocate_as(a, FramePurpose::Heap),
+            Err(DeallocError::WrongPurpose {
+                expected: FramePurpose::Heap,
+                actual: Some(FramePurpose::Kernel),
+            })
+        );
+    }
     assert_ne!(a, b, "frame allocator handed out {a:?} twice");
     assert!(frames.manages(a) && frames.manages(b));
     assert_eq!(frames.free_frames(), before - 2);
@@ -143,6 +160,30 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: u64) {
     assert_eq!(frames.deallocate(b), Ok(()));
     assert_eq!(frames.free_frames(), before);
     log::info!("HARLAN: frame allocator self-test OK (frames arrive zeroed)");
+}
+
+/// Records what the frames behind `[start, start + len)` are used for, by
+/// asking the page tables which frame each page maps to. The heap and the
+/// stacks are taken before the kernel has anywhere to write purposes down;
+/// this fills that in afterwards. Returns how many frames it labelled.
+pub fn label_mapped_frames(
+    mapper: &dyn PageMapper,
+    frames: &mut KernelFrames<'_>,
+    start: u64,
+    len: u64,
+    purpose: FramePurpose,
+) -> u64 {
+    let mut labelled = 0;
+    let mut addr = start;
+    while addr < start + len {
+        if let Some(phys) = mapper.translate(addr)
+            && let Some(frame) = PhysFrame::from_start_address(phys)
+        {
+            labelled += u64::from(frames.label(frame, purpose));
+        }
+        addr += PAGE_SIZE;
+    }
+    labelled
 }
 
 /// Boot-time check of the page mapper on the real page tables: maps a
