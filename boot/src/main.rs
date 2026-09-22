@@ -58,7 +58,9 @@ fn efi_main() -> Status {
     // stopped drawing at the exit, and this is the only writer from here
     // on. The memory stays mapped: UEFI's identity mapping is still what's
     // live (no page tables are touched by exiting boot services).
-    let mut console = unsafe { HardwareConsole::new(framebuffer) };
-    let power = UefiPower;
-    harlan_kernel::kmain(&boot_info, &mut console, &power)
+    let console = unsafe { HardwareConsole::new(framebuffer) };
+    // The kernel takes ownership of all three: it moves them into its own
+    // heap as soon as it has one, so that nothing of its own is left in the
+    // firmware's memory (docs/adr/0007-fase2-own-memory.md).
+    harlan_kernel::kmain(boot_info, console, UefiPower)
 }

@@ -7,10 +7,16 @@ pub mod heap;
 pub mod stacks;
 pub mod zeroed_frames;
 
-use frame_allocator::DeallocError;
+use alloc::boxed::Box;
+use alloc::vec;
+
+use alloc::vec::Vec;
+use frame_allocator::{BitmapFrameAllocator, DeallocError};
+
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
+use harlan_hal::memory_map::MemoryMap;
 use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
-use zeroed_frames::KernelFrames;
+use zeroed_frames::{KernelFrames, ZeroedFrames};
 
 /// Size of the boot frame allocator's bitmap, in 64-frame words: 1024
 /// words = 65 536 frames = 256 MiB of physical address space, matching the
@@ -18,6 +24,74 @@ use zeroed_frames::KernelFrames;
 /// (and logged), never mis-indexed. Real hardware (Fase 5) will need this
 /// sized from the memory map instead.
 pub const FRAME_BITMAP_WORDS: usize = 1024;
+
+/// Copies what the frame allocator needs into the heap and returns an
+/// allocator over those copies: the memory map and the bitmap, with every
+/// frame that was already handed out still handed out. After this, nothing
+/// the allocator reads or writes lives in the firmware's memory, which is
+/// what lets that memory be reclaimed.
+pub fn move_off_firmware_memory(
+    frames: &KernelFrames<'_>,
+    map: &MemoryMap,
+) -> KernelFrames<'static> {
+    let heap_map: &'static MemoryMap = Box::leak(Box::new(*map));
+    let mut bitmap = vec![0u64; FRAME_BITMAP_WORDS].into_boxed_slice();
+    bitmap.copy_from_slice(frames.bitmap());
+    let storage: &'static mut [u64] = Box::leak(bitmap);
+    // SAFETY: the same window, over the same frames, as the allocator this
+    // one replaces.
+    unsafe {
+        ZeroedFrames::new(
+            BitmapFrameAllocator::adopt(storage, heap_map, frames.boot_services_reclaimed()),
+            frames.window(),
+        )
+    }
+}
+
+/// Takes `sample` frames from the pool, checks each arrives zeroed, writes a
+/// pattern of its own into every byte, verifies them all and gives them
+/// back. Run right after reclaiming the firmware's memory: if any of those
+/// frames were still in use, or two of them were the same frame, the
+/// patterns would not survive. Panics on a mismatch; returns how many
+/// frames it exercised.
+pub fn frame_pool_self_test(frames: &mut KernelFrames<'_>, sample: usize) -> usize {
+    let window = frames.window();
+    let mut taken: Vec<PhysFrame> = Vec::with_capacity(sample);
+    while taken.len() < sample {
+        let Some(frame) = frames.allocate() else {
+            break;
+        };
+        let fill = taken.len() as u8 | 1;
+        // SAFETY: the frame has just been handed to us, so nothing else is
+        // using it, and the window reaches it.
+        unsafe {
+            let bytes = core::slice::from_raw_parts(window.frame_ptr(frame), FRAME_SIZE as usize);
+            assert!(
+                bytes.iter().all(|&byte| byte == 0),
+                "frame {frame:?} was handed out holding old data"
+            );
+            window
+                .frame_ptr(frame)
+                .write_bytes(fill, FRAME_SIZE as usize);
+        }
+        taken.push(frame);
+    }
+    for (index, &frame) in taken.iter().enumerate() {
+        let fill = index as u8 | 1;
+        // SAFETY: still ours, same window.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(window.frame_ptr(frame), FRAME_SIZE as usize) };
+        assert!(
+            bytes.iter().all(|&byte| byte == fill),
+            "frame {frame:?} lost the pattern written into it: something else is using it"
+        );
+    }
+    let exercised = taken.len();
+    for frame in taken {
+        assert_eq!(frames.deallocate(frame), Ok(()));
+    }
+    exercised
+}
 
 /// Boot-time check of the allocator against the real memory map, logged
 /// through debugcon. An assertion failure means the allocator is broken,

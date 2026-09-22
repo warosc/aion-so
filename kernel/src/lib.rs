@@ -30,7 +30,15 @@ pub struct BootInfo {
     pub memory_map: MemoryMap,
 }
 
-pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerControl) -> ! {
+/// The kernel takes ownership of everything `boot` hands over (see
+/// docs/adr/0007-fase2-own-memory.md): once the heap is up it moves all of
+/// it there, so that nothing of the kernel's is left in the firmware's
+/// memory and that memory can be reclaimed.
+pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
+    boot_info: BootInfo,
+    console: C,
+    power: P,
+) -> ! {
     // SAFETY: called exactly once, as the first thing kmain does, before
     // any other arch-specific state is touched.
     #[cfg(target_arch = "x86_64")]
@@ -110,6 +118,8 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
 
     #[cfg(target_arch = "x86_64")]
     let mut kernel_stack_top = None;
+    #[cfg(target_arch = "x86_64")]
+    let mut heap_ready = false;
 
     // The kernel takes the root page table over from the firmware
     // (docs/adr/0005-fase2-kernel-page-tables.md). Not fatal if refused: it
@@ -150,6 +160,7 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         let heap_page = harlan_hal::paging::Page::from_start_address(heap_start)
             .expect("the heap starts on a page boundary");
         let heap_bytes = memory::heap::init(&memory::heap::HEAP, mapper, &mut frames, heap_page);
+        heap_ready = heap_bytes > 0;
         if heap_bytes > 0 {
             log::info!(
                 "HARLAN: heap = {} KiB at {heap_start:#x}; {} frame(s) left, {} zeroed so far",
@@ -191,43 +202,64 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         }
     }
 
-    let mut context = KernelContext { console, power };
-
-    // Everything long-running belongs on the guarded stack.
+    // With a mapper, a heap and a guarded stack, the kernel moves
+    // everything it still keeps in the firmware's memory — the memory map,
+    // the frame bitmap, the console and the power control — into its own
+    // heap, and goes on running on its own stack. Nothing of the firmware's
+    // is in use after that.
     #[cfg(target_arch = "x86_64")]
-    if let Some(top) = kernel_stack_top {
-        // SAFETY: `top` is the top of the stack just mapped for this — its
-        // own frames, nothing else using them, an unmapped guard page at
-        // each end — and `kernel_main_on_stack` never returns. `context`
-        // lives in this frame of the firmware's stack, which stays mapped
-        // and which the kernel never reuses.
+    if let (Some(mapper), Some(top)) = (page_mapper, kernel_stack_top)
+        && heap_ready
+    {
+        let context = alloc::boxed::Box::leak(alloc::boxed::Box::new(KernelContext {
+            frames: memory::move_off_firmware_memory(&frames, &boot_info.memory_map),
+            mapper,
+            console: alloc::boxed::Box::leak(alloc::boxed::Box::new(console)),
+            power: alloc::boxed::Box::leak(alloc::boxed::Box::new(power)),
+        }));
+        log::info!("HARLAN: memory map, frame bitmap, console and power moved to the heap");
+        // SAFETY: `top` is the top of the stack mapped for this — its own
+        // frames, nothing else using them, an unmapped guard page at each
+        // end — `kernel_main_on_stack` never returns, and `context` lives
+        // on the heap, which outlives the stack being left behind.
         unsafe {
             harlan_arch_x86_64::stack::switch_to(
                 top,
                 kernel_main_on_stack,
-                (&raw mut context).cast(),
+                (context as *mut KernelContext).cast(),
             )
         }
     }
-    kernel_main(&mut context)
+
+    log::error!("HARLAN: no mapper, heap or guarded stack: still running on the firmware's memory");
+    let mut console = console;
+    banner(&mut console);
+    shell::run_shell(&mut console, &power)
 }
 
-/// What the long-running part of the kernel needs. It outlives the stack
-/// switch because it stays on the stack the kernel steps off.
-struct KernelContext<'a> {
-    console: &'a mut dyn Console,
-    power: &'a dyn PowerControl,
+/// Everything the long-running part of the kernel owns. It lives on the
+/// heap, so the stack switch and the reclaiming of the firmware's memory
+/// leave it untouched.
+#[cfg(target_arch = "x86_64")]
+struct KernelContext {
+    frames: memory::zeroed_frames::KernelFrames<'static>,
+    mapper: harlan_arch_x86_64::paging::KernelPageTable,
+    console: &'static mut dyn Console,
+    power: &'static dyn PowerControl,
 }
 
 /// Entry point on the kernel's own stack (see `stack::switch_to`).
+#[cfg(target_arch = "x86_64")]
 extern "C" fn kernel_main_on_stack(context: *mut u8) -> ! {
-    // SAFETY: `context` is the `KernelContext` `kmain` left on the stack it
-    // just stepped off, which stays mapped, untouched and referenced by
-    // nothing else.
-    kernel_main(unsafe { &mut *context.cast::<KernelContext<'_>>() })
+    // SAFETY: `context` is the `KernelContext` `kmain` leaked onto the heap
+    // and handed over here; nothing else refers to it.
+    kernel_main(unsafe { &mut *context.cast::<KernelContext>() })
 }
 
-fn kernel_main(context: &mut KernelContext<'_>) -> ! {
+#[cfg(target_arch = "x86_64")]
+fn kernel_main(context: &mut KernelContext) -> ! {
+    use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
+
     // Which stack this is running on, so every boot log says whether the
     // switch to the guarded stack happened.
     let here = 0u8;
@@ -236,14 +268,64 @@ fn kernel_main(context: &mut KernelContext<'_>) -> ! {
         core::ptr::addr_of!(here) as u64
     );
 
+    // An identity map of the kernel's own, with the null page left out, so
+    // that no firmware page table is in use any more and a null
+    // dereference faults.
+    //
+    // SAFETY: the kernel's image, its page tables, the framebuffer and
+    // every frame the allocator can hand out are all below the limit; its
+    // stack and heap are in kernel space, which this leaves alone; nothing
+    // depends on the null page; single core, and no interrupt handler
+    // touches page tables.
+    let own_tables = match unsafe {
+        context
+            .mapper
+            .rebuild_identity_map(&mut context.frames, DEFAULT_IDENTITY_LIMIT)
+    } {
+        Ok(stats) => {
+            log::info!(
+                "HARLAN: identity map rebuilt from {} table(s) of the kernel's own, covering {} GiB, null page unmapped",
+                stats.tables,
+                stats.limit / (1024 * 1024 * 1024)
+            );
+            true
+        }
+        Err(err) => {
+            log::error!(
+                "HARLAN: identity map not rebuilt ({err:?}); the firmware's tables stay in use"
+            );
+            false
+        }
+    };
+
+    // Only now, with nothing of the firmware's left in use, does its memory
+    // join the pool.
+    if own_tables {
+        let reclaimed = context.frames.reclaim_boot_services();
+        log::info!(
+            "HARLAN: boot-services memory reclaimed: +{reclaimed} frame(s) ({} MiB), {} free now",
+            reclaimed * FRAME_SIZE / (1024 * 1024),
+            context.frames.free_frames()
+        );
+        // Prove the pool really owns what it just took over.
+        let exercised = memory::frame_pool_self_test(&mut context.frames, 256);
+        log::info!("HARLAN: frame pool self-test OK ({exercised} frames written and verified)");
+    } else {
+        log::warn!("HARLAN: boot-services memory stays held back");
+    }
+
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
     // heap stress rounds until QEMU is stopped.
-    #[cfg(target_arch = "x86_64")]
     if cfg!(feature = "soak") {
         memory::heap::soak();
     }
 
     let console = &mut *context.console;
+    banner(console);
+    shell::run_shell(console, context.power)
+}
+
+fn banner(console: &mut dyn Console) {
     console.write_str(identity::PRODUCT_NAME);
     console.write_str(" ");
     console.write_str(identity::VERSION);
@@ -255,6 +337,4 @@ fn kernel_main(context: &mut KernelContext<'_>) -> ! {
     console.write_str(ARCH_NAME);
     console.write_str("\n");
     console.write_str("Kernel.......... READY\n\n");
-
-    shell::run_shell(console, context.power)
 }
