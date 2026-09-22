@@ -11,7 +11,7 @@ use free_list::{FreeListHeap, HeapCorruption, HeapStats};
 use harlan_hal::InterruptControl;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
 
-use super::frame_allocator::BitmapFrameAllocator;
+use super::zeroed_frames::KernelFrames;
 use crate::sync::IrqLock;
 
 /// Fixed for Fase 2: the heap is mapped once at boot and never grows.
@@ -86,7 +86,7 @@ pub static HEAP: KernelHeap<harlan_arch_x86_64::Cpu> = KernelHeap::new(harlan_ar
 pub fn init<I: InterruptControl>(
     heap: &KernelHeap<I>,
     mapper: &mut dyn PageMapper,
-    frames: &mut BitmapFrameAllocator<'_>,
+    frames: &mut KernelFrames<'_>,
     start: Page,
 ) -> usize {
     let data = PageFlags {

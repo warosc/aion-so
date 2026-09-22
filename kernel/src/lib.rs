@@ -79,7 +79,20 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     // firmware's stack, i.e. in boot-services memory the allocator itself
     // withholds, so the bitmap can never be handed out as a frame.
     let mut frame_bitmap = [0u64; memory::FRAME_BITMAP_WORDS];
-    let mut frames = BitmapFrameAllocator::new(&mut frame_bitmap, &boot_info.memory_map);
+    let bitmap = BitmapFrameAllocator::new(&mut frame_bitmap, &boot_info.memory_map);
+    // Every frame leaves the allocator zeroed from here on: no page table
+    // can start with junk entries and no frame carries what its previous
+    // owner left in it. The window is the firmware's identity map, which
+    // `KernelPageTable::take_over` checks before anything is written.
+    // SAFETY: the identity map covers every frame the allocator can hand
+    // out (it is the map the kernel is running under, and the allocator
+    // only hands out RAM below the covered range).
+    let mut frames = unsafe {
+        memory::zeroed_frames::ZeroedFrames::new(
+            bitmap,
+            memory::zeroed_frames::PhysWindow::identity(),
+        )
+    };
     const MIB: u64 = 1024 * 1024;
     log::info!(
         "HARLAN: frame allocator = {} free frame(s) ({} MiB) in the {} MiB covered, {} usable frame(s) beyond it ignored",
@@ -136,9 +149,10 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         let heap_bytes = memory::heap::init(&memory::heap::HEAP, mapper, &mut frames, heap_page);
         if heap_bytes > 0 {
             log::info!(
-                "HARLAN: heap = {} KiB at {heap_start:#x}; {} frame(s) left",
+                "HARLAN: heap = {} KiB at {heap_start:#x}; {} frame(s) left, {} zeroed so far",
                 heap_bytes / 1024,
-                frames.free_frames()
+                frames.free_frames(),
+                frames.zeroed_frames()
             );
             memory::heap::self_test(heap_start, heap_bytes);
         } else {

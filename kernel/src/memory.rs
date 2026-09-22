@@ -4,10 +4,12 @@
 
 pub mod frame_allocator;
 pub mod heap;
+pub mod zeroed_frames;
 
-use frame_allocator::{BitmapFrameAllocator, DeallocError};
-use harlan_hal::frame::PhysFrame;
+use frame_allocator::DeallocError;
+use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
 use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
+use zeroed_frames::KernelFrames;
 
 /// Size of the boot frame allocator's bitmap, in 64-frame words: 1024
 /// words = 65 536 frames = 256 MiB of physical address space, matching the
@@ -21,7 +23,7 @@ pub const FRAME_BITMAP_WORDS: usize = 1024;
 /// so it panics (through the logging panic handler) rather than let it
 /// hand out memory. `live_stack_addr` is the address of anything on the
 /// stack the kernel is running on.
-pub fn self_test(frames: &mut BitmapFrameAllocator<'_>, live_stack_addr: u64) {
+pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: u64) {
     assert!(
         !frames.manages(PhysFrame::containing_address(live_stack_addr)),
         "frame allocator would hand out the live stack at {live_stack_addr:#x}"
@@ -43,11 +45,28 @@ pub fn self_test(frames: &mut BitmapFrameAllocator<'_>, live_stack_addr: u64) {
     assert_ne!(a, b, "frame allocator handed out {a:?} twice");
     assert!(frames.manages(a) && frames.manages(b));
     assert_eq!(frames.free_frames(), before - 2);
+    // A frame that carried data must come back zeroed, not with what its
+    // previous owner left in it.
+    let window = frames.window();
+    // SAFETY: `a` is ours until it is deallocated below, and the window
+    // reaches it (its contract, checked by the paging take-over).
+    unsafe { window.frame_ptr(a).write_bytes(0xA5, FRAME_SIZE as usize) };
     assert_eq!(frames.deallocate(a), Ok(()));
     assert_eq!(frames.deallocate(a), Err(DeallocError::NotAllocated));
+    let reused = frames
+        .allocate()
+        .expect("the freed frame is available again");
+    // SAFETY: `reused` is ours; same window.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(window.frame_ptr(reused), FRAME_SIZE as usize) };
+    assert!(
+        bytes.iter().all(|&byte| byte == 0),
+        "frame {reused:?} was handed out holding old data"
+    );
+    assert_eq!(frames.deallocate(reused), Ok(()));
     assert_eq!(frames.deallocate(b), Ok(()));
     assert_eq!(frames.free_frames(), before);
-    log::info!("HARLAN: frame allocator self-test OK");
+    log::info!("HARLAN: frame allocator self-test OK (frames arrive zeroed)");
 }
 
 /// Boot-time check of the page mapper on the real page tables: maps a
@@ -59,7 +78,7 @@ pub fn self_test(frames: &mut BitmapFrameAllocator<'_>, live_stack_addr: u64) {
 /// nearby. Panics on a broken mapper.
 pub fn paging_self_test(
     mapper: &mut dyn PageMapper,
-    frames: &mut BitmapFrameAllocator<'_>,
+    frames: &mut KernelFrames<'_>,
     test_page: Page,
 ) {
     let Some(frame) = frames.allocate() else {
