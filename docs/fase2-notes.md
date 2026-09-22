@@ -55,6 +55,83 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 10 — Guard pages en las pilas del kernel (endurecimiento)
+
+Segundo de los tres incrementos de endurecimiento. Estrategia completa en
+`docs/memory-safety.md`.
+
+### ADR
+
+No hay ADR nuevo. El ADR 0005 ya reservó la mitad alta para el kernel y
+dejó el reparto de ranuras abierto; esta usa una ranura más (la 258) sin
+cambiar ninguna decisión.
+
+### El problema
+
+Hasta ahora el kernel corría sobre la pila que le dejó el firmware: 128 KiB
+de memoria de boot services con más datos del firmware justo debajo. Y la
+pila del manejador de double fault era un estático de 16 KiB dentro de la
+imagen, pegado a otros datos del kernel. En ambos casos, pasarse de la pila
+no fallaba: **corrompía lo que hubiera al lado**, en silencio.
+
+### Qué hace
+
+- `kernel::memory::stacks`: mapea las pilas dentro de la ranura 258 de la
+  PML4 (`KERNEL_STACKS_START`), en este orden: página sin mapear, pila del
+  kernel (64 KiB), página sin mapear, pila de double fault (16 KiB), página
+  sin mapear. Las pilas son escribibles y **no ejecutables**.
+- `arch::stack::switch_to`: función *naked* que mueve RSP a la pila nueva y
+  salta a un punto de entrada que nunca retorna. Prepara la pila como si se
+  hubiera llegado con un `call` (32 bytes de shadow space de la convención
+  de Microsoft x64 y una dirección de retorno falsa a 0, para que un
+  retorno accidental falle en el acto).
+- `arch::set_double_fault_stack`: apunta la entrada IST1 del TSS a la pila
+  nueva. La CPU lee el TSS cuando ocurre la excepción, así que no hace
+  falta recargar TR.
+- `kmain` mapea ambas pilas, apunta el IST y se muda a la pila del kernel
+  antes de la parte larga (banner, shell o soak). Si el mapeo falla, sigue
+  en la pila del firmware y lo registra: no es fatal.
+- Dos líneas de log nuevas hacen visible el resultado en cada arranque: la
+  dirección de las pilas, y la dirección real de la pila en uso.
+
+### Verificación ejecutada
+
+- Host: 153 pruebas en verde. Las 3 nuevas de `stacks` usan un `PageMapper`
+  falso y comprueban que las guard pages quedan sin mapear, que las pilas
+  son escribibles y no ejecutables, que no comparten ningún marco y que
+  quedarse sin marcos se reporta.
+- Pruebas de mutación (a mano, revertidas): sin guard page debajo; pilas
+  ejecutables; sin guard page entre las dos pilas; y una pila más corta de
+  lo pedido. Las 4 detectadas.
+- **Prueba negativa de extremo a extremo**: con una recursión infinita
+  provocada a propósito (temporal, revertida), el kernel registra
+  `#DF DOUBLE FAULT on the stack at 0xffff810000015f3f - halting` y se
+  detiene. Esa dirección cae dentro de la pila de double fault recién
+  mapeada (`0xffff810000012000`-`0xffff810000016000`), lo que demuestra
+  **tres cosas a la vez**: la guard page detiene el desbordamiento, el IST
+  apunta a la pila nueva, y el fallo es legible en vez de corrupción.
+- QEMU: `stacks = kernel 64 KiB at 0xffff810000001000, double fault 16 KiB
+  at 0xffff810000012000, guard pages around both` y `kernel running on the
+  stack at 0xffff810000010f17` (dentro del rango de la pila nueva).
+- `boot-test --repeat 10` 10/10; `--memory 1G --repeat 2` 2/2; soak de
+  120 s PASS; `fmt-lint` limpio; builds release OK.
+- QEMU interactivo: `help`, `version`, comando desconocido y `shutdown`
+  correctos con la shell ya sobre la pila protegida.
+
+### Riesgos y límites
+
+- La pila del kernel es de 64 KiB fijos y no crece: si alguna vez hiciera
+  falta más, el síntoma sería este double fault, que es el modo de fallo
+  deseable.
+- El arranque, hasta el cambio de pila, sigue ocurriendo sobre la pila del
+  firmware, sin guardas. El siguiente incremento (tablas propias) es el que
+  deja de depender de esa memoria.
+- La pila de double fault tiene guardas, pero un desbordamiento *dentro*
+  del manejador de double fault sería un triple fault (reinicio). El
+  soak-test lo detectaría.
+- `switch_to` asume la convención de Microsoft x64, como el resto del
+  ensamblador de este crate (es la del objetivo UEFI).
+
 ## Incremento 9 — Los frames se entregan a cero (endurecimiento)
 
 Primero de los tres incrementos de endurecimiento que pidió el usuario tras
