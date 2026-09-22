@@ -11,7 +11,7 @@
 
 use harlan_hal::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
 
-use super::frame_allocator::{BitmapFrameAllocator, DeallocError};
+use super::frame_allocator::{BitmapFrameAllocator, DeallocError, FramePurpose};
 
 /// How the kernel reaches physical memory: every frame is readable and
 /// writable at `base + its physical address`.
@@ -97,14 +97,21 @@ impl<A: FrameAllocator> ZeroedFrames<A> {
     }
 }
 
-impl<A: FrameAllocator> FrameAllocator for ZeroedFrames<A> {
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.inner.allocate_frame()?;
+impl<A: FrameAllocator> ZeroedFrames<A> {
+    /// Zeroes a frame on its way out of the allocator.
+    fn on_the_way_out(&mut self, frame: PhysFrame) -> PhysFrame {
         // SAFETY: the frame has just been handed to us, so nothing else is
         // using it, and the window reaches it (this type's contract).
         unsafe { self.window.zero(frame) };
         self.zeroed += 1;
-        Some(frame)
+        frame
+    }
+}
+
+impl<A: FrameAllocator> FrameAllocator for ZeroedFrames<A> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.inner.allocate_frame()?;
+        Some(self.on_the_way_out(frame))
     }
 }
 
@@ -112,13 +119,49 @@ impl<A: FrameAllocator> FrameAllocator for ZeroedFrames<A> {
 /// out. The bitmap's own operations stay available.
 pub type KernelFrames<'a> = ZeroedFrames<BitmapFrameAllocator<'a>>;
 
-impl KernelFrames<'_> {
+impl<'a> KernelFrames<'a> {
+    pub fn label(&mut self, frame: PhysFrame, purpose: FramePurpose) -> bool {
+        self.inner.label(frame, purpose)
+    }
+
+    /// Hands out a zeroed frame, recording what it is for.
+    pub fn allocate_for(&mut self, purpose: FramePurpose) -> Option<PhysFrame> {
+        let frame = self.inner.allocate_for(purpose)?;
+        Some(self.on_the_way_out(frame))
+    }
+
+    /// Anything the kernel keeps without a more specific purpose.
     pub fn allocate(&mut self) -> Option<PhysFrame> {
-        self.allocate_frame()
+        self.allocate_for(FramePurpose::Kernel)
     }
 
     pub fn deallocate(&mut self, frame: PhysFrame) -> Result<(), DeallocError> {
         self.inner.deallocate(frame)
+    }
+
+    /// Gives a frame back, checking it is what the caller thinks it is.
+    pub fn deallocate_as(
+        &mut self,
+        frame: PhysFrame,
+        purpose: FramePurpose,
+    ) -> Result<(), DeallocError> {
+        self.inner.deallocate_as(frame, purpose)
+    }
+
+    pub fn purpose_of(&self, frame: PhysFrame) -> Option<FramePurpose> {
+        self.inner.purpose_of(frame)
+    }
+
+    pub fn frames_for(&self, purpose: FramePurpose) -> u64 {
+        self.inner.frames_for(purpose)
+    }
+
+    /// Starts recording purposes, in a table the caller owns.
+    pub fn with_purposes(self, table: &'a mut [u8]) -> Self {
+        Self {
+            inner: self.inner.with_purposes(table),
+            ..self
+        }
     }
 
     pub fn manages(&self, frame: PhysFrame) -> bool {

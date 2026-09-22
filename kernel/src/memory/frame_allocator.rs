@@ -38,6 +38,63 @@ pub enum DeallocError {
     /// A managed frame that is already free: a double free, or freeing a
     /// frame that was never allocated.
     NotAllocated,
+    /// Freed as something it is not: the frame is in use, but for another
+    /// purpose than the caller thinks (a page table freed as a heap page,
+    /// say). Nothing is freed.
+    WrongPurpose {
+        expected: FramePurpose,
+        actual: Option<FramePurpose>,
+    },
+}
+
+/// What a frame the kernel holds is being used for. Recorded per frame so
+/// that a wrong assumption shows up as an error instead of silently freeing
+/// something else's memory, and so the boot log can say where the memory
+/// went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FramePurpose {
+    /// Handed out before the kernel had anywhere to record purposes.
+    Boot = 1,
+    /// A page table.
+    PageTable = 2,
+    /// Backing the kernel heap.
+    Heap = 3,
+    /// A kernel stack.
+    Stack = 4,
+    /// Anything else the kernel keeps.
+    Kernel = 5,
+}
+
+impl FramePurpose {
+    pub const ALL: [FramePurpose; 5] = [
+        FramePurpose::Boot,
+        FramePurpose::PageTable,
+        FramePurpose::Heap,
+        FramePurpose::Stack,
+        FramePurpose::Kernel,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            FramePurpose::Boot => "boot",
+            FramePurpose::PageTable => "page tables",
+            FramePurpose::Heap => "heap",
+            FramePurpose::Stack => "stacks",
+            FramePurpose::Kernel => "kernel",
+        }
+    }
+
+    const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(FramePurpose::Boot),
+            2 => Some(FramePurpose::PageTable),
+            3 => Some(FramePurpose::Heap),
+            4 => Some(FramePurpose::Stack),
+            5 => Some(FramePurpose::Kernel),
+            _ => None,
+        }
+    }
 }
 
 pub struct BitmapFrameAllocator<'a> {
@@ -46,6 +103,10 @@ pub struct BitmapFrameAllocator<'a> {
     /// Once the kernel owns its stack and page tables, boot-services
     /// memory becomes allocatable too (see `reclaim_boot_services`).
     boot_services_reclaimed: bool,
+    /// One byte per frame: 0 for a frame nobody holds, otherwise the
+    /// purpose it was handed out for. `None` until the kernel has a heap to
+    /// put the table in (`with_purposes`).
+    purposes: Option<&'a mut [u8]>,
     free: u64,
     /// Word where the next search starts (next-fit): allocation does not
     /// rescan the already-full low words every time.
@@ -63,6 +124,7 @@ impl<'a> BitmapFrameAllocator<'a> {
             bitmap: storage,
             map,
             boot_services_reclaimed: false,
+            purposes: None,
             free: 0,
             next_word: 0,
             uncovered: 0,
@@ -112,9 +174,88 @@ impl<'a> BitmapFrameAllocator<'a> {
             bitmap: storage,
             map,
             boot_services_reclaimed,
+            purposes: None,
             free,
             next_word: 0,
             uncovered: 0,
+        }
+    }
+
+    /// Starts recording what each frame is used for, in `table` (one byte
+    /// per frame, as long as the bitmap covers). Frames already handed out
+    /// are recorded as `Boot`: they were taken before there was anywhere to
+    /// write this down.
+    pub fn with_purposes(mut self, table: &'a mut [u8]) -> Self {
+        let covered = self.covered_frames() as usize;
+        assert!(
+            table.len() >= covered,
+            "the purpose table must cover every frame the bitmap does"
+        );
+        for number in 0..covered as u64 {
+            let frame = PhysFrame::containing_address(number * FRAME_SIZE);
+            let held = self.manages(frame) && self.bit(number);
+            table[number as usize] = if held { FramePurpose::Boot as u8 } else { 0 };
+        }
+        self.purposes = Some(table);
+        self
+    }
+
+    /// What `frame` is being used for, if the kernel holds it and purposes
+    /// are being recorded.
+    pub fn purpose_of(&self, frame: PhysFrame) -> Option<FramePurpose> {
+        let table = self.purposes.as_ref()?;
+        let number = frame.number() as usize;
+        FramePurpose::from_byte(*table.get(number)?)
+    }
+
+    /// How many frames are held for `purpose`.
+    pub fn frames_for(&self, purpose: FramePurpose) -> u64 {
+        self.purposes.as_ref().map_or(0, |table| {
+            table.iter().filter(|&&byte| byte == purpose as u8).count() as u64
+        })
+    }
+
+    /// Records what a frame the kernel already holds is for, for frames
+    /// taken before there was anywhere to write it down. Returns whether
+    /// anything was recorded: a frame nobody holds keeps no purpose.
+    pub fn label(&mut self, frame: PhysFrame, purpose: FramePurpose) -> bool {
+        let held = self.manages(frame) && self.bit(frame.number());
+        if held {
+            self.set_purpose(frame, Some(purpose));
+        }
+        held
+    }
+
+    /// Hands out a frame and records what it is for.
+    pub fn allocate_for(&mut self, purpose: FramePurpose) -> Option<PhysFrame> {
+        let frame = self.allocate()?;
+        self.set_purpose(frame, Some(purpose));
+        Some(frame)
+    }
+
+    /// Gives a frame back, checking it is what the caller thinks it is.
+    /// Nothing is freed if it is not.
+    pub fn deallocate_as(
+        &mut self,
+        frame: PhysFrame,
+        purpose: FramePurpose,
+    ) -> Result<(), DeallocError> {
+        let actual = self.purpose_of(frame);
+        if self.purposes.is_some() && actual != Some(purpose) {
+            return Err(DeallocError::WrongPurpose {
+                expected: purpose,
+                actual,
+            });
+        }
+        self.deallocate(frame)
+    }
+
+    fn set_purpose(&mut self, frame: PhysFrame, purpose: Option<FramePurpose>) {
+        let number = frame.number() as usize;
+        if let Some(table) = self.purposes.as_mut()
+            && let Some(slot) = table.get_mut(number)
+        {
+            *slot = purpose.map_or(0, |purpose| purpose as u8);
         }
     }
 
@@ -192,6 +333,7 @@ impl<'a> BitmapFrameAllocator<'a> {
             return Err(DeallocError::NotAllocated);
         }
         self.set_bit(frame.number(), false);
+        self.set_purpose(frame, None);
         self.free += 1;
         Ok(())
     }
@@ -250,11 +392,13 @@ impl<'a> BitmapFrameAllocator<'a> {
     }
 }
 
-/// How architecture code (page-table creation) draws frames from this
-/// allocator without depending on the `kernel` crate.
+/// How architecture code draws frames from this allocator without
+/// depending on the `kernel` crate. The only such consumer is page-table
+/// creation, so frames taken this way are recorded as page tables; anything
+/// else uses `allocate_for`.
 impl FrameAllocator for BitmapFrameAllocator<'_> {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        self.allocate()
+        self.allocate_for(FramePurpose::PageTable)
     }
 }
 
@@ -607,6 +751,100 @@ mod tests {
         assert_eq!(allocator.reclaim_boot_services(), 7);
         assert!(!allocator.manages(frame(0x3000)));
         assert!(!drain(&mut allocator).contains(&0x3000));
+    }
+
+    #[test]
+    fn frames_carry_what_they_are_used_for() {
+        let map = map_of(&[(0x1000, 10, Usable)]);
+        let mut storage = [0; 1];
+        let mut table = [0u8; 64];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map).with_purposes(&mut table);
+
+        let heap = allocator.allocate_for(FramePurpose::Heap).unwrap();
+        let stack = allocator.allocate_for(FramePurpose::Stack).unwrap();
+        assert_eq!(allocator.purpose_of(heap), Some(FramePurpose::Heap));
+        assert_eq!(allocator.purpose_of(stack), Some(FramePurpose::Stack));
+        assert_eq!(allocator.frames_for(FramePurpose::Heap), 1);
+        assert_eq!(allocator.frames_for(FramePurpose::PageTable), 0);
+
+        // A frame nobody holds carries no purpose.
+        assert_eq!(allocator.purpose_of(frame(0x9000)), None);
+        assert_eq!(allocator.deallocate(heap), Ok(()));
+        assert_eq!(allocator.purpose_of(heap), None);
+        assert_eq!(allocator.frames_for(FramePurpose::Heap), 0);
+    }
+
+    #[test]
+    fn frames_taken_through_the_trait_are_page_tables() {
+        let map = map_of(&[(0x1000, 4, Usable)]);
+        let mut storage = [0; 1];
+        let mut table = [0u8; 64];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map).with_purposes(&mut table);
+        // What `arch` page-table code gets, through the trait.
+        let frame = FrameAllocator::allocate_frame(&mut allocator).unwrap();
+        assert_eq!(allocator.purpose_of(frame), Some(FramePurpose::PageTable));
+    }
+
+    #[test]
+    fn labelling_only_touches_frames_the_kernel_holds() {
+        let map = map_of(&[(0x1000, 4, Usable)]);
+        let mut storage = [0; 1];
+        let mut table = [0u8; 64];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map).with_purposes(&mut table);
+        let held = allocator.allocate().unwrap();
+
+        assert!(allocator.label(held, FramePurpose::Heap));
+        assert_eq!(allocator.purpose_of(held), Some(FramePurpose::Heap));
+        // Free and withheld frames keep no purpose.
+        assert!(!allocator.label(frame(0x2000), FramePurpose::Heap));
+        assert!(!allocator.label(frame(0), FramePurpose::Heap));
+        assert_eq!(allocator.frames_for(FramePurpose::Heap), 1);
+    }
+
+    #[test]
+    fn freeing_a_frame_as_the_wrong_thing_frees_nothing() {
+        let map = map_of(&[(0x1000, 4, Usable)]);
+        let mut storage = [0; 1];
+        let mut table = [0u8; 64];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map).with_purposes(&mut table);
+        let table_frame = allocator.allocate_for(FramePurpose::PageTable).unwrap();
+        let free_before = allocator.free_frames();
+
+        assert_eq!(
+            allocator.deallocate_as(table_frame, FramePurpose::Heap),
+            Err(DeallocError::WrongPurpose {
+                expected: FramePurpose::Heap,
+                actual: Some(FramePurpose::PageTable),
+            })
+        );
+        assert_eq!(allocator.free_frames(), free_before, "nothing was freed");
+        assert_eq!(
+            allocator.purpose_of(table_frame),
+            Some(FramePurpose::PageTable)
+        );
+        assert_eq!(
+            allocator.deallocate_as(table_frame, FramePurpose::PageTable),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn frames_handed_out_before_the_table_existed_are_recorded_as_boot() {
+        let map = map_of(&[(0x1000, 6, Usable)]);
+        let mut storage = [0; 1];
+        let mut table = [0xEEu8; 64];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
+        let early = allocator.allocate().unwrap();
+        let mut allocator = allocator.with_purposes(&mut table);
+
+        assert_eq!(allocator.purpose_of(early), Some(FramePurpose::Boot));
+        assert_eq!(allocator.frames_for(FramePurpose::Boot), 1);
+        // Withheld frames and free ones carry nothing, whatever the table
+        // held before.
+        assert_eq!(allocator.purpose_of(frame(0)), None);
+        assert_eq!(allocator.purpose_of(frame(0x2000)), None);
+        assert_eq!(allocator.deallocate(early), Ok(()));
+        assert_eq!(allocator.frames_for(FramePurpose::Boot), 0);
     }
 
     /// Deterministic pseudo-random allocate/free sequence checked against
