@@ -4,6 +4,7 @@
 
 pub mod frame_allocator;
 pub mod heap;
+pub mod stacks;
 pub mod zeroed_frames;
 
 use frame_allocator::DeallocError;

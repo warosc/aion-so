@@ -108,6 +108,9 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     let stack_probe = 0u8;
     memory::self_test(&mut frames, core::ptr::addr_of!(stack_probe) as u64);
 
+    #[cfg(target_arch = "x86_64")]
+    let mut kernel_stack_top = None;
+
     // The kernel takes the root page table over from the firmware
     // (docs/adr/0005-fase2-kernel-page-tables.md). Not fatal if refused: it
     // keeps running on the firmware's tables, just without a page mapper.
@@ -158,7 +161,80 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         } else {
             log::error!("HARLAN: no kernel heap: every allocation will panic");
         }
+
+        // Stacks of the kernel's own, each between unmapped guard pages, so
+        // an overflow faults at once instead of overwriting what is below
+        // it. Not fatal if they cannot be mapped: the kernel stays on the
+        // firmware's stack, unguarded, and says so.
+        match memory::stacks::map_kernel_stacks(
+            mapper,
+            &mut frames,
+            harlan_arch_x86_64::paging::KERNEL_STACKS_START,
+        ) {
+            Ok((kernel, double_fault)) => {
+                // SAFETY: `double_fault` was just mapped for this, is
+                // writable, stays mapped for the life of the kernel and
+                // nothing else uses it. Not called from a double fault.
+                unsafe { harlan_arch_x86_64::set_double_fault_stack(double_fault.top()) };
+                log::info!(
+                    "HARLAN: stacks = kernel {} KiB at {:#x}, double fault {} KiB at {:#x}, guard pages around both",
+                    kernel.size() / 1024,
+                    kernel.bottom(),
+                    double_fault.size() / 1024,
+                    double_fault.bottom()
+                );
+                kernel_stack_top = Some(kernel.top());
+            }
+            Err(err) => log::error!(
+                "HARLAN: no guarded kernel stacks ({err:?}); staying on the firmware's stack"
+            ),
+        }
     }
+
+    let mut context = KernelContext { console, power };
+
+    // Everything long-running belongs on the guarded stack.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(top) = kernel_stack_top {
+        // SAFETY: `top` is the top of the stack just mapped for this — its
+        // own frames, nothing else using them, an unmapped guard page at
+        // each end — and `kernel_main_on_stack` never returns. `context`
+        // lives in this frame of the firmware's stack, which stays mapped
+        // and which the kernel never reuses.
+        unsafe {
+            harlan_arch_x86_64::stack::switch_to(
+                top,
+                kernel_main_on_stack,
+                (&raw mut context).cast(),
+            )
+        }
+    }
+    kernel_main(&mut context)
+}
+
+/// What the long-running part of the kernel needs. It outlives the stack
+/// switch because it stays on the stack the kernel steps off.
+struct KernelContext<'a> {
+    console: &'a mut dyn Console,
+    power: &'a dyn PowerControl,
+}
+
+/// Entry point on the kernel's own stack (see `stack::switch_to`).
+extern "C" fn kernel_main_on_stack(context: *mut u8) -> ! {
+    // SAFETY: `context` is the `KernelContext` `kmain` left on the stack it
+    // just stepped off, which stays mapped, untouched and referenced by
+    // nothing else.
+    kernel_main(unsafe { &mut *context.cast::<KernelContext<'_>>() })
+}
+
+fn kernel_main(context: &mut KernelContext<'_>) -> ! {
+    // Which stack this is running on, so every boot log says whether the
+    // switch to the guarded stack happened.
+    let here = 0u8;
+    log::info!(
+        "HARLAN: kernel running on the stack at {:#x}",
+        core::ptr::addr_of!(here) as u64
+    );
 
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
     // heap stress rounds until QEMU is stopped.
@@ -167,6 +243,7 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
         memory::heap::soak();
     }
 
+    let console = &mut *context.console;
     console.write_str(identity::PRODUCT_NAME);
     console.write_str(" ");
     console.write_str(identity::VERSION);
@@ -179,5 +256,5 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     console.write_str("\n");
     console.write_str("Kernel.......... READY\n\n");
 
-    shell::run_shell(console, power)
+    shell::run_shell(console, context.power)
 }
