@@ -2,6 +2,7 @@
 
 mod console;
 mod cpu;
+pub mod frame;
 pub mod framebuffer;
 mod interrupts;
 pub mod memory_map;

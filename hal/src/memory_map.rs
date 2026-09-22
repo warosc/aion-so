@@ -3,12 +3,19 @@
 //! `ExitBootServices` transition; `kernel` consumes it without ever
 //! depending on `uefi` itself.
 
-/// Coarse classification of a memory region. Nothing downstream needs
-/// finer granularity yet — the Incremento 5 frame allocator only cares
-/// about usable-or-not.
+/// Coarse classification of a memory region: only as fine as some consumer
+/// needs (today, the kernel's frame allocator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryRegionKind {
+    /// Free RAM (UEFI conventional memory): nothing lives there.
     Usable,
+    /// UEFI boot-services code and data. The firmware no longer needs it
+    /// after `ExitBootServices`, but the kernel still does: on OVMF the
+    /// stack it runs on and every page table in the live `CR3` hierarchy
+    /// sit in boot-services data (observed, see docs/fase2-notes.md,
+    /// Incremento 5). Kept apart from `Usable` so it is not handed out
+    /// before the kernel owns its own stack and page tables.
+    BootServices,
     Reserved,
 }
 
@@ -74,8 +81,12 @@ impl MemoryMap {
     }
 
     pub fn total_usable_pages(&self) -> u64 {
+        self.total_pages(MemoryRegionKind::Usable)
+    }
+
+    pub fn total_pages(&self, kind: MemoryRegionKind) -> u64 {
         self.iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .filter(|r| r.kind == kind)
             .map(|r| r.page_count)
             .sum()
     }
@@ -97,15 +108,17 @@ mod raw_memory_type {
     pub const CONVENTIONAL: u32 = 7;
 }
 
-/// Classifies a raw UEFI memory-type ordinal. `post_exit`: whether this
-/// runs after `ExitBootServices` — `BOOT_SERVICES_CODE`/`_DATA` only
-/// become safely reusable then (the UEFI spec's own documented
-/// convention, matching what the Linux EFI stub does).
-pub fn classify_memory_type(raw_ordinal: u32, post_exit: bool) -> MemoryRegionKind {
+/// Classifies a raw UEFI memory-type ordinal. Boot-services memory gets its
+/// own kind rather than `Usable`: the UEFI spec lets an OS reuse it after
+/// `ExitBootServices`, but only an OS that no longer runs on the firmware's
+/// stack and page tables, which this kernel still does (see
+/// `MemoryRegionKind::BootServices`). When to reclaim it is the kernel's
+/// decision, not this classifier's.
+pub fn classify_memory_type(raw_ordinal: u32) -> MemoryRegionKind {
     use raw_memory_type::*;
     match raw_ordinal {
         CONVENTIONAL => MemoryRegionKind::Usable,
-        BOOT_SERVICES_CODE | BOOT_SERVICES_DATA if post_exit => MemoryRegionKind::Usable,
+        BOOT_SERVICES_CODE | BOOT_SERVICES_DATA => MemoryRegionKind::BootServices,
         _ => MemoryRegionKind::Reserved,
     }
 }
@@ -117,42 +130,34 @@ mod tests {
     #[test]
     fn conventional_memory_is_usable() {
         assert_eq!(
-            classify_memory_type(raw_memory_type::CONVENTIONAL, true),
-            MemoryRegionKind::Usable
-        );
-        assert_eq!(
-            classify_memory_type(raw_memory_type::CONVENTIONAL, false),
+            classify_memory_type(raw_memory_type::CONVENTIONAL),
             MemoryRegionKind::Usable
         );
     }
 
     #[test]
-    fn boot_services_memory_is_usable_only_post_exit() {
+    fn boot_services_memory_is_its_own_kind_not_usable() {
         assert_eq!(
-            classify_memory_type(raw_memory_type::BOOT_SERVICES_CODE, true),
-            MemoryRegionKind::Usable
+            classify_memory_type(raw_memory_type::BOOT_SERVICES_CODE),
+            MemoryRegionKind::BootServices
         );
         assert_eq!(
-            classify_memory_type(raw_memory_type::BOOT_SERVICES_CODE, false),
-            MemoryRegionKind::Reserved
-        );
-        assert_eq!(
-            classify_memory_type(raw_memory_type::BOOT_SERVICES_DATA, true),
-            MemoryRegionKind::Usable
+            classify_memory_type(raw_memory_type::BOOT_SERVICES_DATA),
+            MemoryRegionKind::BootServices
         );
     }
 
     #[test]
     fn loader_and_reserved_memory_is_never_usable() {
         // LOADER_CODE=1, LOADER_DATA=2, RESERVED=0
-        assert_eq!(classify_memory_type(0, true), MemoryRegionKind::Reserved);
-        assert_eq!(classify_memory_type(1, true), MemoryRegionKind::Reserved);
-        assert_eq!(classify_memory_type(2, true), MemoryRegionKind::Reserved);
+        assert_eq!(classify_memory_type(0), MemoryRegionKind::Reserved);
+        assert_eq!(classify_memory_type(1), MemoryRegionKind::Reserved);
+        assert_eq!(classify_memory_type(2), MemoryRegionKind::Reserved);
     }
 
     #[test]
     fn unknown_ordinal_is_reserved() {
-        assert_eq!(classify_memory_type(9999, true), MemoryRegionKind::Reserved);
+        assert_eq!(classify_memory_type(9999), MemoryRegionKind::Reserved);
     }
 
     #[test]
@@ -189,5 +194,25 @@ mod tests {
             kind: MemoryRegionKind::Usable,
         }));
         assert_eq!(map.total_usable_pages(), 30);
+    }
+
+    #[test]
+    fn total_pages_counts_each_kind_separately() {
+        let mut map = MemoryMap::new();
+        for (start, pages, kind) in [
+            (0x0, 4, MemoryRegionKind::Usable),
+            (0x4000, 7, MemoryRegionKind::BootServices),
+            (0xB000, 2, MemoryRegionKind::Reserved),
+            (0xD000, 3, MemoryRegionKind::BootServices),
+        ] {
+            assert!(map.push(MemoryRegion {
+                start_phys_addr: start,
+                page_count: pages,
+                kind,
+            }));
+        }
+        assert_eq!(map.total_pages(MemoryRegionKind::Usable), 4);
+        assert_eq!(map.total_pages(MemoryRegionKind::BootServices), 10);
+        assert_eq!(map.total_pages(MemoryRegionKind::Reserved), 2);
     }
 }

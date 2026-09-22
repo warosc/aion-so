@@ -1,10 +1,13 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod identity;
+mod memory;
 mod shell;
 
-use harlan_hal::memory_map::MemoryMap;
+use harlan_hal::frame::FRAME_SIZE;
+use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
 use harlan_hal::{Console, PowerControl};
+use memory::frame_allocator::BitmapFrameAllocator;
 
 /// Grepped by `cargo xtask boot-test` in the QEMU debugcon capture.
 /// Keep in sync with tools/xtask's default `--marker` value.
@@ -61,10 +64,32 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     log::info!("HARLAN: architecture = {ARCH_NAME}");
     log::info!("HARLAN: GDT/IDT installed, breakpoint self-test OK");
     log::info!(
-        "HARLAN: memory map = {} region(s), {} usable pages",
+        "HARLAN: memory map = {} region(s), {} usable pages, {} boot-services pages held back",
         boot_info.memory_map.len(),
-        boot_info.memory_map.total_usable_pages()
+        boot_info.memory_map.total_usable_pages(),
+        boot_info
+            .memory_map
+            .total_pages(MemoryRegionKind::BootServices)
     );
+
+    // Lives as long as kmain, which never returns. It sits on the
+    // firmware's stack, i.e. in boot-services memory the allocator itself
+    // withholds, so the bitmap can never be handed out as a frame.
+    let mut frame_bitmap = [0u64; memory::FRAME_BITMAP_WORDS];
+    let mut frames = BitmapFrameAllocator::new(&mut frame_bitmap, &boot_info.memory_map);
+    const MIB: u64 = 1024 * 1024;
+    log::info!(
+        "HARLAN: frame allocator = {} free frame(s) ({} MiB) in the {} MiB covered, {} usable frame(s) beyond it ignored",
+        frames.free_frames(),
+        frames.free_frames() * FRAME_SIZE / MIB,
+        frames.covered_frames() * FRAME_SIZE / MIB,
+        frames.uncovered_usable_frames()
+    );
+    // Virtual and physical addresses still coincide (the firmware's
+    // identity mapping is live; Incremento 6 asserts it), so the address
+    // of a local is a physical address on the live stack.
+    let stack_probe = 0u8;
+    memory::self_test(&mut frames, core::ptr::addr_of!(stack_probe) as u64);
 
     console.write_str(identity::PRODUCT_NAME);
     console.write_str(" ");
