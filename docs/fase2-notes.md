@@ -7,6 +7,115 @@
 > equivalen hoy a `HARLAN` / `harlan-*` / `harlan_*`; tabla completa en
 > `docs/adr/0003-brand-migration-harlan.md`.
 
+## Incremento 7 — Heap del kernel
+
+### ADR
+
+`docs/adr/0006-fase2-kernel-heap.md`: ubicación (ranura 257 de la PML4,
+`0xFFFF_8080_0000_0000`), tamaño (4 MiB fijos), algoritmo y candado.
+
+### Qué hace
+
+- `kernel/src/memory/heap/free_list.rs`, `FreeListHeap`: lista libre
+  intrusiva ordenada por dirección, primer ajuste, división y fusión, con
+  granularidad de 16 bytes (igual al tamaño de la cabecera de un hueco:
+  cualquier sobrante es un hueco válido).
+  - Los bloques no llevan cabecera: su tamaño sale del `Layout`.
+  - Cada acceso a una cabecera comprueba los límites del heap.
+  - La doble liberación y liberar memoria ajena provocan un pánico.
+  - `check()` verifica todos los invariantes.
+  - El puntero base conserva la *provenance* (`with_addr`).
+- `kernel/src/sync.rs`, `IrqLock`: deshabilita las interrupciones mientras
+  está tomado y restaura el estado anterior (las secciones anidadas no las
+  reactivan antes de tiempo). Una reentrada provoca un pánico en vez de
+  girar en espera. Es el primer consumidor de `hal::InterruptControl`,
+  que esperaba uno desde el Incremento 1.
+- `kernel/src/memory/heap.rs`:
+  - `KernelHeap<I>` (`FreeListHeap` detrás de un `IrqLock`) implementa
+    `GlobalAlloc`.
+  - `static HEAP` es el `#[global_allocator]` (salvo en las pruebas de
+    host).
+  - `init` mapea 4 MiB página a página con frames nuevos (NX).
+  - `stress` es una carga determinista (SplitMix64) de hasta 256 bloques
+    vivos de 1 a 8192 bytes y alineaciones de 1 a 128 bytes (4096 una vez
+    de cada 64). Rellena cada bloque con su propio byte y lo verifica antes
+    de liberarlo, ejecuta `check()` cada 64 ciclos y al final exige volver a
+    los bytes libres iniciales.
+  - `self_test` comprueba que `Vec`, `Box` y `String` reciben memoria del
+    rango del heap y después ejecuta `stress`.
+- `STRESS_CYCLES`: 2 000 en cada arranque, 200 000 con la feature
+  `heap-stress` (`harlan-boot` la reenvía a `harlan-kernel`).
+  `cargo xtask boot-test --heap-stress` compila con ella; la CI la ejecuta
+  una vez por PR.
+- `kmain`: después de la autoprueba del mapper ejecuta `heap::init` y
+  `heap::self_test`. Si no hay mapper (`take_over` rechazado), no hay heap
+  y lo registra en el log.
+
+### Desviaciones del plan original
+
+1. El heap vive en la mitad alta (ADR 0005), no donde `virt == phys`: la
+   paginación queda ejercitada de verdad.
+2. El candado no gira en espera: la reentrada provoca un pánico, que es lo
+   correcto en un solo núcleo con las interrupciones apagadas.
+3. La prueba de estrés verifica el contenido de cada bloque (detecta
+   solapes) y es el mismo código en el host y en QEMU. El plan pedía ciclos
+   de asignar y liberar, sin especificar cómo detectar la corrupción.
+
+### Verificación ejecutada
+
+- Host: `cargo xtask test` pasa 137 pruebas en verde (51 `arch`, 17
+  `fbcon`, 15 `hal`, 49 `kernel`, 5 `xtask`). Nuevas:
+  - 14 de `FreeListHeap` sobre búferes reales, es decir, el mismo código
+    `unsafe` que corre en el kernel: alineación, exhaustión, relleno por
+    alineación, tamaño cero, peticiones imposibles, fusión en cualquier
+    orden de liberación, doble liberación, memoria ajena, cabecera
+    corrupta detectada por `check()`, puntero `next` corrupto que provoca
+    un pánico en vez de escribir fuera, y 20 000 operaciones aleatorias con
+    verificación de contenido;
+  - 4 de `IrqLock`;
+  - 4 de `KernelHeap`, entre ellas **la carga de arranque con 100 000
+    ciclos sobre 1 MiB**;
+  - 1 de la plomería `--heap-stress` en xtask;
+  - 1 de la ranura del heap.
+- Pruebas de mutación (a mano, revertidas): se introdujeron 10 bugs
+  deliberados, uno cada vez: perder la cola al dividir un hueco; perder el
+  relleno de alineación; no fusionar con el hueco siguiente; no fusionar con
+  el anterior; sin detección de doble liberación; tamaños sin redondear a
+  16; ignorar la alineación pedida; no descontar los bytes libres; el
+  candado reactivando las interrupciones siempre; y el candado sin detectar
+  la reentrada. Las pruebas detectaron los 10.
+- `cargo xtask fmt-lint` limpio; builds release correctos, también con
+  `--features heap-stress`.
+- QEMU:
+  - `heap = 4096 KiB at 0xffff808000000000; 51853 frame(s) left`. Cuadra al
+    frame: 52 885 − 1 (raíz) − 3 (autoprueba del mapper) − 1 024 (páginas)
+    − 4 (tablas del heap).
+  - `heap stress complete, 2000 cycles, 0 corruption (… after: 1 hole(s),
+    4194304 of 4194304 bytes free)`.
+  - Con `--heap-stress`, 200 000 ciclos: pico de 139 032 bytes vivos y el
+    mismo final, con un solo hueco y todo libre.
+  - `boot-test --repeat 10`: 10/10; el marcador del estrés corto ×10:
+    10/10; el estrés largo ×3: 3/3; `ticks=500` correcto.
+- QEMU interactivo: `help` y `version` correctos, `shutdown` apaga QEMU y
+  `reboot` produce un segundo arranque completo, con el heap reinicializado
+  y verificado dos veces.
+
+### Simplificaciones y riesgos documentados
+
+- 4 MiB fijos, sin crecimiento: agotarlo provoca un pánico registrado.
+- Primer ajuste con una lista lineal: O(huecos) por asignación. Basta para
+  las cargas de Fase 2.
+- Los metadatos van dentro del heap: un desbordamiento de un bloque puede
+  pisar la cabecera del hueco vecino. Queda acotado: los accesos comprueban
+  los límites y `check()` la detecta, así que se convierte en pánico y no
+  en una escritura arbitraria. Aun así no se detecta hasta el siguiente
+  acceso a ese hueco.
+- No es reentrante desde interrupciones: ningún manejador debe asignar
+  memoria (se detecta con un pánico).
+- Sin heap cuando `take_over` se rechaza (por ejemplo, en una CPU sin NX):
+  el kernel arranca igual porque nada más asigna todavía, pero cualquier
+  código futuro que asigne en esa configuración terminará en pánico.
+
 ## Incremento 6 — Page mapper: el kernel toma la raíz de las tablas de páginas
 
 ### ADR
