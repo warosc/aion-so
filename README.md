@@ -1,6 +1,6 @@
-# AION OS
+# HARLAN OS
 
-AION OS es un proyecto educativo y experimental para construir un sistema operativo **AI-native**, seguro y portable. La primera meta es un kernel real que arranque en QEMU mediante UEFI y presente una consola `AION>`.
+HARLAN OS es un proyecto educativo y experimental para construir un sistema operativo **AI-native**, seguro y portable. La primera meta es un kernel real que arranque en QEMU mediante UEFI y presente una consola `Harlan>`.
 
 ## Principios
 
@@ -26,12 +26,14 @@ AION OS es un proyecto educativo y experimental para construir un sistema operat
 ## Primer resultado esperado
 
 ```text
-AION OS v0.0.1
+HARLAN OS 0.0.1
+Computing with intent.
+
 Boot............ UEFI OK
 Architecture.... x86_64
 Kernel.......... READY
 
-AION> help
+Harlan> help
 ```
 
 Estos documentos son la constitución inicial del repositorio. El código deberá respetarlos; cualquier cambio arquitectónico importante requiere una decisión documentada.

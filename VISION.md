@@ -1,10 +1,10 @@
-# Visión de AION OS
+# Visión de HARLAN OS
 
 ## La pregunta
 
 ¿Cómo funcionaría una computadora si hubiera sido diseñada después de la IA, en lugar de antes?
 
-AION OS convierte objetivos humanos en planes verificables y acciones autorizadas. No reemplaza la seguridad del sistema por decisiones probabilísticas: separa estrictamente la inteligencia del mecanismo.
+HARLAN OS convierte objetivos humanos en planes verificables y acciones autorizadas. No reemplaza la seguridad del sistema por decisiones probabilísticas: separa estrictamente la inteligencia del mecanismo.
 
 ## Experiencia objetivo
 
@@ -39,4 +39,4 @@ El sistema debe resolverla mediante una secuencia visible y controlada:
 
 ## Éxito de la primera etapa
 
-AION v0.0.1 arranca repetidamente en QEMU con UEFI, inicializa una consola, recibe teclado y ejecuta comandos básicos sin red ni IA.
+HARLAN OS v0.0.1 arranca repetidamente en QEMU con UEFI, inicializa una consola, recibe teclado y ejecuta comandos básicos sin red ni IA.

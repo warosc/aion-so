@@ -17,7 +17,7 @@ Esta guía define el entorno previsto; los comandos exactos se ajustarán al sis
 ## Organización recomendada
 
 ```text
-aion-os/
+harlanos/
 ├── .vscode/
 ├── boot/
 ├── kernel/
@@ -38,19 +38,19 @@ aion-os/
 
 Abrir la carpeta raíz, no archivos individuales. Las tareas del proyecto deberán ofrecer como mínimo:
 
-- `AION: Build`
-- `AION: Run QEMU`
-- `AION: Test`
-- `AION: Format + Lint`
-- `AION: Debug QEMU`
+- `Harlan: Build`
+- `Harlan: Run QEMU`
+- `Harlan: Test`
+- `Harlan: Format + Lint`
+- `Harlan: Debug QEMU`
 
 Codex y Claude deben ejecutarse desde la raíz para que ambos lean sus instrucciones y vean el mismo estado de Git.
 
 ## Flujo inicial
 
 ```bash
-git clone <URL-DEL-REPOSITORIO> aion-os
-cd aion-os
+git clone <URL-DEL-REPOSITORIO> harlanos
+cd harlanos
 git switch develop
 code .
 ```
@@ -63,6 +63,6 @@ No copies el repositorio por separado para cada IA. Usa ramas distintas o `git w
 2. Configurar el target freestanding.
 3. Implementar el boot UEFI mínimo.
 4. Automatizar la imagen y el arranque QEMU.
-5. Añadir un smoke test que detecte `AION OS v0.0.1` por consola serial.
+5. Añadir un smoke test que detecte `HARLAN OS 0.0.1` por consola serial.
 
 El primer objetivo no es añadir IA: es conseguir un arranque real, repetible y observable.

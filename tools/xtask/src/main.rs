@@ -1,4 +1,4 @@
-//! Build/run/test automation for AION OS. See ROADMAP.md Fase 0: the goal is
+//! Build/run/test automation for HARLAN OS. See ROADMAP.md Fase 0: the goal is
 //! a single command that builds and boots the image in QEMU.
 
 use std::{
@@ -17,11 +17,11 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// Must match `kernel::shell::SHELL_READY_MARKER` (kernel/src/shell.rs).
 /// Not shared via a dependency edge because xtask is host tooling, not part
 /// of the freestanding boot chain. Override with `--marker` to check the
-/// older Fase 0 checkpoint (`AION-PHASE0-BOOT-OK`) instead.
-const DEFAULT_MARKER: &str = "AION-PHASE1-SHELL-READY";
+/// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
+const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "AION OS build/run/test automation")]
+#[command(name = "xtask", about = "HARLAN OS build/run/test automation")]
 struct Cli {
     #[command(subcommand)]
     command: XtaskCommand,
@@ -31,9 +31,9 @@ struct Cli {
 enum XtaskCommand {
     /// Build the kernel and the UEFI boot application, and assemble the ESP directory.
     Build,
-    /// Build and run AION OS interactively in QEMU (opens a window).
+    /// Build and run HARLAN OS interactively in QEMU (opens a window).
     Run,
-    /// Run host-runnable unit tests (every crate except `aion-boot`, which
+    /// Run host-runnable unit tests (every crate except `harlan-boot`, which
     /// only builds for UEFI).
     Test,
     /// Run cargo fmt and cargo clippy across every target.
@@ -105,9 +105,12 @@ fn run_cargo(root: &Path, args: &[&str]) -> Result<()> {
 fn build(root: &Path) -> Result<()> {
     run_cargo(
         root,
-        &["build", "-p", "aion-kernel", "--target", KERNEL_TARGET],
+        &["build", "-p", "harlan-kernel", "--target", KERNEL_TARGET],
     )?;
-    run_cargo(root, &["build", "-p", "aion-boot", "--target", UEFI_TARGET])?;
+    run_cargo(
+        root,
+        &["build", "-p", "harlan-boot", "--target", UEFI_TARGET],
+    )?;
     assemble_esp(root)
 }
 
@@ -116,7 +119,7 @@ fn assemble_esp(root: &Path) -> Result<()> {
         .join("target")
         .join(UEFI_TARGET)
         .join("debug")
-        .join("aion-boot.efi");
+        .join("harlan-boot.efi");
     let esp_boot_dir = root.join("target").join("esp").join("efi").join("boot");
     fs::create_dir_all(&esp_boot_dir)
         .with_context(|| format!("failed to create {}", esp_boot_dir.display()))?;
@@ -137,13 +140,13 @@ fn test(root: &Path) -> Result<()> {
         &[
             "test",
             "-p",
-            "aion-hal",
+            "harlan-hal",
             "-p",
-            "aion-arch-x86_64",
+            "harlan-arch-x86_64",
             "-p",
-            "aion-fbcon",
+            "harlan-fbcon",
             "-p",
-            "aion-kernel",
+            "harlan-kernel",
             "-p",
             "xtask",
         ],
@@ -161,13 +164,13 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
         &[
             "clippy",
             "-p",
-            "aion-hal",
+            "harlan-hal",
             "-p",
-            "aion-arch-x86_64",
+            "harlan-arch-x86_64",
             "-p",
-            "aion-fbcon",
+            "harlan-fbcon",
             "-p",
-            "aion-kernel",
+            "harlan-kernel",
             "-p",
             "xtask",
             "--all-targets",
@@ -181,7 +184,7 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
         &[
             "clippy",
             "-p",
-            "aion-kernel",
+            "harlan-kernel",
             "--target",
             KERNEL_TARGET,
             "--",
@@ -194,7 +197,7 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
         &[
             "clippy",
             "-p",
-            "aion-boot",
+            "harlan-boot",
             "--target",
             UEFI_TARGET,
             "--",

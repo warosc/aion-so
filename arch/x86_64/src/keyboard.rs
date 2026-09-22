@@ -20,7 +20,7 @@
 
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use aion_hal::ConsoleKey;
+use harlan_hal::ConsoleKey;
 
 use crate::port::{inb, outb};
 
@@ -396,15 +396,15 @@ pub unsafe fn init_controller() -> Result<(), InitError> {
         outb(DATA_PORT, KEYBOARD_ENABLE_SCANNING);
         match wait_output_ready() {
             Ok(KEYBOARD_ACK) => {}
-            Ok(other) => log::warn!("AION: keyboard answered {other:#04x} to enable-scanning"),
-            Err(_) => log::warn!("AION: keyboard did not answer enable-scanning"),
+            Ok(other) => log::warn!("HARLAN: keyboard answered {other:#04x} to enable-scanning"),
+            Err(_) => log::warn!("HARLAN: keyboard did not answer enable-scanning"),
         }
 
         // The ACK above, and any byte that raced in, would otherwise be
         // decoded as a key once IRQ1 is unmasked.
         drain_output_buffer();
 
-        log::info!("AION: PS/2 keyboard ready (i8042 config {config:#04x} -> {new_config:#04x})");
+        log::info!("HARLAN: PS/2 keyboard ready (i8042 config {config:#04x} -> {new_config:#04x})");
     }
     Ok(())
 }
@@ -436,7 +436,7 @@ pub unsafe fn on_irq() {
         // Mouse bytes have no consumer (IRQ12 stays masked), but must
         // still be read out or they would block the keyboard's.
         if status & STATUS_AUX_DATA == 0 && !SCANCODES.push(byte) {
-            log::warn!("AION: keyboard queue full, dropped scancode {byte:#04x}");
+            log::warn!("HARLAN: keyboard queue full, dropped scancode {byte:#04x}");
         }
     }
 }

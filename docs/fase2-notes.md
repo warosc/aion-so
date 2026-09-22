@@ -1,5 +1,12 @@
 # Notas de implementación — Fase 2
 
+> **Nota (ADR 0003):** las secciones de los Incrementos 1 a 4 son anteriores
+> a la migración de marca AION OS → HARLAN OS. Se conservan sin reescribir
+> porque registran lo que se decidió y observó entonces, incluidas líneas de
+> log literales como `AION: ticks=300`. `AION` / `aion-*` / `aion_*`
+> equivalen hoy a `HARLAN` / `harlan-*` / `harlan_*`; tabla completa en
+> `docs/adr/0003-brand-migration-harlan.md`.
+
 ## Incremento 4 — Teclado PS/2 por IRQ, consola de framebuffer, shell restaurada
 
 ### No se necesitó un ADR nuevo

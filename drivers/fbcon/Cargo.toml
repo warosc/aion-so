@@ -1,11 +1,11 @@
 [package]
-name = "aion-fbcon"
+name = "harlan-fbcon"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-aion-hal = { path = "../../hal" }
+harlan-hal = { path = "../../hal" }
 # Data-only dependency (one ~1 KiB glyph table). `default-features = false`
 # is what makes it `no_std`: the crate's default `std` feature would not
 # build for the freestanding/UEFI targets.

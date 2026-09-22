@@ -8,12 +8,12 @@
 //!
 //! Colors are white on black. Both are byte-order symmetric as a 32-bit
 //! pixel (`0x00FFFFFF` / `0`), so RGB-versus-BGR framebuffers need no
-//! distinction here — see `aion_hal::framebuffer::FramebufferInfo`.
+//! distinction here — see `harlan_hal::framebuffer::FramebufferInfo`.
 
 #![cfg_attr(not(test), no_std)]
 
-use aion_hal::framebuffer::FramebufferInfo;
 use font8x8::legacy::BASIC_LEGACY;
+use harlan_hal::framebuffer::FramebufferInfo;
 
 const GLYPH_PIXELS: usize = 8;
 const SCALE: usize = 2;

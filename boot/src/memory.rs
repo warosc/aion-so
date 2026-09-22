@@ -3,7 +3,7 @@
 //! `hal`'s firmware-agnostic `MemoryMap` — the boundary that keeps
 //! `kernel` free of any dependency on the `uefi` crate.
 
-use aion_hal::memory_map::{MemoryMap, MemoryRegion, classify_memory_type};
+use harlan_hal::memory_map::{MemoryMap, MemoryRegion, classify_memory_type};
 use uefi::mem::memory_map::{MemoryMap as UefiMemoryMapTrait, MemoryMapOwned};
 
 pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
@@ -21,7 +21,7 @@ pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
     }
     if dropped > 0 {
         log::warn!(
-            "AION: memory map truncated, {dropped} region(s) dropped (capacity {})",
+            "HARLAN: memory map truncated, {dropped} region(s) dropped (capacity {})",
             MemoryMap::CAPACITY
         );
     }
