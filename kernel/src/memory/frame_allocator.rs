@@ -43,6 +43,9 @@ pub enum DeallocError {
 pub struct BitmapFrameAllocator<'a> {
     bitmap: &'a mut [u64],
     map: &'a MemoryMap,
+    /// Once the kernel owns its stack and page tables, boot-services
+    /// memory becomes allocatable too (see `reclaim_boot_services`).
+    boot_services_reclaimed: bool,
     free: u64,
     /// Word where the next search starts (next-fit): allocation does not
     /// rescan the already-full low words every time.
@@ -59,6 +62,7 @@ impl<'a> BitmapFrameAllocator<'a> {
         let mut allocator = Self {
             bitmap: storage,
             map,
+            boot_services_reclaimed: false,
             free: 0,
             next_word: 0,
             uncovered: 0,
@@ -89,6 +93,73 @@ impl<'a> BitmapFrameAllocator<'a> {
             .map(|word| u64::from(word.count_zeros()))
             .sum();
         allocator
+    }
+
+    /// Takes over `storage`, a copy of another allocator's bitmap over the
+    /// same `map`, keeping every frame that was already handed out handed
+    /// out. This is how the kernel moves its bookkeeping (from the
+    /// firmware's memory to its own heap) without losing track of anything.
+    pub fn adopt(
+        storage: &'a mut [u64],
+        map: &'a MemoryMap,
+        boot_services_reclaimed: bool,
+    ) -> Self {
+        let free = storage
+            .iter()
+            .map(|word| u64::from(word.count_zeros()))
+            .sum();
+        Self {
+            bitmap: storage,
+            map,
+            boot_services_reclaimed,
+            free,
+            next_word: 0,
+            uncovered: 0,
+        }
+    }
+
+    /// Adds the map's boot-services memory to the pool, under the same
+    /// rules as everything else: never a frame a reserved region touches,
+    /// never frame 0, never one already handed out. Returns how many frames
+    /// it added; calling it again adds nothing.
+    ///
+    /// Only correct once the kernel no longer depends on anything the
+    /// firmware left there — its own stack and page tables, above all (see
+    /// docs/adr/0007-fase2-own-memory.md).
+    pub fn reclaim_boot_services(&mut self) -> u64 {
+        if self.boot_services_reclaimed {
+            return 0;
+        }
+        self.boot_services_reclaimed = true;
+        let covered = self.covered_frames();
+        let mut added = 0;
+        // A copy of the shared reference, so walking the map does not
+        // borrow `self` while the bits are being cleared.
+        let map = self.map;
+        for region in map
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::BootServices)
+        {
+            let (first, end) = inward_frames(region);
+            for number in first..end.min(covered) {
+                let frame = PhysFrame::containing_address(number * FRAME_SIZE);
+                if self.manages(frame) && self.bit(number) {
+                    self.set_bit(number, false);
+                    added += 1;
+                }
+            }
+        }
+        self.free += added;
+        added
+    }
+
+    pub fn boot_services_reclaimed(&self) -> bool {
+        self.boot_services_reclaimed
+    }
+
+    /// The raw bitmap, to copy it somewhere the kernel owns (see `adopt`).
+    pub fn bitmap(&self) -> &[u64] {
+        self.bitmap
     }
 
     pub fn allocate(&mut self) -> Option<PhysFrame> {
@@ -131,16 +202,20 @@ impl<'a> BitmapFrameAllocator<'a> {
     pub fn manages(&self, frame: PhysFrame) -> bool {
         let number = frame.number();
         let contains = |(first, end): (u64, u64)| first <= number && number < end;
+        let allocatable = |kind| {
+            kind == MemoryRegionKind::Usable
+                || (self.boot_services_reclaimed && kind == MemoryRegionKind::BootServices)
+        };
         number != 0
             && number < self.covered_frames()
             && self
                 .map
                 .iter()
-                .any(|r| r.kind == MemoryRegionKind::Usable && contains(inward_frames(r)))
+                .any(|r| allocatable(r.kind) && contains(inward_frames(r)))
             && !self
                 .map
                 .iter()
-                .any(|r| r.kind != MemoryRegionKind::Usable && contains(outward_frames(r)))
+                .any(|r| !allocatable(r.kind) && contains(outward_frames(r)))
     }
 
     pub fn free_frames(&self) -> u64 {
@@ -447,6 +522,91 @@ mod tests {
         assert_eq!(allocator.free_frames(), 134 + 24 + 1792 + 3);
         assert!(!allocator.manages(PhysFrame::containing_address(0xfe86f70)));
         assert!(!allocator.manages(frame(0x87000)));
+    }
+
+    #[test]
+    fn an_adopted_bitmap_keeps_every_frame_that_was_handed_out() {
+        let map = map_of(&[(0x1000, 10, Usable)]);
+        let mut storage = [0; 1];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
+        let taken = [
+            allocator.allocate().unwrap(),
+            allocator.allocate().unwrap(),
+            allocator.allocate().unwrap(),
+        ];
+        let free_before = allocator.free_frames();
+
+        let mut copy = [0; 1];
+        copy.copy_from_slice(allocator.bitmap());
+        let mut moved = BitmapFrameAllocator::adopt(&mut copy, &map, false);
+
+        assert_eq!(moved.free_frames(), free_before);
+        let handed_out = drain(&mut moved);
+        for frame in taken {
+            assert!(
+                !handed_out.contains(&frame.start_address()),
+                "{frame:?} was handed out twice"
+            );
+            assert_eq!(moved.deallocate(frame), Ok(()));
+        }
+    }
+
+    #[test]
+    fn reclaiming_boot_services_adds_exactly_its_frames() {
+        let map = map_of(&[
+            (0x0, 4, BootServices),
+            (0x4000, 4, Usable),
+            (0x8000, 4, BootServices),
+        ]);
+        let mut storage = [0; 1];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
+        let taken = allocator.allocate().unwrap();
+        assert!(!allocator.manages(frame(0x8000)));
+
+        // Frame 0 is in the first boot-services region and stays out.
+        assert_eq!(allocator.reclaim_boot_services(), 3 + 4);
+        assert_eq!(allocator.reclaim_boot_services(), 0, "not twice");
+        assert!(allocator.manages(frame(0x8000)) && !allocator.manages(frame(0x0)));
+
+        // The frame handed out before is still handed out.
+        let handed_out = drain(&mut allocator);
+        assert!(!handed_out.contains(&taken.start_address()));
+        assert_eq!(handed_out.len(), 3 + 4 + 3);
+    }
+
+    #[test]
+    fn reclaiming_again_never_frees_what_was_handed_out() {
+        let map = map_of(&[(0x1000, 8, BootServices), (0x9000, 1, Usable)]);
+        let mut storage = [0; 1];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
+        assert_eq!(allocator.reclaim_boot_services(), 8);
+        let taken = allocator.allocate().unwrap();
+        let free_before = allocator.free_frames();
+
+        assert_eq!(allocator.reclaim_boot_services(), 0);
+
+        assert_eq!(
+            allocator.free_frames(),
+            free_before,
+            "a live frame was freed"
+        );
+        // Still allocated: freeing it now must succeed exactly once.
+        assert_eq!(allocator.deallocate(taken), Ok(()));
+        assert_eq!(allocator.deallocate(taken), Err(DeallocError::NotAllocated));
+    }
+
+    #[test]
+    fn reclaiming_never_touches_frames_a_reserved_region_covers() {
+        let map = map_of(&[
+            (0x1000, 8, BootServices),
+            (0x3000, 1, Reserved),
+            (0x9000, 1, Usable),
+        ]);
+        let mut storage = [0; 1];
+        let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
+        assert_eq!(allocator.reclaim_boot_services(), 7);
+        assert!(!allocator.manages(frame(0x3000)));
+        assert!(!drain(&mut allocator).contains(&0x3000));
     }
 
     /// Deterministic pseudo-random allocate/free sequence checked against

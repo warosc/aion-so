@@ -136,6 +136,18 @@ impl KernelFrames<'_> {
     pub fn uncovered_usable_frames(&self) -> u64 {
         self.inner.uncovered_usable_frames()
     }
+
+    pub fn bitmap(&self) -> &[u64] {
+        self.inner.bitmap()
+    }
+
+    pub fn boot_services_reclaimed(&self) -> bool {
+        self.inner.boot_services_reclaimed()
+    }
+
+    pub fn reclaim_boot_services(&mut self) -> u64 {
+        self.inner.reclaim_boot_services()
+    }
 }
 
 #[cfg(test)]
