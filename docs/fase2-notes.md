@@ -55,6 +55,90 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 11 — Tablas propias, memoria del firmware recuperada y página 0 fuera (endurecimiento)
+
+Tercero y último de los incrementos de endurecimiento que pidió el usuario.
+Decisión en `docs/adr/0007-fase2-own-memory.md`.
+
+### El problema
+
+El kernel seguía dependiendo del firmware en tres sitios: las tablas de
+niveles inferiores del mapa de identidad eran suyas, el mapa de memoria y el
+bitmap de marcos vivían en su pila, y la consola también. Por eso la memoria
+de boot services seguía retenida (unos 43 MiB, el 17 % de la RAM) y la
+página 0 seguía mapeada con escritura: **una desreferencia nula no fallaba**.
+
+### Qué hace
+
+- **Contrato de arranque** (ADR 0007): `kmain` recibe `BootInfo`, consola y
+  control de energía **por valor**. `boot` deja de ser su dueño.
+- **Traslado al heap**: con mapper, heap y pila propia, el kernel copia al
+  heap el mapa de memoria y el bitmap, y mueve allí la consola y el control
+  de energía; el contexto vive también en el heap.
+  `BitmapFrameAllocator::adopt` reconstruye el asignador sobre las copias
+  **conservando exactamente qué marcos estaban entregados**.
+- **Mapa de identidad propio**: `rebuild_identity_map` construye 6 tablas
+  (un PDPT, cuatro directorios de 2 MiB y una tabla de 4 KiB para los
+  primeros 2 MiB) que cubren `0..4 GiB` **sin la página 0**, y las instala
+  como toda la mitad baja. Se construye entero antes de enlazarlo, así que
+  el mapa en uso nunca pierde una traducción sobre la que está corriendo.
+- **Recuperación**: `reclaim_boot_services` añade esa memoria al pool, solo
+  si lo anterior salió bien, con las reglas conservadoras de siempre y de
+  forma idempotente.
+- **Autoprueba nueva**: justo después de recuperar, el kernel toma 256
+  marcos, comprueba que llegan a cero, escribe un patrón distinto en cada
+  uno, los verifica y los devuelve.
+
+### Verificación ejecutada
+
+- Host: 160 pruebas en verde. Nuevas: 3 del mapa de identidad (página 0
+  fuera y traducciones correctas; se conserva el espacio del kernel y se
+  descarta el resto de la mitad baja; un límite inválido o falta de marcos
+  deja intacto el mapa anterior) y 3 del asignador (`adopt` conserva lo
+  entregado; recuperar añade exactamente sus marcos, respeta la página 0 y
+  no se repite; nunca toca marcos que cubra una región reservada; y
+  recuperar otra vez no libera nada que se haya entregado entre medias).
+- Pruebas de mutación (a mano, revertidas): 8 bugs deliberados: mapear la
+  página 0; dejar en pie el resto de la mitad baja; no invalidar la TLB;
+  directorios con el tamaño de página equivocado; enlazar el mapa nuevo
+  antes de construirlo; recuperar ignorando las reglas de retención;
+  recuperar dos veces; y que `adopt` borre el bitmap en vez de adoptarlo.
+  Las 8 detectadas — **una de ellas destapó un hueco real**: la prueba de
+  idempotencia solo miraba el valor devuelto, así que no veía que una
+  segunda recuperación podía liberar marcos ya entregados. Se añadió la
+  prueba que faltaba antes de dar el incremento por bueno.
+- **Pruebas negativas de extremo a extremo**:
+  - una lectura por puntero nulo, provocada a propósito (temporal,
+    revertida), produce `#PF accessing 0x0, error_code=0x0, rip=0xde036bc`.
+    Antes leía memoria real sin enterarse.
+- QEMU: `identity map rebuilt from 6 table(s) of the kernel's own, covering
+  4 GiB, null page unmapped`, `boot-services memory reclaimed: +10998
+  frame(s) (42 MiB), 62815 free now` y `frame pool self-test OK (256 frames
+  written and verified)`.
+- `boot-test --repeat 10` 10/10; `--memory 1G --repeat 2` 2/2; estrés largo
+  del heap OK; soak de 120 s con 256 MiB y con 1 GiB: PASS.
+- QEMU interactivo **después de recuperar la memoria del firmware**: `help`,
+  `version`, `shutdown` (apaga la máquina) y `reboot` (segundo arranque
+  completo) correctos. Los *runtime services* de UEFI sobreviven porque
+  viven en memoria de tipo runtime, que sigue reservada.
+
+### Riesgos y límites
+
+- **La mitad baja queda escribible y ejecutable** (igual que la dejaba el
+  firmware). W^X exigiría saber dónde está la imagen cargada, dato que solo
+  da `LoadedImage` antes de salir de boot services. Es el siguiente hueco
+  de seguridad de memoria a cerrar.
+- El mapa de identidad son 4 GiB fijos: cubre la RAM que el asignador
+  gestiona (256 MiB), el framebuffer y el MMIO heredado. Más RAM que eso ya
+  se ignoraba antes.
+- Lo que el firmware mapeaba entre 4 GiB y 1 TiB se descarta. Si alguna vez
+  hace falta MMIO alto (por ejemplo, PCIe sobre 4 GiB), habrá que mapearlo
+  explícitamente.
+- La recuperación depende de que nada del kernel siga en memoria de boot
+  services. Hoy lo garantiza el orden: tablas propias, pila propia y estado
+  en el heap, todo antes de recuperar. Cualquier cosa nueva que se guarde
+  antes de ese punto tiene que moverse también.
+
 ## Incremento 10 — Guard pages en las pilas del kernel (endurecimiento)
 
 Segundo de los tres incrementos de endurecimiento. Estrategia completa en
