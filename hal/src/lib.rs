@@ -6,6 +6,7 @@ pub mod frame;
 pub mod framebuffer;
 mod interrupts;
 pub mod memory_map;
+pub mod paging;
 mod power;
 mod timer;
 

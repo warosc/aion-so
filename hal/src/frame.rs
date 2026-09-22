@@ -7,6 +7,13 @@
 /// counts frames directly.
 pub const FRAME_SIZE: u64 = 4096;
 
+/// Source of free physical frames. The kernel's frame allocator implements
+/// it; architecture code that builds page tables consumes it, since `arch`
+/// cannot depend on the `kernel` crate.
+pub trait FrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame>;
+}
+
 /// A `FRAME_SIZE`-aligned block of physical memory, named by its start
 /// address. Constructing one says nothing about who owns the memory — that
 /// is the frame allocator's job — only that the address is aligned.
