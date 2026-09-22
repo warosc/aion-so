@@ -13,6 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use frame_allocator::{BitmapFrameAllocator, DeallocError, FramePurpose};
 
+use harlan_hal::addr::{PhysAddr, VirtAddr};
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
 use harlan_hal::memory_map::MemoryMap;
 use harlan_hal::paging::{MapError, PAGE_SIZE, Page, PageFlags, PageMapper, UnmapError};
@@ -105,7 +106,10 @@ pub fn frame_pool_self_test(frames: &mut KernelFrames<'_>, sample: usize) -> usi
 /// so it panics (through the logging panic handler) rather than let it
 /// hand out memory. `live_stack_addr` is the address of anything on the
 /// stack the kernel is running on.
-pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: u64) {
+pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: VirtAddr) {
+    // Under the firmware's identity map the two coincide; this runs before
+    // the kernel takes over the page tables.
+    let live_stack_addr = PhysAddr::new(live_stack_addr.as_u64());
     assert!(
         !frames.manages(PhysFrame::containing_address(live_stack_addr)),
         "frame allocator would hand out the live stack at {live_stack_addr:#x}"
@@ -169,7 +173,7 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: u64) {
 pub fn label_mapped_frames(
     mapper: &dyn PageMapper,
     frames: &mut KernelFrames<'_>,
-    start: u64,
+    start: VirtAddr,
     len: u64,
     purpose: FramePurpose,
 ) -> u64 {
@@ -181,7 +185,7 @@ pub fn label_mapped_frames(
         {
             labelled += u64::from(frames.label(frame, purpose));
         }
-        addr += PAGE_SIZE;
+        addr = addr + PAGE_SIZE;
     }
     labelled
 }
@@ -220,11 +224,12 @@ pub fn paging_self_test(
     const PATTERN: u64 = u64::from_le_bytes(*b"HARLANOS");
     // SAFETY: `test_page` is mapped writable to `frame`, which nothing else
     // uses; a page-aligned address is aligned for `u64`.
-    unsafe { core::ptr::write_volatile(addr as *mut u64, PATTERN) };
+    unsafe { core::ptr::write_volatile(addr.as_ptr::<u64>(), PATTERN) };
     // SAFETY: the same frame through the firmware's identity map (checked
     // by the paging take-over before it wrote anything); a read, after the
     // write above.
-    let seen = unsafe { core::ptr::read_volatile(frame.start_address() as *const u64) };
+    let identity = VirtAddr::new(frame.start_address().as_u64());
+    let seen = unsafe { core::ptr::read_volatile(identity.as_ptr::<u64>()) };
     assert_eq!(
         seen, PATTERN,
         "a write through the new mapping missed its frame"

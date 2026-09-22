@@ -6,6 +6,8 @@
 
 use core::mem::size_of;
 
+use harlan_hal::addr::VirtAddr;
+
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const TSS_SELECTOR: u16 = 0x18;
@@ -147,7 +149,7 @@ struct DescriptorTablePointer {
 /// `top` must be the top of a mapped, writable stack of at least a few
 /// KiB that nothing else uses, and it must stay mapped for as long as the
 /// kernel runs. Must not be called from inside a double-fault handler.
-pub unsafe fn set_double_fault_stack(top: u64) {
+pub unsafe fn set_double_fault_stack(top: VirtAddr) {
     // SAFETY: single-core kernel; this writes one `u64` of the TSS, which
     // the CPU only reads when it takes a double fault, and the caller
     // guarantees it is not one.
@@ -156,7 +158,7 @@ pub unsafe fn set_double_fault_stack(top: u64) {
             .cast::<u8>()
             .add(IST1_OFFSET)
             .cast::<u64>()
-            .write(top);
+            .write(top.as_u64());
     }
 }
 

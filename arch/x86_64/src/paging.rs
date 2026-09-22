@@ -21,21 +21,26 @@
 
 use core::arch::asm;
 
+use harlan_hal::addr::{PhysAddr, VirtAddr};
 use harlan_hal::frame::{FrameAllocator, PhysFrame, PhysRange};
 use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
 
 /// First address of kernel space: PML4 slot 256, the start of the
-/// canonical higher half.
-pub const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
+/// canonical higher half. The bare number is what the walker below does
+/// its arithmetic with; callers outside get the typed address.
+const KERNEL_SPACE_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// First address of kernel space (see `KERNEL_SPACE_BASE`).
+pub const KERNEL_SPACE_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE);
 
 /// Where the kernel heap starts: PML4 slot 257, a slot of its own (see
 /// docs/adr/0006-fase2-kernel-heap.md).
-pub const KERNEL_HEAP_START: u64 = KERNEL_SPACE_START + (1 << 39);
+pub const KERNEL_HEAP_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + (1 << 39));
 
 /// Where the kernel's stacks live: PML4 slot 258, again a slot of its own,
 /// so a stack that runs off its guard page can only ever land on an
 /// unmapped page (see docs/fase2-notes.md, Incremento 10).
-pub const KERNEL_STACKS_START: u64 = KERNEL_SPACE_START + 2 * (1 << 39);
+pub const KERNEL_STACKS_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 2 * (1 << 39));
 
 const ENTRIES: usize = 512;
 const PAGE: u64 = 4096;
@@ -135,7 +140,7 @@ impl<A: TableAccess> PageTables<A> {
             root: old_root,
             access,
         };
-        let kernel_slots = table_indices(KERNEL_SPACE_START)[0]..ENTRIES;
+        let kernel_slots = table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES;
         if kernel_slots
             .into_iter()
             .any(|slot| tables.access.read(old_root, slot) & PRESENT != 0)
@@ -188,7 +193,7 @@ impl<A: TableAccess> PageTables<A> {
         flags: PageFlags,
         frames: &mut dyn FrameAllocator,
     ) -> Result<(), MapError> {
-        if page < KERNEL_SPACE_START {
+        if page < KERNEL_SPACE_BASE {
             return Err(MapError::OutsideKernelSpace);
         }
         let indices = table_indices(page);
@@ -210,7 +215,7 @@ impl<A: TableAccess> PageTables<A> {
         if self.access.read(table, indices[3]) & PRESENT != 0 {
             return Err(MapError::AlreadyMapped);
         }
-        let mut leaf = frame.start_address() | PRESENT;
+        let mut leaf = frame.start_address().as_u64() | PRESENT;
         if flags.writable {
             leaf |= WRITABLE;
         }
@@ -223,7 +228,7 @@ impl<A: TableAccess> PageTables<A> {
     }
 
     fn unmap(&mut self, page: u64) -> Result<PhysFrame, UnmapError> {
-        if page < KERNEL_SPACE_START {
+        if page < KERNEL_SPACE_BASE {
             return Err(UnmapError::OutsideKernelSpace);
         }
         let indices = table_indices(page);
@@ -244,7 +249,9 @@ impl<A: TableAccess> PageTables<A> {
         }
         self.access.write(table, indices[3], 0);
         self.access.flush(page);
-        Ok(PhysFrame::containing_address(leaf & ADDRESS_MASK))
+        Ok(PhysFrame::containing_address(PhysAddr::new(
+            leaf & ADDRESS_MASK,
+        )))
     }
 
     /// Builds an identity map for `0..limit` in fresh frames and installs
@@ -279,9 +286,9 @@ impl<A: TableAccess> PageTables<A> {
                 // The first 2 MiB (the null page has to be left out) and
                 // anything holding code need 4 KiB granularity.
                 let fine_grained = base == 0
-                    || executable
-                        .iter()
-                        .any(|range| range.overlaps(base, base + LARGE_PAGE));
+                    || executable.iter().any(|range| {
+                        range.overlaps(PhysAddr::new(base), PhysAddr::new(base + LARGE_PAGE))
+                    });
                 if !fine_grained {
                     self.access.write(
                         directory,
@@ -299,9 +306,9 @@ impl<A: TableAccess> PageTables<A> {
                     if page == 0 {
                         continue;
                     }
-                    let runs_code = executable
-                        .iter()
-                        .any(|range| range.overlaps(page, page + PAGE));
+                    let runs_code = executable.iter().any(|range| {
+                        range.overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
+                    });
                     executable_pages += u64::from(runs_code);
                     let flags = if runs_code {
                         PRESENT | WRITABLE
@@ -318,7 +325,7 @@ impl<A: TableAccess> PageTables<A> {
         }
 
         self.access.write(self.root, 0, pdpt | PRESENT | WRITABLE);
-        for slot in 1..table_indices(KERNEL_SPACE_START)[0] {
+        for slot in 1..table_indices(KERNEL_SPACE_BASE)[0] {
             self.access.write(self.root, slot, 0);
         }
         self.access.flush_all();
@@ -338,7 +345,8 @@ impl<A: TableAccess> PageTables<A> {
         let frame = frames
             .allocate_frame()
             .ok_or(MapError::OutOfFrames)?
-            .start_address();
+            .start_address()
+            .as_u64();
         match self.translate(frame) {
             Some(t) if t.phys == frame && t.writable => {}
             _ => return Err(MapError::TableFrameNotWritable),
@@ -489,15 +497,18 @@ impl PageMapper for KernelPageTable {
         flags: PageFlags,
         frames: &mut dyn FrameAllocator,
     ) -> Result<(), MapError> {
-        self.tables.map(page.start_address(), frame, flags, frames)
+        self.tables
+            .map(page.start_address().as_u64(), frame, flags, frames)
     }
 
     unsafe fn unmap(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
-        self.tables.unmap(page.start_address())
+        self.tables.unmap(page.start_address().as_u64())
     }
 
-    fn translate(&self, addr: u64) -> Option<u64> {
-        self.tables.translate(addr).map(|t| t.phys)
+    fn translate(&self, addr: VirtAddr) -> Option<PhysAddr> {
+        self.tables
+            .translate(addr.as_u64())
+            .map(|t| PhysAddr::new(t.phys))
     }
 }
 
@@ -587,7 +598,8 @@ mod tests {
 
     impl FrameAllocator for Frames {
         fn allocate_frame(&mut self) -> Option<PhysFrame> {
-            (!self.0.is_empty()).then(|| PhysFrame::from_start_address(self.0.remove(0)).unwrap())
+            (!self.0.is_empty())
+                .then(|| PhysFrame::from_start_address(PhysAddr::new(self.0.remove(0))).unwrap())
         }
     }
 
@@ -626,33 +638,34 @@ mod tests {
     }
 
     fn page(offset: u64) -> u64 {
-        KERNEL_SPACE_START + offset
+        KERNEL_SPACE_BASE + offset
     }
 
     fn frame(addr: u64) -> PhysFrame {
-        PhysFrame::from_start_address(addr).unwrap()
+        PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap()
     }
 
     #[test]
     fn table_indices_split_an_address_in_walk_order() {
-        assert_eq!(table_indices(KERNEL_SPACE_START), [256, 0, 0, 0]);
-        let va = KERNEL_SPACE_START + (1 << 39) + (2 << 30) + (3 << 21) + (4 << 12) + 0x123;
+        assert_eq!(table_indices(KERNEL_SPACE_BASE), [256, 0, 0, 0]);
+        let va = KERNEL_SPACE_BASE + (1 << 39) + (2 << 30) + (3 << 21) + (4 << 12) + 0x123;
         assert_eq!(table_indices(va), [257, 2, 3, 4]);
         assert_eq!(table_indices(0x0000_7FFF_FFFF_F000), [255, 511, 511, 511]);
     }
 
     #[test]
     fn the_heap_and_the_stacks_each_have_a_kernel_space_slot() {
-        assert!(is_canonical(KERNEL_HEAP_START) && is_canonical(KERNEL_STACKS_START));
-        assert_eq!(table_indices(KERNEL_HEAP_START), [257, 0, 0, 0]);
-        assert_eq!(table_indices(KERNEL_STACKS_START), [258, 0, 0, 0]);
+        let (heap, stacks) = (KERNEL_HEAP_START.as_u64(), KERNEL_STACKS_START.as_u64());
+        assert!(is_canonical(heap) && is_canonical(stacks));
+        assert_eq!(table_indices(heap), [257, 0, 0, 0]);
+        assert_eq!(table_indices(stacks), [258, 0, 0, 0]);
     }
 
     #[test]
     fn canonical_addresses_repeat_bit_47() {
         assert!(is_canonical(0x0000_7FFF_FFFF_FFFF));
         assert!(!is_canonical(0x0000_8000_0000_0000));
-        assert!(is_canonical(KERNEL_SPACE_START));
+        assert!(is_canonical(KERNEL_SPACE_BASE));
         assert!(!is_canonical(0xFFFF_7FFF_FFFF_FFFF));
     }
 
@@ -897,7 +910,7 @@ mod tests {
     /// 2 MiB regions those fall in are split into 4 KiB pages.
     #[test]
     fn only_the_ranges_that_hold_code_stay_executable() {
-        let image = PhysRange::new(0x40_0000 + 0x2000, 2 * PAGE);
+        let image = PhysRange::new(PhysAddr::new(0x40_0000 + 0x2000), 2 * PAGE);
         let mut frames = Frames(vec![
             0x80_0000, 0x80_1000, 0x80_2000, 0x80_3000, 0x80_4000, 0x80_5000,
         ]);
@@ -923,9 +936,15 @@ mod tests {
             }
             unreachable!()
         };
-        assert!(executable(image.start) && executable(image.end() - 1));
-        assert!(!executable(image.start - PAGE), "the page below the image");
-        assert!(!executable(image.end()), "the page above the image");
+        assert!(executable(image.start.as_u64()) && executable(image.end().as_u64() - 1));
+        assert!(
+            !executable(image.start.as_u64() - PAGE),
+            "the page below the image"
+        );
+        assert!(
+            !executable(image.end().as_u64()),
+            "the page above the image"
+        );
         assert!(!executable(0x1000), "low memory is data");
         assert!(!executable(0x2000_0000), "a plain 2 MiB page");
     }

@@ -9,6 +9,7 @@ use core::ptr::{self, NonNull};
 
 use free_list::{FreeListHeap, HeapCorruption, HeapStats};
 use harlan_hal::InterruptControl;
+use harlan_hal::addr::VirtAddr;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
 
 use super::frame_allocator::FramePurpose;
@@ -115,7 +116,7 @@ pub fn init<I: InterruptControl>(
         // SAFETY: `[start, start + mapped)` was just mapped writable to
         // fresh frames that nothing else uses, and is never unmapped. A
         // second initialization panics instead of taking effect.
-        unsafe { heap.init(start.start_address() as usize as *mut u8, mapped) };
+        unsafe { heap.init(start.start_address().as_ptr::<u8>(), mapped) };
     }
     mapped
 }
@@ -247,14 +248,14 @@ pub fn soak() -> ! {
 /// Boot-time check of the global heap: ordinary `alloc` types land inside
 /// the heap's range and behave, then `STRESS_CYCLES` of `stress`.
 #[cfg(target_arch = "x86_64")]
-pub fn self_test(heap_start: u64, heap_bytes: usize) {
+pub fn self_test(heap_start: VirtAddr, heap_bytes: usize) {
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::fmt::Write;
 
     let in_heap = |addr: usize| {
-        let addr = addr as u64;
+        let addr = VirtAddr::new(addr as u64);
         addr >= heap_start && addr < heap_start + heap_bytes as u64
     };
     let numbers: Vec<u64> = (1..=1000).collect();

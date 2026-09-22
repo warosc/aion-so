@@ -3,6 +3,7 @@
 //! `hal`'s firmware-agnostic `MemoryMap` — the boundary that keeps
 //! `kernel` free of any dependency on the `uefi` crate.
 
+use harlan_hal::addr::PhysAddr;
 use harlan_hal::memory_map::{MemoryMap, MemoryRegion, classify_memory_type};
 use uefi::mem::memory_map::{MemoryMap as UefiMemoryMapTrait, MemoryMapOwned};
 
@@ -11,7 +12,7 @@ pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
     let mut dropped = 0u32;
     for descriptor in uefi_map.entries() {
         let region = MemoryRegion {
-            start_phys_addr: descriptor.phys_start,
+            start_phys_addr: PhysAddr::new(descriptor.phys_start),
             page_count: descriptor.page_count,
             kind: classify_memory_type(descriptor.ty.0),
         };

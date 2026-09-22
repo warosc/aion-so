@@ -11,6 +11,9 @@
 //! stack, guard page, double-fault stack, guard page. Nothing else is ever
 //! mapped in that part of kernel space.
 
+#[cfg(test)]
+use harlan_hal::addr::PhysAddr;
+use harlan_hal::addr::VirtAddr;
 use harlan_hal::paging::{MapError, PAGE_SIZE, Page, PageFlags, PageMapper};
 
 use super::frame_allocator::FramePurpose;
@@ -25,21 +28,21 @@ pub const DOUBLE_FAULT_STACK_PAGES: u64 = 4;
 /// past it (where the stack pointer starts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stack {
-    bottom: u64,
-    top: u64,
+    bottom: VirtAddr,
+    top: VirtAddr,
 }
 
 impl Stack {
-    pub fn top(self) -> u64 {
+    pub fn top(self) -> VirtAddr {
         self.top
     }
 
-    pub fn bottom(self) -> u64 {
+    pub fn bottom(self) -> VirtAddr {
         self.bottom
     }
 
     pub fn size(self) -> u64 {
-        self.top - self.bottom
+        self.top.saturating_sub(self.bottom)
     }
 }
 
@@ -79,7 +82,7 @@ pub fn map_with_guard(
 pub fn map_kernel_stacks(
     mapper: &mut dyn PageMapper,
     frames: &mut KernelFrames<'_>,
-    base: u64,
+    base: VirtAddr,
 ) -> Result<(Stack, Stack), MapError> {
     let kernel = map_with_guard(
         mapper,
@@ -111,7 +114,7 @@ mod tests {
     /// Records what was mapped where, without touching any page table.
     #[derive(Default)]
     struct FakeMapper {
-        mapped: BTreeMap<u64, (PhysFrame, PageFlags)>,
+        mapped: BTreeMap<VirtAddr, (PhysFrame, PageFlags)>,
     }
 
     impl PageMapper for FakeMapper {
@@ -136,11 +139,11 @@ mod tests {
                 .ok_or(UnmapError::NotMapped)
         }
 
-        fn translate(&self, addr: u64) -> Option<u64> {
+        fn translate(&self, addr: VirtAddr) -> Option<PhysAddr> {
             let page = Page::containing_address(addr);
             self.mapped
                 .get(&page.start_address())
-                .map(|(frame, _)| frame.start_address() + (addr - page.start_address()))
+                .map(|(frame, _)| frame.start_address() + addr.saturating_sub(page.start_address()))
         }
     }
 
@@ -158,7 +161,7 @@ mod tests {
         let first = buffer.as_ptr().addr().next_multiple_of(PAGE_SIZE as usize) as u64;
         let mut map = MemoryMap::new();
         assert!(map.push(MemoryRegion {
-            start_phys_addr: first,
+            start_phys_addr: PhysAddr::new(first),
             page_count: frames,
             kind: MemoryRegionKind::Usable,
         }));
@@ -169,7 +172,7 @@ mod tests {
         }
     }
 
-    const BASE: u64 = 0xFFFF_8100_0000_0000;
+    const BASE: VirtAddr = VirtAddr::new(0xFFFF_8100_0000_0000);
 
     #[test]
     fn stacks_sit_between_unmapped_guard_pages() {
@@ -193,7 +196,8 @@ mod tests {
         }
         // Every byte of both stacks is mapped, writable and not executable.
         for stack in [kernel, double_fault] {
-            for addr in (stack.bottom()..stack.top()).step_by(PAGE_SIZE as usize) {
+            for page in 0..stack.size() / PAGE_SIZE {
+                let addr = stack.bottom() + page * PAGE_SIZE;
                 assert!(mapper.translate(addr).is_some(), "{addr:#x} not mapped");
                 let (_, flags) = mapper.mapped[&addr];
                 assert!(flags.writable && !flags.executable);

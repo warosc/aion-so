@@ -24,9 +24,11 @@ pub enum MemoryRegionKind {
     Reserved,
 }
 
+use crate::addr::PhysAddr;
+
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryRegion {
-    pub start_phys_addr: u64,
+    pub start_phys_addr: PhysAddr,
     pub page_count: u64,
     pub kind: MemoryRegionKind,
 }
@@ -50,7 +52,7 @@ impl MemoryMap {
 
     pub const fn new() -> Self {
         const EMPTY: MemoryRegion = MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 0,
             kind: MemoryRegionKind::Reserved,
         };
@@ -181,7 +183,7 @@ mod tests {
     fn push_reports_capacity_exhaustion_instead_of_panicking() {
         let mut map = MemoryMap::new();
         let region = MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 1,
             kind: MemoryRegionKind::Usable,
         };
@@ -196,17 +198,17 @@ mod tests {
     fn total_usable_pages_sums_only_usable_regions() {
         let mut map = MemoryMap::new();
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 10,
             kind: MemoryRegionKind::Usable,
         }));
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0x1000,
+            start_phys_addr: PhysAddr::new(0x1000),
             page_count: 5,
             kind: MemoryRegionKind::Reserved,
         }));
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0x2000,
+            start_phys_addr: PhysAddr::new(0x2000),
             page_count: 20,
             kind: MemoryRegionKind::Usable,
         }));
@@ -223,7 +225,7 @@ mod tests {
             (0xD000, 3, MemoryRegionKind::BootServices),
         ] {
             assert!(map.push(MemoryRegion {
-                start_phys_addr: start,
+                start_phys_addr: PhysAddr::new(start),
                 page_count: pages,
                 kind,
             }));

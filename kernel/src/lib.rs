@@ -118,7 +118,10 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
     // the address of a local is a physical address on the live stack. This
     // self-test writes no frame, so it can run before that check.
     let stack_probe = 0u8;
-    memory::self_test(&mut frames, core::ptr::addr_of!(stack_probe) as u64);
+    memory::self_test(
+        &mut frames,
+        harlan_hal::addr::VirtAddr::new(core::ptr::addr_of!(stack_probe) as u64),
+    );
 
     #[cfg(target_arch = "x86_64")]
     let mut kernel_stack_top = None;
@@ -240,7 +243,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
         // on the heap, which outlives the stack being left behind.
         unsafe {
             harlan_arch_x86_64::stack::switch_to(
-                top,
+                top.as_u64(),
                 kernel_main_on_stack,
                 (context as *mut KernelContext).cast(),
             )
@@ -262,7 +265,7 @@ struct KernelContext {
     map: &'static MemoryMap,
     kernel_image: Option<PhysRange>,
     /// Where the heap is and how big, to label its frames.
-    heap_range: Option<(u64, u64)>,
+    heap_range: Option<(harlan_hal::addr::VirtAddr, u64)>,
     kernel_stacks: Option<(memory::stacks::Stack, memory::stacks::Stack)>,
     mapper: harlan_arch_x86_64::paging::KernelPageTable,
     console: &'static mut dyn Console,

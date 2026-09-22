@@ -6,6 +6,7 @@
 //! (docs/adr/0008-fase2-write-xor-execute.md). Like the framebuffer, the
 //! answer is captured as plain data before the exit.
 
+use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::PhysRange;
 use uefi::boot;
 use uefi::proto::loaded_image::LoadedImage;
@@ -22,7 +23,7 @@ pub fn query() -> Option<PhysRange> {
         }
     };
     let (base, size) = loaded.info();
-    let range = PhysRange::new(base as usize as u64, size);
+    let range = PhysRange::new(PhysAddr::new(base as usize as u64), size);
     log::info!(
         "HARLAN: kernel image at {:#x}..{:#x} ({} KiB)",
         range.start,

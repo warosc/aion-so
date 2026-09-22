@@ -2,6 +2,7 @@
 //! tables. `arch` implements it (x86_64: `KernelPageTable`); the kernel
 //! consumes it without knowing the page-table format.
 
+use crate::addr::{PhysAddr, VirtAddr};
 use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
 
 pub const PAGE_SIZE: u64 = FRAME_SIZE;
@@ -9,13 +10,13 @@ pub const PAGE_SIZE: u64 = FRAME_SIZE;
 /// A `PAGE_SIZE`-aligned virtual page, named by its start address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Page {
-    start: u64,
+    start: VirtAddr,
 }
 
 impl Page {
     /// `None` if `addr` is not `PAGE_SIZE`-aligned.
-    pub const fn from_start_address(addr: u64) -> Option<Self> {
-        if addr.is_multiple_of(PAGE_SIZE) {
+    pub const fn from_start_address(addr: VirtAddr) -> Option<Self> {
+        if addr.is_aligned_to(PAGE_SIZE) {
             Some(Self { start: addr })
         } else {
             None
@@ -23,13 +24,13 @@ impl Page {
     }
 
     /// The page that contains `addr` (rounds down).
-    pub const fn containing_address(addr: u64) -> Self {
+    pub const fn containing_address(addr: VirtAddr) -> Self {
         Self {
-            start: addr - addr % PAGE_SIZE,
+            start: addr.align_down(PAGE_SIZE),
         }
     }
 
-    pub const fn start_address(self) -> u64 {
+    pub const fn start_address(self) -> VirtAddr {
         self.start
     }
 }
@@ -93,28 +94,35 @@ pub trait PageMapper {
     unsafe fn unmap(&mut self, page: Page) -> Result<PhysFrame, UnmapError>;
 
     /// The physical address `addr` translates to, if it is mapped.
-    fn translate(&self, addr: u64) -> Option<u64>;
+    fn translate(&self, addr: VirtAddr) -> Option<PhysAddr>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn virt(addr: u64) -> VirtAddr {
+        VirtAddr::new(addr)
+    }
+
     #[test]
     fn from_start_address_accepts_only_aligned_addresses() {
         assert_eq!(
-            Page::from_start_address(0xFFFF_8000_0000_0000).map(Page::start_address),
-            Some(0xFFFF_8000_0000_0000)
+            Page::from_start_address(virt(0xFFFF_8000_0000_0000)).map(Page::start_address),
+            Some(virt(0xFFFF_8000_0000_0000))
         );
-        assert_eq!(Page::from_start_address(0xFFFF_8000_0000_0008), None);
+        assert_eq!(Page::from_start_address(virt(0xFFFF_8000_0000_0008)), None);
     }
 
     #[test]
     fn containing_address_rounds_down_to_the_page_start() {
-        assert_eq!(Page::containing_address(0x7FFF).start_address(), 0x7000);
         assert_eq!(
-            Page::containing_address(u64::MAX).start_address(),
-            u64::MAX - 0xFFF
+            Page::containing_address(virt(0x7FFF)).start_address(),
+            virt(0x7000)
+        );
+        assert_eq!(
+            Page::containing_address(virt(u64::MAX)).start_address(),
+            virt(u64::MAX - 0xFFF)
         );
     }
 }

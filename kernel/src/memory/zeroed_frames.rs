@@ -9,6 +9,9 @@
 //! The frame allocator itself stays pure — it only flips bits in a bitmap —
 //! so all the memory access of this path lives here.
 
+#[cfg(test)]
+use harlan_hal::addr::PhysAddr;
+use harlan_hal::addr::VirtAddr;
 use harlan_hal::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
 
 use super::frame_allocator::{BitmapFrameAllocator, DeallocError, FramePurpose};
@@ -47,11 +50,13 @@ impl PhysWindow {
 
     /// Pointer to the first byte of `frame`.
     pub fn frame_ptr(self, frame: PhysFrame) -> *mut u8 {
+        // The one place the kernel crosses from a physical address to
+        // the virtual one it can write through.
         let addr = self
             .base
-            .checked_add(frame.start_address())
+            .checked_add(frame.start_address().as_u64())
             .expect("physical window does not reach this frame");
-        addr as usize as *mut u8
+        VirtAddr::new(addr).as_ptr::<u8>()
     }
 
     /// Overwrites `frame` with zeros.
@@ -210,7 +215,9 @@ mod tests {
             let buffer = vec![0xAAu8; (count + 1) * FRAME_SIZE as usize];
             let first = buffer.as_ptr().addr().next_multiple_of(FRAME_SIZE as usize) as u64;
             let frames = (0..count)
-                .map(|i| PhysFrame::containing_address(first + i as u64 * FRAME_SIZE))
+                .map(|i| {
+                    PhysFrame::containing_address(PhysAddr::new(first + i as u64 * FRAME_SIZE))
+                })
                 .collect();
             Self {
                 _buffer: buffer,
@@ -223,7 +230,7 @@ mod tests {
             // SAFETY: `frame` is one of this test's own pages.
             unsafe {
                 core::slice::from_raw_parts(
-                    frame.start_address() as usize as *const u8,
+                    VirtAddr::new(frame.start_address().as_u64()).as_ptr::<u8>(),
                     FRAME_SIZE as usize,
                 )
             }
@@ -271,7 +278,7 @@ mod tests {
     fn the_window_places_a_frame_at_base_plus_its_address() {
         // SAFETY: never dereferenced in this test.
         let window = unsafe { PhysWindow::new(0xFFFF_8100_0000_0000) };
-        let frame = PhysFrame::containing_address(0x2000);
+        let frame = PhysFrame::containing_address(PhysAddr::new(0x2000));
         assert_eq!(window.frame_ptr(frame).addr() as u64, 0xFFFF_8100_0000_2000);
     }
 
@@ -280,6 +287,6 @@ mod tests {
     fn a_window_that_cannot_reach_a_frame_panics() {
         // SAFETY: never dereferenced in this test.
         let window = unsafe { PhysWindow::new(u64::MAX - 0xFFF) };
-        let _ = window.frame_ptr(PhysFrame::containing_address(0x2000));
+        let _ = window.frame_ptr(PhysFrame::containing_address(PhysAddr::new(0x2000)));
     }
 }

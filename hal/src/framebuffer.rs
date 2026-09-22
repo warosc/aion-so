@@ -7,11 +7,13 @@
 /// used so far are white and black, whose 32-bit value is identical in
 /// either byte order, so a format field would be dead weight. It must be
 /// added the day anything draws a color that isn't byte-order symmetric.
+use crate::addr::PhysAddr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramebufferInfo {
     /// Address of the first pixel. Physical and virtual coincide (the
     /// firmware's identity mapping is still what's live).
-    pub base_addr: u64,
+    pub base_addr: PhysAddr,
     /// Visible width, in pixels.
     pub width: u32,
     pub height: u32,

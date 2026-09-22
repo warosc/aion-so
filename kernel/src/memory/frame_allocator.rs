@@ -25,6 +25,7 @@
 //! No `unsafe`: this only flips bits in a slice. Nothing here reads or
 //! writes the frames themselves.
 
+use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind};
 
@@ -192,7 +193,7 @@ impl<'a> BitmapFrameAllocator<'a> {
             "the purpose table must cover every frame the bitmap does"
         );
         for number in 0..covered as u64 {
-            let frame = PhysFrame::containing_address(number * FRAME_SIZE);
+            let frame = PhysFrame::containing_address(PhysAddr::new(number * FRAME_SIZE));
             let held = self.manages(frame) && self.bit(number);
             table[number as usize] = if held { FramePurpose::Boot as u8 } else { 0 };
         }
@@ -283,7 +284,7 @@ impl<'a> BitmapFrameAllocator<'a> {
         {
             let (first, end) = inward_frames(region);
             for number in first..end.min(covered) {
-                let frame = PhysFrame::containing_address(number * FRAME_SIZE);
+                let frame = PhysFrame::containing_address(PhysAddr::new(number * FRAME_SIZE));
                 if self.manages(frame) && self.bit(number) {
                     self.set_bit(number, false);
                     added += 1;
@@ -317,7 +318,9 @@ impl<'a> BitmapFrameAllocator<'a> {
                 self.free -= 1;
                 self.next_word = index;
                 let frame = index as u64 * BITS_PER_WORD + bit;
-                return Some(PhysFrame::containing_address(frame * FRAME_SIZE));
+                return Some(PhysFrame::containing_address(PhysAddr::new(
+                    frame * FRAME_SIZE,
+                )));
             }
         }
         // `free > 0` guarantees a clear bit; only a bug gets here, and
@@ -407,13 +410,14 @@ impl FrameAllocator for BitmapFrameAllocator<'_> {
 fn region_end(region: &MemoryRegion) -> u64 {
     region
         .start_phys_addr
+        .as_u64()
         .saturating_add(region.page_count.saturating_mul(FRAME_SIZE))
 }
 
 /// `[first, end)` frame numbers lying wholly inside `region`.
 fn inward_frames(region: &MemoryRegion) -> (u64, u64) {
     (
-        region.start_phys_addr.div_ceil(FRAME_SIZE),
+        region.start_phys_addr.as_u64().div_ceil(FRAME_SIZE),
         region_end(region) / FRAME_SIZE,
     )
 }
@@ -421,7 +425,7 @@ fn inward_frames(region: &MemoryRegion) -> (u64, u64) {
 /// `[first, end)` frame numbers `region` touches at all.
 fn outward_frames(region: &MemoryRegion) -> (u64, u64) {
     (
-        region.start_phys_addr / FRAME_SIZE,
+        region.start_phys_addr.as_u64() / FRAME_SIZE,
         region_end(region).div_ceil(FRAME_SIZE),
     )
 }
@@ -436,7 +440,7 @@ mod tests {
         let mut map = MemoryMap::new();
         for &(start_phys_addr, page_count, kind) in regions {
             assert!(map.push(MemoryRegion {
-                start_phys_addr,
+                start_phys_addr: PhysAddr::new(start_phys_addr),
                 page_count,
                 kind,
             }));
@@ -445,12 +449,12 @@ mod tests {
     }
 
     fn frame(addr: u64) -> PhysFrame {
-        PhysFrame::from_start_address(addr).unwrap()
+        PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap()
     }
 
     fn drain(allocator: &mut BitmapFrameAllocator<'_>) -> Vec<u64> {
         core::iter::from_fn(|| allocator.allocate())
-            .map(PhysFrame::start_address)
+            .map(|frame| frame.start_address().as_u64())
             .collect()
     }
 
@@ -582,7 +586,7 @@ mod tests {
         let free_before = allocator.free_frames();
         for addr in [0x0, 0x10000, 0x20000, 0x30000, 64 * FRAME_SIZE] {
             assert_eq!(
-                allocator.deallocate(PhysFrame::containing_address(addr)),
+                allocator.deallocate(PhysFrame::containing_address(PhysAddr::new(addr))),
                 Err(DeallocError::NotManaged),
                 "{addr:#x}"
             );
@@ -618,7 +622,7 @@ mod tests {
         let mut storage = [0; 1];
         let mut allocator = BitmapFrameAllocator::new(&mut storage, &map);
         assert_eq!(drain(&mut allocator), [0x1000]);
-        assert!(!allocator.manages(PhysFrame::containing_address(u64::MAX)));
+        assert!(!allocator.manages(PhysFrame::containing_address(PhysAddr::new(u64::MAX))));
     }
 
     #[test]
@@ -635,7 +639,7 @@ mod tests {
         let allocator = BitmapFrameAllocator::new(&mut storage, &map);
         let mut managed = 0;
         for number in 0..allocator.covered_frames() {
-            let frame = PhysFrame::containing_address(number * FRAME_SIZE);
+            let frame = PhysFrame::containing_address(PhysAddr::new(number * FRAME_SIZE));
             assert_eq!(
                 !allocator.bit(number),
                 allocator.manages(frame),
@@ -664,7 +668,7 @@ mod tests {
         let allocator = BitmapFrameAllocator::new(&mut storage, &map);
         // Frame 0 withheld; boot-services memory withheld.
         assert_eq!(allocator.free_frames(), 134 + 24 + 1792 + 3);
-        assert!(!allocator.manages(PhysFrame::containing_address(0xfe86f70)));
+        assert!(!allocator.manages(PhysFrame::containing_address(PhysAddr::new(0xfe86f70))));
         assert!(!allocator.manages(frame(0x87000)));
     }
 
@@ -688,7 +692,7 @@ mod tests {
         let handed_out = drain(&mut moved);
         for frame in taken {
             assert!(
-                !handed_out.contains(&frame.start_address()),
+                !handed_out.contains(&frame.start_address().as_u64()),
                 "{frame:?} was handed out twice"
             );
             assert_eq!(moved.deallocate(frame), Ok(()));
@@ -714,7 +718,7 @@ mod tests {
 
         // The frame handed out before is still handed out.
         let handed_out = drain(&mut allocator);
-        assert!(!handed_out.contains(&taken.start_address()));
+        assert!(!handed_out.contains(&taken.start_address().as_u64()));
         assert_eq!(handed_out.len(), 3 + 4 + 3);
     }
 
