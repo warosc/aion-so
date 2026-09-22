@@ -19,6 +19,10 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// of the freestanding boot chain. Override with `--marker` to check the
 /// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
 const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
+/// Guest RAM the frame allocator's fixed bitmap is sized for (see
+/// kernel::memory::FRAME_BITMAP_WORDS). More RAM boots too; the frames
+/// above the covered range are ignored and logged.
+const DEFAULT_MEMORY: &str = "256M";
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "HARLAN OS build/run/test automation")]
@@ -58,6 +62,9 @@ enum XtaskCommand {
         /// long heap stress workload instead of the quick one.
         #[arg(long)]
         heap_stress: bool,
+        /// Guest RAM, in QEMU's own syntax.
+        #[arg(long, default_value = DEFAULT_MEMORY)]
+        memory: String,
     },
     /// Boot a soak build (endless heap stress rounds instead of the shell)
     /// and let it run for the whole duration. Fails on an early exit, a CPU
@@ -70,6 +77,9 @@ enum XtaskCommand {
         min_ticks: u64,
         #[arg(long, default_value_t = 50_000)]
         min_heap_cycles: u64,
+        /// Guest RAM, in QEMU's own syntax.
+        #[arg(long, default_value = DEFAULT_MEMORY)]
+        memory: String,
     },
 }
 
@@ -88,22 +98,26 @@ fn main() -> Result<()> {
             marker,
             repeat,
             heap_stress,
+            memory,
         } => boot_test(
             &root,
             Duration::from_secs(timeout_secs),
             &marker,
             repeat,
             heap_stress,
+            &memory,
         ),
         XtaskCommand::SoakTest {
             duration_secs,
             min_ticks,
             min_heap_cycles,
+            memory,
         } => soak_test(
             &root,
             Duration::from_secs(duration_secs),
             min_ticks,
             min_heap_cycles,
+            &memory,
         ),
     }
 }
@@ -289,6 +303,7 @@ struct QemuConfig {
     ovmf_code: PathBuf,
     ovmf_vars: PathBuf,
     esp_dir: PathBuf,
+    memory: String,
     headless: bool,
     debug_stub: bool,
     debugcon_log: Option<PathBuf>,
@@ -305,7 +320,7 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
         "-cpu".to_string(),
         "qemu64".to_string(),
         "-m".to_string(),
-        "256M".to_string(),
+        cfg.memory.clone(),
         "-accel".to_string(),
         "tcg".to_string(),
         // No network device at all: enforces "no red para arrancar" (ARCHITECTURE.md)
@@ -363,13 +378,19 @@ fn qemu_binary() -> &'static str {
     "qemu-system-x86_64"
 }
 
-fn prepare_qemu_config(root: &Path, headless: bool, debug_stub: bool) -> Result<QemuConfig> {
+fn prepare_qemu_config(
+    root: &Path,
+    headless: bool,
+    debug_stub: bool,
+    memory: &str,
+) -> Result<QemuConfig> {
     let (ovmf_code, ovmf_vars_template) = fetch_ovmf(root)?;
     let ovmf_vars = prepare_vars_copy(root, &ovmf_vars_template)?;
     Ok(QemuConfig {
         ovmf_code,
         ovmf_vars,
         esp_dir: root.join("target").join("esp"),
+        memory: memory.to_string(),
         headless,
         debug_stub,
         debugcon_log: None,
@@ -379,7 +400,7 @@ fn prepare_qemu_config(root: &Path, headless: bool, debug_stub: bool) -> Result<
 
 fn run(root: &Path) -> Result<()> {
     build(root, &[])?;
-    let cfg = prepare_qemu_config(root, false, false)?;
+    let cfg = prepare_qemu_config(root, false, false, DEFAULT_MEMORY)?;
     let args = build_qemu_args(&cfg);
     let status = Command::new(qemu_binary())
         .args(&args)
@@ -393,7 +414,7 @@ fn run(root: &Path) -> Result<()> {
 
 fn debug(root: &Path) -> Result<()> {
     build(root, &[])?;
-    let cfg = prepare_qemu_config(root, false, true)?;
+    let cfg = prepare_qemu_config(root, false, true, DEFAULT_MEMORY)?;
     let args = build_qemu_args(&cfg);
     println!("QEMU paused at reset; gdbstub listening on tcp::1234 (see .vscode/launch.json)");
     let status = Command::new(qemu_binary())
@@ -412,18 +433,19 @@ fn boot_test(
     marker: &str,
     repeat: u32,
     heap_stress: bool,
+    memory: &str,
 ) -> Result<()> {
     build(root, if heap_stress { &["heap-stress"] } else { &[] })?;
     for attempt in 1..=repeat {
-        boot_test_once(root, timeout, marker)
+        boot_test_once(root, timeout, marker, memory)
             .with_context(|| format!("boot-test attempt {attempt}/{repeat} failed"))?;
     }
     println!("boot-test: {repeat}/{repeat} consecutive successful boots (marker {marker:?})");
     Ok(())
 }
 
-fn boot_test_once(root: &Path, timeout: Duration, marker: &str) -> Result<()> {
-    let mut cfg = prepare_qemu_config(root, true, false)?;
+fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) -> Result<()> {
+    let mut cfg = prepare_qemu_config(root, true, false, memory)?;
     let log_path = root.join("target").join("boot-test.log");
     let stderr_path = root.join("target").join("boot-test-qemu-stderr.log");
     if log_path.exists() {
@@ -494,9 +516,15 @@ const SOAK_ONCE_MARKERS: [&str; 3] = [
 /// Written by the kernel's panic handler and exception handlers.
 const SOAK_TROUBLE: [&str; 4] = ["PANIC", "HARLAN: #", "unhandled exception", "NMI received"];
 
-fn soak_test(root: &Path, duration: Duration, min_ticks: u64, min_heap_cycles: u64) -> Result<()> {
+fn soak_test(
+    root: &Path,
+    duration: Duration,
+    min_ticks: u64,
+    min_heap_cycles: u64,
+    memory: &str,
+) -> Result<()> {
     build(root, &["soak"])?;
-    let mut cfg = prepare_qemu_config(root, true, false)?;
+    let mut cfg = prepare_qemu_config(root, true, false, memory)?;
     let target = root.join("target");
     let log_path = target.join("soak-test.log");
     let qemu_log_path = target.join("soak-test-qemu.log");
@@ -677,6 +705,7 @@ mod tests {
             ovmf_code: PathBuf::from("target/ovmf/x64/code.fd"),
             ovmf_vars: PathBuf::from("target/ovmf-vars.fd"),
             esp_dir: PathBuf::from("target/esp"),
+            memory: "256M".to_string(),
             headless: false,
             debug_stub: false,
             debugcon_log: None,
@@ -730,6 +759,18 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn qemu_args_carry_the_requested_memory_size() {
+        let mut cfg = sample_config();
+        assert!(
+            build_qemu_args(&cfg)
+                .windows(2)
+                .any(|w| w == ["-m", "256M"])
+        );
+        cfg.memory = "1G".to_string();
+        assert!(build_qemu_args(&cfg).windows(2).any(|w| w == ["-m", "1G"]));
     }
 
     #[test]
