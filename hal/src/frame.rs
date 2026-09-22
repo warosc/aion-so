@@ -7,6 +7,35 @@
 /// counts frames directly.
 pub const FRAME_SIZE: u64 = 4096;
 
+/// A range of physical addresses, as plain data: where the kernel image
+/// was loaded, what a firmware region covers, and so on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+impl PhysRange {
+    pub const fn new(start: u64, len: u64) -> Self {
+        Self { start, len }
+    }
+
+    /// First address past the range, saturating (the range may come from
+    /// firmware).
+    pub const fn end(self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+
+    pub const fn contains(self, addr: u64) -> bool {
+        self.start <= addr && addr < self.end()
+    }
+
+    /// Whether any part of `[start, end)` is inside this range.
+    pub const fn overlaps(self, start: u64, end: u64) -> bool {
+        start < self.end() && self.start < end
+    }
+}
+
 /// Source of free physical frames. The kernel's frame allocator implements
 /// it; architecture code that builds page tables consumes it, since `arch`
 /// cannot depend on the `kernel` crate.
@@ -54,6 +83,23 @@ impl PhysFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_knows_what_it_covers() {
+        let range = PhysRange::new(0x2000, 0x1000);
+        assert_eq!(range.end(), 0x3000);
+        assert!(range.contains(0x2000) && range.contains(0x2FFF));
+        assert!(!range.contains(0x1FFF) && !range.contains(0x3000));
+        assert!(range.overlaps(0x1000, 0x2001) && range.overlaps(0x2FFF, 0x9000));
+        assert!(!range.overlaps(0x0, 0x2000) && !range.overlaps(0x3000, 0x9000));
+    }
+
+    #[test]
+    fn a_range_that_would_wrap_around_saturates() {
+        let range = PhysRange::new(u64::MAX - 0xF, u64::MAX);
+        assert_eq!(range.end(), u64::MAX);
+        assert!(range.contains(u64::MAX - 1));
+    }
 
     #[test]
     fn from_start_address_accepts_only_aligned_addresses() {

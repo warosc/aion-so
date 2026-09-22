@@ -16,6 +16,11 @@ pub enum MemoryRegionKind {
     /// Incremento 5). Kept apart from `Usable` so it is not handed out
     /// before the kernel owns its own stack and page tables.
     BootServices,
+    /// Firmware code that keeps running after `ExitBootServices` (the UEFI
+    /// runtime services). Never allocatable, and the only firmware memory
+    /// the kernel still executes, so its pages must stay executable when
+    /// the kernel builds its own page tables.
+    RuntimeCode,
     Reserved,
 }
 
@@ -105,6 +110,7 @@ impl Default for MemoryMap {
 mod raw_memory_type {
     pub const BOOT_SERVICES_CODE: u32 = 3;
     pub const BOOT_SERVICES_DATA: u32 = 4;
+    pub const RUNTIME_SERVICES_CODE: u32 = 5;
     pub const CONVENTIONAL: u32 = 7;
 }
 
@@ -119,6 +125,7 @@ pub fn classify_memory_type(raw_ordinal: u32) -> MemoryRegionKind {
     match raw_ordinal {
         CONVENTIONAL => MemoryRegionKind::Usable,
         BOOT_SERVICES_CODE | BOOT_SERVICES_DATA => MemoryRegionKind::BootServices,
+        RUNTIME_SERVICES_CODE => MemoryRegionKind::RuntimeCode,
         _ => MemoryRegionKind::Reserved,
     }
 }
@@ -145,6 +152,16 @@ mod tests {
             classify_memory_type(raw_memory_type::BOOT_SERVICES_DATA),
             MemoryRegionKind::BootServices
         );
+    }
+
+    #[test]
+    fn runtime_services_code_is_its_own_kind() {
+        assert_eq!(
+            classify_memory_type(raw_memory_type::RUNTIME_SERVICES_CODE),
+            MemoryRegionKind::RuntimeCode
+        );
+        // Runtime services *data* is not executed: plain reserved memory.
+        assert_eq!(classify_memory_type(6), MemoryRegionKind::Reserved);
     }
 
     #[test]
