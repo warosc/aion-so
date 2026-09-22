@@ -1,13 +1,14 @@
 #![cfg_attr(not(test), no_std)]
 
+pub mod identity;
 mod shell;
 
-use aion_hal::memory_map::MemoryMap;
-use aion_hal::{Console, PowerControl};
+use harlan_hal::memory_map::MemoryMap;
+use harlan_hal::{Console, PowerControl};
 
 /// Grepped by `cargo xtask boot-test` in the QEMU debugcon capture.
 /// Keep in sync with tools/xtask's default `--marker` value.
-pub const BOOT_OK_MARKER: &str = "AION-PHASE0-BOOT-OK";
+pub const BOOT_OK_MARKER: &str = "HARLAN-PHASE0-BOOT-OK";
 
 #[cfg(target_arch = "x86_64")]
 pub const ARCH_NAME: &str = "x86_64";
@@ -28,23 +29,23 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     // any other arch-specific state is touched.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        aion_arch_x86_64::interrupts::init();
+        harlan_arch_x86_64::interrupts::init();
     }
     // SAFETY: called exactly once, immediately after `init()` above (GDT/
     // IDT already installed) and before anything else runs.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        aion_arch_x86_64::interrupts::init_timer();
+        harlan_arch_x86_64::interrupts::init_timer();
     }
     // SAFETY: called exactly once, right after `init_timer()` (the PIC is
     // remapped) and with interrupts still disabled — nothing above
     // enabled them.
     #[cfg(target_arch = "x86_64")]
     {
-        if let Err(err) = unsafe { aion_arch_x86_64::interrupts::init_keyboard() } {
+        if let Err(err) = unsafe { harlan_arch_x86_64::interrupts::init_keyboard() } {
             // Not fatal: the kernel is still useful (and debuggable via
             // debugcon) without input, and must never hang on a device.
-            log::error!("AION: PS/2 keyboard unavailable: {err:?}");
+            log::error!("HARLAN: PS/2 keyboard unavailable: {err:?}");
         }
     }
     // Every device is configured; this is the one place interrupts come
@@ -52,20 +53,25 @@ pub fn kmain(boot_info: &BootInfo, console: &mut dyn Console, power: &dyn PowerC
     // half-initialized device.
     #[cfg(target_arch = "x86_64")]
     {
-        use aion_hal::InterruptControl;
-        aion_arch_x86_64::Cpu.enable();
+        use harlan_hal::InterruptControl;
+        harlan_arch_x86_64::Cpu.enable();
     }
 
     log::info!("{BOOT_OK_MARKER}");
-    log::info!("AION: architecture = {ARCH_NAME}");
-    log::info!("AION: GDT/IDT installed, breakpoint self-test OK");
+    log::info!("HARLAN: architecture = {ARCH_NAME}");
+    log::info!("HARLAN: GDT/IDT installed, breakpoint self-test OK");
     log::info!(
-        "AION: memory map = {} region(s), {} usable pages",
+        "HARLAN: memory map = {} region(s), {} usable pages",
         boot_info.memory_map.len(),
         boot_info.memory_map.total_usable_pages()
     );
 
-    console.write_str(concat!("AION OS v", env!("CARGO_PKG_VERSION"), "\n"));
+    console.write_str(identity::PRODUCT_NAME);
+    console.write_str(" ");
+    console.write_str(identity::VERSION);
+    console.write_str("\n");
+    console.write_str(identity::TAGLINE);
+    console.write_str("\n\n");
     console.write_str("Boot............ UEFI OK\n");
     console.write_str("Architecture.... ");
     console.write_str(ARCH_NAME);

@@ -2,34 +2,34 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "AION: Build",
+      "label": "Harlan: Build",
       "type": "shell",
       "command": "cargo xtask build",
       "group": { "kind": "build", "isDefault": true },
       "problemMatcher": ["$rustc"]
     },
     {
-      "label": "AION: Run QEMU",
+      "label": "Harlan: Run QEMU",
       "type": "shell",
       "command": "cargo xtask run",
-      "dependsOn": ["AION: Build"],
+      "dependsOn": ["Harlan: Build"],
       "problemMatcher": []
     },
     {
-      "label": "AION: Test",
+      "label": "Harlan: Test",
       "type": "shell",
       "command": "cargo xtask test",
       "group": { "kind": "test", "isDefault": true },
       "problemMatcher": ["$rustc"]
     },
     {
-      "label": "AION: Format + Lint",
+      "label": "Harlan: Format + Lint",
       "type": "shell",
       "command": "cargo xtask fmt-lint",
       "problemMatcher": ["$rustc"]
     },
     {
-      "label": "AION: Debug QEMU",
+      "label": "Harlan: Debug QEMU",
       "type": "shell",
       "command": "cargo xtask debug",
       "isBackground": true,

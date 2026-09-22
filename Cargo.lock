@@ -3,47 +3,6 @@
 version = 4
 
 [[package]]
-name = "aion-arch-x86_64"
-version = "0.0.1"
-dependencies = [
- "aion-hal",
- "log",
-]
-
-[[package]]
-name = "aion-boot"
-version = "0.0.1"
-dependencies = [
- "aion-arch-x86_64",
- "aion-fbcon",
- "aion-hal",
- "aion-kernel",
- "log",
- "uefi",
-]
-
-[[package]]
-name = "aion-fbcon"
-version = "0.0.1"
-dependencies = [
- "aion-hal",
- "font8x8",
-]
-
-[[package]]
-name = "aion-hal"
-version = "0.0.1"
-
-[[package]]
-name = "aion-kernel"
-version = "0.0.1"
-dependencies = [
- "aion-arch-x86_64",
- "aion-hal",
- "log",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -297,6 +256,47 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "harlan-arch-x86_64"
+version = "0.0.1"
+dependencies = [
+ "harlan-hal",
+ "log",
+]
+
+[[package]]
+name = "harlan-boot"
+version = "0.0.1"
+dependencies = [
+ "harlan-arch-x86_64",
+ "harlan-fbcon",
+ "harlan-hal",
+ "harlan-kernel",
+ "log",
+ "uefi",
+]
+
+[[package]]
+name = "harlan-fbcon"
+version = "0.0.1"
+dependencies = [
+ "font8x8",
+ "harlan-hal",
+]
+
+[[package]]
+name = "harlan-hal"
+version = "0.0.1"
+
+[[package]]
+name = "harlan-kernel"
+version = "0.0.1"
+dependencies = [
+ "harlan-arch-x86_64",
+ "harlan-hal",
+ "log",
 ]
 
 [[package]]

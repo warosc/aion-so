@@ -8,7 +8,7 @@ pub mod pic;
 pub mod pit;
 pub mod port;
 
-use aion_hal::{CpuControl, InterruptControl, TickCounter};
+use harlan_hal::{CpuControl, InterruptControl, TickCounter};
 
 pub struct Cpu;
 

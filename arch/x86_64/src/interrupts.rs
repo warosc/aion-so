@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
-use aion_hal::{CpuControl, InterruptControl};
+use harlan_hal::{CpuControl, InterruptControl};
 
 /// Written only by the timer ISR (`VECTOR_TIMER` below); read by
 /// `ticks()`, `hal::TickCounter`'s sole consumer today.
@@ -240,7 +240,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
     let frame = unsafe { &*frame };
     match frame.vector as u8 {
         VECTOR_DIVIDE_ERROR => {
-            log::error!("AION: #DE divide error at rip={:#x}", frame.rip);
+            log::error!("HARLAN: #DE divide error at rip={:#x}", frame.rip);
             halt();
         }
         VECTOR_NMI => {
@@ -248,10 +248,10 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             // principle arrive even during Incremento 1's cli-before-lidt
             // window. Nothing in this codebase intentionally raises one;
             // logging and returning is the safe default.
-            log::warn!("AION: NMI received (non-fatal)");
+            log::warn!("HARLAN: NMI received (non-fatal)");
         }
         VECTOR_BREAKPOINT => {
-            log::info!("AION: breakpoint handler OK");
+            log::info!("HARLAN: breakpoint handler OK");
         }
         VECTOR_TIMER => {
             let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -263,7 +263,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
                 crate::pic::send_eoi();
             }
             if count.is_multiple_of(100) {
-                log::info!("AION: ticks={count}");
+                log::info!("HARLAN: ticks={count}");
             }
         }
         VECTOR_KEYBOARD => {
@@ -278,7 +278,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
         }
         VECTOR_GENERAL_PROTECTION => {
             log::error!(
-                "AION: #GP error_code={:#x} at rip={:#x}",
+                "HARLAN: #GP error_code={:#x} at rip={:#x}",
                 frame.error_code,
                 frame.rip
             );
@@ -287,7 +287,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
         VECTOR_PAGE_FAULT => {
             let faulting_address = read_cr2();
             log::error!(
-                "AION: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
+                "HARLAN: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
                 faulting_address,
                 frame.error_code,
                 frame.rip
@@ -296,7 +296,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
         }
         other => {
             log::error!(
-                "AION: unhandled exception vector={other} at rip={:#x}",
+                "HARLAN: unhandled exception vector={other} at rip={:#x}",
                 frame.rip
             );
             halt();
@@ -346,7 +346,7 @@ unsafe extern "C" fn double_fault_stub() -> ! {
 }
 
 extern "C" fn double_fault_handler() {
-    log::error!("AION: #DF DOUBLE FAULT - halting");
+    log::error!("HARLAN: #DF DOUBLE FAULT - halting");
 }
 
 /// # Safety

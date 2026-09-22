@@ -1,15 +1,15 @@
 //! Hardware `Console` backend, valid after `ExitBootServices`: output is
-//! drawn straight onto the GOP framebuffer (`aion-fbcon`), input comes from
+//! drawn straight onto the GOP framebuffer (`harlan-fbcon`), input comes from
 //! the PS/2 keyboard's IRQ-fed queue. Replaces `UefiConsole` (Fase 1) and
 //! the invisible VGA-text placeholder (Incremento 2).
 //!
-//! x86_64-only for now, by way of the direct `aion_arch_x86_64` import: an
+//! x86_64-only for now, by way of the direct `harlan_arch_x86_64` import: an
 //! honest compile error on another architecture rather than a quiet stub.
 
-use aion_arch_x86_64::keyboard::Keyboard;
-use aion_fbcon::{FramebufferSurface, TextConsole};
-use aion_hal::framebuffer::FramebufferInfo;
-use aion_hal::{Console, ConsoleKey};
+use harlan_arch_x86_64::keyboard::Keyboard;
+use harlan_fbcon::{FramebufferSurface, TextConsole};
+use harlan_hal::framebuffer::FramebufferInfo;
+use harlan_hal::{Console, ConsoleKey};
 
 pub struct HardwareConsole {
     /// `None` when the firmware gave us no usable framebuffer (or one whose
@@ -33,7 +33,7 @@ impl HardwareConsole {
             let surface = unsafe { FramebufferSurface::new(&info) };
             if surface.is_none() {
                 log::warn!(
-                    "AION: framebuffer description is inconsistent; running without a display"
+                    "HARLAN: framebuffer description is inconsistent; running without a display"
                 );
             }
             surface.map(TextConsole::new)
