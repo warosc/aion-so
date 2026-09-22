@@ -553,17 +553,27 @@ fn soak_test(
     // up makes any later one stand out without hard-coding that number.
     let mut resets_at_boot = None;
     let mut early_exit = None;
+    let mut last_ticks = None;
+    let mut last_heap_cycles = None;
+    let mut ticks_changed_at = start;
+    let mut heap_changed_at = start;
     while start.elapsed() < duration {
         if let Some(status) = child.try_wait().context("failed to poll qemu")? {
             early_exit = Some((status, start.elapsed()));
             break;
         }
-        if resets_at_boot.is_none()
-            && fs::read_to_string(&log_path).is_ok_and(|log| log.contains(SOAK_MARKER))
-        {
-            resets_at_boot = Some(count_resets(
-                &fs::read_to_string(&qemu_log_path).unwrap_or_default(),
-            ));
+        if let Ok(log) = fs::read_to_string(&log_path) {
+            if resets_at_boot.is_none() && log.contains(SOAK_MARKER) {
+                resets_at_boot = Some(count_resets(
+                    &fs::read_to_string(&qemu_log_path).unwrap_or_default(),
+                ));
+            }
+            refresh_progress(latest_ticks(&log), &mut last_ticks, &mut ticks_changed_at);
+            refresh_progress(
+                latest_heap_cycles(&log),
+                &mut last_heap_cycles,
+                &mut heap_changed_at,
+            );
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -573,7 +583,20 @@ fn soak_test(
     let debugcon = fs::read_to_string(&log_path).unwrap_or_default();
     let qemu_log = fs::read_to_string(&qemu_log_path).unwrap_or_default();
     let baseline = resets_at_boot.unwrap_or_else(|| count_resets(&qemu_log));
-    let verdict = analyze_soak(&debugcon, &qemu_log, baseline, min_ticks, min_heap_cycles);
+    const MAX_PROGRESS_SILENCE: Duration = Duration::from_secs(10);
+    let freshness = ProgressFreshness {
+        ticks_stalled: last_ticks.is_some() && ticks_changed_at.elapsed() > MAX_PROGRESS_SILENCE,
+        heap_stalled: last_heap_cycles.is_some()
+            && heap_changed_at.elapsed() > MAX_PROGRESS_SILENCE,
+    };
+    let verdict = analyze_soak(
+        &debugcon,
+        &qemu_log,
+        baseline,
+        min_ticks,
+        min_heap_cycles,
+        freshness,
+    );
     let mut problems = verdict.as_ref().err().cloned().unwrap_or_default();
     if let Some((status, after)) = early_exit {
         problems.insert(0, format!("QEMU exited after {after:?} ({status})"));
@@ -604,6 +627,12 @@ struct SoakSummary {
     rounds: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ProgressFreshness {
+    ticks_stalled: bool,
+    heap_stalled: bool,
+}
+
 /// Judges a finished soak run from its debugcon log and QEMU's `-d
 /// cpu_reset` log; `resets_at_boot` is how many resets QEMU had logged
 /// when the kernel's soak marker appeared. Pure, so it is unit-tested.
@@ -613,6 +642,7 @@ fn analyze_soak(
     resets_at_boot: usize,
     min_ticks: u64,
     min_heap_cycles: u64,
+    freshness: ProgressFreshness,
 ) -> Result<SoakSummary, Vec<String>> {
     let mut problems = Vec::new();
     for line in debugcon.lines() {
@@ -663,6 +693,12 @@ fn analyze_soak(
             "only {heap_cycles} heap cycles, minimum {min_heap_cycles}"
         ));
     }
+    if freshness.ticks_stalled {
+        problems.push("timer made no progress during the final 10 seconds".to_string());
+    }
+    if freshness.heap_stalled {
+        problems.push("heap made no progress during the final 10 seconds".to_string());
+    }
 
     let resets = count_resets(qemu_log);
     if resets > resets_at_boot {
@@ -694,6 +730,28 @@ fn count_resets(qemu_log: &str) -> usize {
 fn leading_number(text: &str) -> Option<u64> {
     let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     text[..digits].parse().ok()
+}
+
+fn latest_ticks(log: &str) -> Option<u64> {
+    log.lines()
+        .filter_map(|line| leading_number(line.split_once("HARLAN: ticks=")?.1))
+        .next_back()
+}
+
+fn latest_heap_cycles(log: &str) -> Option<u64> {
+    log.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("HARLAN: soak round ")?.1.split_once(": ")?;
+            leading_number(rest)
+        })
+        .next_back()
+}
+
+fn refresh_progress(value: Option<u64>, previous: &mut Option<u64>, changed_at: &mut Instant) {
+    if value.is_some() && value != *previous {
+        *previous = value;
+        *changed_at = Instant::now();
+    }
 }
 
 #[cfg(test)]
@@ -809,12 +867,28 @@ mod tests {
     const TWO_RESETS: &str = "CPU Reset (CPU 0)\nEAX=00000000\nCPU Reset (CPU 0)\nEAX=00000000\n";
 
     fn problems(log: &str, qemu_log: &str, min_ticks: u64, min_heap: u64) -> Vec<String> {
-        analyze_soak(log, qemu_log, 2, min_ticks, min_heap).unwrap_err()
+        analyze_soak(
+            log,
+            qemu_log,
+            2,
+            min_ticks,
+            min_heap,
+            ProgressFreshness::default(),
+        )
+        .unwrap_err()
     }
 
     #[test]
     fn a_healthy_soak_passes_with_its_numbers() {
-        let summary = analyze_soak(&healthy_soak_log(), TWO_RESETS, 2, 300, 60_000).unwrap();
+        let summary = analyze_soak(
+            &healthy_soak_log(),
+            TWO_RESETS,
+            2,
+            300,
+            60_000,
+            ProgressFreshness::default(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             SoakSummary {
@@ -829,6 +903,23 @@ mod tests {
     fn too_little_progress_fails() {
         let found = problems(&healthy_soak_log(), TWO_RESETS, 301, 60_001);
         assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn progress_that_stopped_before_the_end_fails() {
+        let found = analyze_soak(
+            &healthy_soak_log(),
+            TWO_RESETS,
+            2,
+            300,
+            60_000,
+            ProgressFreshness {
+                ticks_stalled: false,
+                heap_stalled: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(found, ["heap made no progress during the final 10 seconds"]);
     }
 
     #[test]

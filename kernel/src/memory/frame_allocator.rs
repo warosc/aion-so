@@ -46,6 +46,8 @@ pub enum DeallocError {
         expected: FramePurpose,
         actual: Option<FramePurpose>,
     },
+    /// Purpose tracking is active, so callers must use `deallocate_as`.
+    PurposeRequired { actual: FramePurpose },
 }
 
 /// What a frame the kernel holds is being used for. Recorded per frame so
@@ -248,7 +250,7 @@ impl<'a> BitmapFrameAllocator<'a> {
                 actual,
             });
         }
-        self.deallocate(frame)
+        self.deallocate_unchecked(frame)
     }
 
     fn set_purpose(&mut self, frame: PhysFrame, purpose: Option<FramePurpose>) {
@@ -329,6 +331,19 @@ impl<'a> BitmapFrameAllocator<'a> {
     }
 
     pub fn deallocate(&mut self, frame: PhysFrame) -> Result<(), DeallocError> {
+        if !self.manages(frame) {
+            return Err(DeallocError::NotManaged);
+        }
+        if !self.bit(frame.number()) {
+            return Err(DeallocError::NotAllocated);
+        }
+        if let Some(actual) = self.purpose_of(frame) {
+            return Err(DeallocError::PurposeRequired { actual });
+        }
+        self.deallocate_unchecked(frame)
+    }
+
+    fn deallocate_unchecked(&mut self, frame: PhysFrame) -> Result<(), DeallocError> {
         if !self.manages(frame) {
             return Err(DeallocError::NotManaged);
         }
@@ -773,7 +788,13 @@ mod tests {
 
         // A frame nobody holds carries no purpose.
         assert_eq!(allocator.purpose_of(frame(0x9000)), None);
-        assert_eq!(allocator.deallocate(heap), Ok(()));
+        assert_eq!(
+            allocator.deallocate(heap),
+            Err(DeallocError::PurposeRequired {
+                actual: FramePurpose::Heap
+            })
+        );
+        assert_eq!(allocator.deallocate_as(heap, FramePurpose::Heap), Ok(()));
         assert_eq!(allocator.purpose_of(heap), None);
         assert_eq!(allocator.frames_for(FramePurpose::Heap), 0);
     }
@@ -847,7 +868,7 @@ mod tests {
         // held before.
         assert_eq!(allocator.purpose_of(frame(0)), None);
         assert_eq!(allocator.purpose_of(frame(0x2000)), None);
-        assert_eq!(allocator.deallocate(early), Ok(()));
+        assert_eq!(allocator.deallocate_as(early, FramePurpose::Boot), Ok(()));
         assert_eq!(allocator.frames_for(FramePurpose::Boot), 0);
     }
 
