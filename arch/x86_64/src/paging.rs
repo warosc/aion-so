@@ -38,6 +38,14 @@ pub const KERNEL_HEAP_START: u64 = KERNEL_SPACE_START + (1 << 39);
 pub const KERNEL_STACKS_START: u64 = KERNEL_SPACE_START + 2 * (1 << 39);
 
 const ENTRIES: usize = 512;
+const PAGE: u64 = 4096;
+const LARGE_PAGE: u64 = 2 * 1024 * 1024;
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// How much physical address space `rebuild_identity_map` covers by
+/// default: enough for the RAM the frame allocator can manage, the
+/// framebuffer and legacy MMIO, on every machine this kernel has run on.
+pub const DEFAULT_IDENTITY_LIMIT: u64 = 4 * GIB;
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -77,6 +85,17 @@ pub enum PagingError {
     KernelSpaceInUse,
     OutOfFrames,
     TableFrameNotWritable,
+    /// The identity limit must be a whole number of GiB, at most 512.
+    BadIdentityLimit,
+}
+
+/// What `rebuild_identity_map` built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityMapStats {
+    /// Page tables the new map took (all of them the kernel's own).
+    pub tables: u64,
+    /// Physical address space it covers, from 0.
+    pub limit: u64,
 }
 
 /// How the walker reaches table memory, given a table's physical address.
@@ -85,8 +104,11 @@ trait TableAccess {
     fn write(&mut self, table: u64, index: usize, value: u64);
     /// Drops any cached translation of `va`.
     fn flush(&mut self, va: u64);
+    /// Drops every cached translation (after replacing whole subtrees).
+    fn flush_all(&mut self);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Translation {
     phys: u64,
     writable: bool,
@@ -222,6 +244,60 @@ impl<A: TableAccess> PageTables<A> {
         Ok(PhysFrame::containing_address(leaf & ADDRESS_MASK))
     }
 
+    /// Builds an identity map for `0..limit` in fresh frames and installs
+    /// it as the whole lower half, leaving the null page unmapped. The
+    /// tables that were there before are simply dropped: nothing points at
+    /// them any more.
+    fn rebuild_identity(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        limit: u64,
+    ) -> Result<IdentityMapStats, PagingError> {
+        if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
+            return Err(PagingError::BadIdentityLimit);
+        }
+        let to_paging = |err| match err {
+            MapError::OutOfFrames => PagingError::OutOfFrames,
+            _ => PagingError::TableFrameNotWritable,
+        };
+
+        // Everything is built first and only linked into the root at the
+        // end, so the map in use never loses a translation it is running
+        // on.
+        let pdpt = self.new_table(frames).map_err(to_paging)?;
+        let mut tables = 1;
+        for slot in 0..(limit / GIB) as usize {
+            let directory = self.new_table(frames).map_err(to_paging)?;
+            tables += 1;
+            for entry in 0..ENTRIES {
+                let base = slot as u64 * GIB + entry as u64 * LARGE_PAGE;
+                self.access
+                    .write(directory, entry, base | PRESENT | WRITABLE | HUGE);
+            }
+            if slot == 0 {
+                // The first 2 MiB at 4 KiB granularity, so that the null
+                // page can be left out: a null dereference then faults
+                // instead of reading or writing real memory.
+                let table = self.new_table(frames).map_err(to_paging)?;
+                tables += 1;
+                for entry in 1..ENTRIES {
+                    let page = entry as u64 * PAGE;
+                    self.access.write(table, entry, page | PRESENT | WRITABLE);
+                }
+                self.access.write(directory, 0, table | PRESENT | WRITABLE);
+            }
+            self.access
+                .write(pdpt, slot, directory | PRESENT | WRITABLE);
+        }
+
+        self.access.write(self.root, 0, pdpt | PRESENT | WRITABLE);
+        for slot in 1..table_indices(KERNEL_SPACE_START)[0] {
+            self.access.write(self.root, slot, 0);
+        }
+        self.access.flush_all();
+        Ok(IdentityMapStats { tables, limit })
+    }
+
     /// A zeroed page table in a fresh frame. Tables are written through
     /// their physical address, so a frame that address does not reach
     /// writably is refused (and not returned to `frames`, which has no way
@@ -273,6 +349,15 @@ impl TableAccess for IdentityAccess {
         // re-walks the tables. Not `nomem`: it must also order the entry
         // write before it.
         unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) }
+    }
+
+    fn flush_all(&mut self) {
+        // SAFETY: reloading CR3 with the value it already holds keeps the
+        // same tables and drops every cached translation. Not `nomem`: the
+        // entries written before it must land first.
+        unsafe {
+            asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags));
+        }
     }
 }
 
@@ -334,6 +419,28 @@ impl KernelPageTable {
     /// Physical address of the kernel's root table (PML4).
     pub fn root(&self) -> u64 {
         self.tables.root
+    }
+
+    /// Replaces the firmware's identity map with one built from the
+    /// kernel's own frames, covering `0..limit` and leaving the null page
+    /// unmapped. After this the kernel no longer reads or depends on any
+    /// page table the firmware built.
+    ///
+    /// # Safety
+    ///
+    /// - Everything the kernel runs on or reaches through the identity map
+    ///   — its image, its page tables, the framebuffer, and every frame the
+    ///   allocator can hand out — must lie below `limit`.
+    /// - Nothing may depend on the null page being mapped, or on anything
+    ///   the firmware mapped in the lower half above `limit`.
+    /// - Called on the only core, with no interrupt handler touching page
+    ///   tables.
+    pub unsafe fn rebuild_identity_map(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        limit: u64,
+    ) -> Result<IdentityMapStats, PagingError> {
+        self.tables.rebuild_identity(frames, limit)
     }
 }
 
@@ -411,6 +518,7 @@ mod tests {
         firmware: BTreeSet<u64>,
         writes: Vec<(u64, usize, u64)>,
         flushed: Vec<u64>,
+        flushed_all: u32,
     }
 
     impl TableAccess for FakeMemory {
@@ -431,6 +539,10 @@ mod tests {
 
         fn flush(&mut self, va: u64) {
             self.flushed.push(va);
+        }
+
+        fn flush_all(&mut self) {
+            self.flushed_all += 1;
         }
     }
 
@@ -710,6 +822,85 @@ mod tests {
         assert_eq!(tables.access.flushed, [page(0x7000), page(0x7000)]);
         assert_eq!(tables.unmap(page(0x7000)), Err(UnmapError::NotMapped));
         assert_eq!(tables.unmap(page(1 << 39)), Err(UnmapError::NotMapped));
+    }
+
+    #[test]
+    fn rebuilding_the_identity_map_leaves_the_null_page_out() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        // 1 GiB: one PDPT, one page directory and one page table.
+        let stats = tables.rebuild_identity(&mut frames, GIB).unwrap();
+        assert_eq!(
+            stats,
+            IdentityMapStats {
+                tables: 3,
+                limit: GIB
+            }
+        );
+
+        assert_eq!(tables.translate(0), None, "the null page must be unmapped");
+        for addr in [PAGE, 0x1234 + PAGE, LARGE_PAGE, GIB - PAGE, GIB - 1] {
+            let seen = tables.translate(addr).expect("identity mapped");
+            assert_eq!((seen.phys, seen.writable), (addr, true), "{addr:#x}");
+        }
+        assert_eq!(tables.translate(GIB), None, "nothing above the limit");
+        assert_eq!(tables.access.flushed_all, 1);
+        // The firmware's own tables were never written.
+        assert!(
+            tables
+                .access
+                .writes
+                .iter()
+                .all(|&(table, _, _)| table != FW_PDPT && table != FW_PD)
+        );
+    }
+
+    #[test]
+    fn rebuilding_keeps_kernel_space_and_drops_the_rest_of_the_lower_half() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000]);
+        let mut tables = adopted(&mut frames);
+        // Something of the kernel's own in the higher half...
+        tables
+            .access
+            .write(tables.root, 300, 0x50_0000 | PRESENT | WRITABLE);
+        // ...and a leftover the firmware had mapped high in the lower half.
+        tables
+            .access
+            .write(tables.root, 200, 0x60_0000 | PRESENT | WRITABLE);
+
+        tables.rebuild_identity(&mut frames, GIB).unwrap();
+
+        let root = tables.access.tables[&tables.root];
+        assert_eq!(root[300], 0x50_0000 | PRESENT | WRITABLE, "kernel space");
+        assert_eq!(
+            root[200], 0,
+            "the lower half is the new map and nothing else"
+        );
+        assert_ne!(root[0], 0);
+    }
+
+    #[test]
+    fn a_bad_limit_or_too_few_frames_leaves_the_old_map_alone() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000]);
+        let mut tables = adopted(&mut frames);
+        let before = tables.access.tables[&tables.root][0];
+
+        assert_eq!(
+            tables.rebuild_identity(&mut frames, GIB + PAGE),
+            Err(PagingError::BadIdentityLimit)
+        );
+        assert_eq!(
+            tables.rebuild_identity(&mut frames, 1024 * GIB),
+            Err(PagingError::BadIdentityLimit)
+        );
+        // One frame short of the PDPT, directory and page table it needs.
+        assert_eq!(
+            tables.rebuild_identity(&mut frames, GIB),
+            Err(PagingError::OutOfFrames)
+        );
+        assert_eq!(tables.access.tables[&tables.root][0], before);
+        assert_eq!(tables.translate(0x5_4321).unwrap().phys, 0x5_4321);
+        assert_eq!(tables.access.flushed_all, 0);
     }
 
     #[test]
