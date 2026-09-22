@@ -33,19 +33,20 @@ pub const FRAME_BITMAP_WORDS: usize = 1024;
 pub fn move_off_firmware_memory(
     frames: &KernelFrames<'_>,
     map: &MemoryMap,
-) -> KernelFrames<'static> {
+) -> (KernelFrames<'static>, &'static MemoryMap) {
     let heap_map: &'static MemoryMap = Box::leak(Box::new(*map));
     let mut bitmap = vec![0u64; FRAME_BITMAP_WORDS].into_boxed_slice();
     bitmap.copy_from_slice(frames.bitmap());
     let storage: &'static mut [u64] = Box::leak(bitmap);
     // SAFETY: the same window, over the same frames, as the allocator this
     // one replaces.
-    unsafe {
+    let moved = unsafe {
         ZeroedFrames::new(
             BitmapFrameAllocator::adopt(storage, heap_map, frames.boot_services_reclaimed()),
             frames.window(),
         )
-    }
+    };
+    (moved, heap_map)
 }
 
 /// Takes `sample` frames from the pool, checks each arrives zeroed, writes a

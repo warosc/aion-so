@@ -7,7 +7,7 @@ mod memory;
 mod shell;
 mod sync;
 
-use harlan_hal::frame::FRAME_SIZE;
+use harlan_hal::frame::{FRAME_SIZE, PhysRange};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
 use harlan_hal::{Console, PowerControl};
 use memory::frame_allocator::BitmapFrameAllocator;
@@ -28,6 +28,10 @@ pub const ARCH_NAME: &str = "unknown";
 /// firmware-agnostic type.
 pub struct BootInfo {
     pub memory_map: MemoryMap,
+    /// Where the firmware loaded the kernel image, if it said. The kernel
+    /// keeps these pages executable and marks the rest of the identity map
+    /// no-execute (docs/adr/0008-fase2-write-xor-execute.md).
+    pub kernel_image: Option<PhysRange>,
 }
 
 /// The kernel takes ownership of everything `boot` hands over (see
@@ -211,8 +215,12 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
     if let (Some(mapper), Some(top)) = (page_mapper, kernel_stack_top)
         && heap_ready
     {
+        let (heap_frames, heap_map) =
+            memory::move_off_firmware_memory(&frames, &boot_info.memory_map);
         let context = alloc::boxed::Box::leak(alloc::boxed::Box::new(KernelContext {
-            frames: memory::move_off_firmware_memory(&frames, &boot_info.memory_map),
+            frames: heap_frames,
+            map: heap_map,
+            kernel_image: boot_info.kernel_image,
             mapper,
             console: alloc::boxed::Box::leak(alloc::boxed::Box::new(console)),
             power: alloc::boxed::Box::leak(alloc::boxed::Box::new(power)),
@@ -243,6 +251,8 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
 #[cfg(target_arch = "x86_64")]
 struct KernelContext {
     frames: memory::zeroed_frames::KernelFrames<'static>,
+    map: &'static MemoryMap,
+    kernel_image: Option<PhysRange>,
     mapper: harlan_arch_x86_64::paging::KernelPageTable,
     console: &'static mut dyn Console,
     power: &'static dyn PowerControl,
@@ -268,35 +278,60 @@ fn kernel_main(context: &mut KernelContext) -> ! {
         core::ptr::addr_of!(here) as u64
     );
 
+    // What still runs through the identity map: the kernel's own image and
+    // the firmware's runtime services code (`reboot` and `shutdown` call
+    // into it). Everything else in the map becomes no-execute.
+    let mut executable = alloc::vec::Vec::new();
+    executable.extend(context.kernel_image);
+    executable.extend(
+        context
+            .map
+            .iter()
+            .filter(|region| region.kind == MemoryRegionKind::RuntimeCode)
+            .map(|region| PhysRange::new(region.start_phys_addr, region.page_count * FRAME_SIZE)),
+    );
+    if executable.is_empty() {
+        log::warn!(
+            "HARLAN: no executable range known; the identity map would fault on its own code"
+        );
+    }
+
     // An identity map of the kernel's own, with the null page left out, so
     // that no firmware page table is in use any more and a null
     // dereference faults.
     //
     // SAFETY: the kernel's image, its page tables, the framebuffer and
     // every frame the allocator can hand out are all below the limit; its
-    // stack and heap are in kernel space, which this leaves alone; nothing
+    // stack and heap are in kernel space, which this leaves alone;
+    // `executable` lists every range of code still reached through this map
+    // (the kernel image and the firmware's runtime services); nothing
     // depends on the null page; single core, and no interrupt handler
     // touches page tables.
-    let own_tables = match unsafe {
-        context
-            .mapper
-            .rebuild_identity_map(&mut context.frames, DEFAULT_IDENTITY_LIMIT)
-    } {
-        Ok(stats) => {
-            log::info!(
-                "HARLAN: identity map rebuilt from {} table(s) of the kernel's own, covering {} GiB, null page unmapped",
-                stats.tables,
-                stats.limit / (1024 * 1024 * 1024)
-            );
-            true
-        }
-        Err(err) => {
-            log::error!(
-                "HARLAN: identity map not rebuilt ({err:?}); the firmware's tables stay in use"
-            );
-            false
-        }
-    };
+    let own_tables = !executable.is_empty()
+        && match unsafe {
+            context.mapper.rebuild_identity_map(
+                &mut context.frames,
+                DEFAULT_IDENTITY_LIMIT,
+                &executable,
+            )
+        } {
+            Ok(stats) => {
+                log::info!(
+                    "HARLAN: identity map rebuilt from {} table(s) of the kernel's own, covering {} GiB, null page unmapped, {} page(s) executable of {} range(s), everything else no-execute",
+                    stats.tables,
+                    stats.limit / (1024 * 1024 * 1024),
+                    stats.executable_pages,
+                    executable.len()
+                );
+                true
+            }
+            Err(err) => {
+                log::error!(
+                    "HARLAN: identity map not rebuilt ({err:?}); the firmware's tables stay in use"
+                );
+                false
+            }
+        };
 
     // Only now, with nothing of the firmware's left in use, does its memory
     // join the pool.

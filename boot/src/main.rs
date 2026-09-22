@@ -3,6 +3,7 @@
 
 mod console_hw;
 mod framebuffer;
+mod image;
 mod memory;
 mod panic;
 mod power;
@@ -21,6 +22,9 @@ fn efi_main() -> Status {
     // The GOP protocol is a Boot Services object: it can only be queried
     // now. What it describes (the framebuffer memory) outlives the exit.
     let framebuffer = framebuffer::query();
+    // Also a Boot Services question: the kernel marks this range executable
+    // and everything else no-execute when it builds its own page tables.
+    let kernel_image = image::query();
 
     // SAFETY: this is the only call site, on a single linear,
     // non-reentrant path. No Boot-Services-backed resource is held past
@@ -51,7 +55,10 @@ fn efi_main() -> Status {
     }
 
     let memory_map = memory::build_memory_map(&uefi_memory_map);
-    let boot_info = harlan_kernel::BootInfo { memory_map };
+    let boot_info = harlan_kernel::BootInfo {
+        memory_map,
+        kernel_image,
+    };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
     // was current when it was queried, and nothing changes the display
     // mode after that (boot services are gone). Firmware's own console
