@@ -32,6 +32,11 @@ pub const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
 /// docs/adr/0006-fase2-kernel-heap.md).
 pub const KERNEL_HEAP_START: u64 = KERNEL_SPACE_START + (1 << 39);
 
+/// Where the kernel's stacks live: PML4 slot 258, again a slot of its own,
+/// so a stack that runs off its guard page can only ever land on an
+/// unmapped page (see docs/fase2-notes.md, Incremento 10).
+pub const KERNEL_STACKS_START: u64 = KERNEL_SPACE_START + 2 * (1 << 39);
+
 const ENTRIES: usize = 512;
 
 const PRESENT: u64 = 1 << 0;
@@ -488,9 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn the_heap_has_a_kernel_space_slot_of_its_own() {
-        assert!(is_canonical(KERNEL_HEAP_START));
+    fn the_heap_and_the_stacks_each_have_a_kernel_space_slot() {
+        assert!(is_canonical(KERNEL_HEAP_START) && is_canonical(KERNEL_STACKS_START));
         assert_eq!(table_indices(KERNEL_HEAP_START), [257, 0, 0, 0]);
+        assert_eq!(table_indices(KERNEL_STACKS_START), [258, 0, 0, 0]);
     }
 
     #[test]

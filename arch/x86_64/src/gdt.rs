@@ -134,6 +134,35 @@ struct DescriptorTablePointer {
     base: u64,
 }
 
+/// Points the double-fault handler's IST entry at `top`, the top
+/// (exclusive) of a stack the kernel has mapped for it. Until this is
+/// called, `#DF` runs on `DOUBLE_FAULT_STACK`, a static inside the kernel
+/// image with nothing guarding either end of it.
+///
+/// The CPU reads the TSS when the exception happens, so there is nothing
+/// to reload: writing the entry is enough.
+///
+/// # Safety
+///
+/// `top` must be the top of a mapped, writable stack of at least a few
+/// KiB that nothing else uses, and it must stay mapped for as long as the
+/// kernel runs. Must not be called from inside a double-fault handler.
+pub unsafe fn set_double_fault_stack(top: u64) {
+    // SAFETY: single-core kernel; this writes one `u64` of the TSS, which
+    // the CPU only reads when it takes a double fault, and the caller
+    // guarantees it is not one.
+    unsafe {
+        (&raw mut TSS)
+            .cast::<u8>()
+            .add(IST1_OFFSET)
+            .cast::<u64>()
+            .write(top);
+    }
+}
+
+/// Byte offset of `ist[0]` (IST1) inside `TaskStateSegment`.
+const IST1_OFFSET: usize = core::mem::offset_of!(TaskStateSegment, ist);
+
 /// Builds the GDT/TSS, loads them, and switches every segment register to
 /// the new flat selectors.
 ///
