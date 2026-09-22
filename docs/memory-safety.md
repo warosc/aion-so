@@ -48,9 +48,11 @@ marcos ni al mapper—, y debe seguir cumpliéndose:
 `IrqLock` protege el heap: tomarlo desactiva las interrupciones, de modo que
 en un solo núcleo no hay contención posible salvo por reentrada, y la
 reentrada **entra en pánico en vez de girar** (un giro con las interrupciones
-desactivadas colgaría la máquina en silencio). Es decir: si algún día un
-manejador asignara memoria, no corrompería el heap —se detendría con un
-mensaje.
+desactivadas colgaría la máquina en silencio). El candado evita corrupción si
+una interrupción alcanza al heap mientras ya está bloqueado, pero no impone
+por sí solo la regla "ningún manejador asigna": una asignación desde un
+manejador con el heap libre podría completarse. Esa prohibición se verifica
+hoy revisando los manejadores y debe conservarse explícitamente.
 
 Con varios núcleos (Fase 3 o más adelante) esto cambia: `IrqLock` tendrá que
 girar además de desactivar interrupciones, el asignador de marcos necesitará

@@ -55,7 +55,11 @@ macro_rules! address_type {
             type Output = Self;
 
             fn add(self, offset: u64) -> Self {
-                Self(self.0 + offset)
+                Self(
+                    self.0
+                        .checked_add(offset)
+                        .expect("address addition overflow"),
+                )
             }
         }
 
@@ -129,6 +133,12 @@ mod tests {
             VirtAddr::new(0x1000).saturating_sub(VirtAddr::new(0x3000)),
             0
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "address addition overflow")]
+    fn addition_panics_instead_of_wrapping() {
+        let _ = PhysAddr::new(u64::MAX) + 1;
     }
 
     #[test]

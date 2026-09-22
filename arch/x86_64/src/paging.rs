@@ -92,6 +92,8 @@ pub enum PagingError {
     TableFrameNotWritable,
     /// The identity limit must be a whole number of GiB, at most 512.
     BadIdentityLimit,
+    /// A required executable range would be dropped by the new map.
+    RequiredRangeOutsideIdentityMap,
 }
 
 /// What `rebuild_identity_map` built.
@@ -267,6 +269,14 @@ impl<A: TableAccess> PageTables<A> {
         if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
             return Err(PagingError::BadIdentityLimit);
         }
+        if executable.iter().any(|range| {
+            range.len == 0
+                || range.start.as_u64() >= limit
+                || range.start.checked_add(range.len).is_none()
+                || range.end().as_u64() > limit
+        }) {
+            return Err(PagingError::RequiredRangeOutsideIdentityMap);
+        }
         let to_paging = |err| match err {
             MapError::OutOfFrames => PagingError::OutOfFrames,
             _ => PagingError::TableFrameNotWritable,
@@ -407,6 +417,27 @@ pub struct KernelPageTable {
 }
 
 impl KernelPageTable {
+    /// Whether `frame` is identity-mapped writable by the currently active
+    /// firmware tables. Used before an identity `PhysWindow` can safely be
+    /// constructed.
+    ///
+    /// # Safety
+    ///
+    /// The active CR3 must be the firmware root and its table frames must
+    /// be reachable at their physical addresses, as required by
+    /// `take_over` itself.
+    pub unsafe fn active_identity_frame_is_writable(frame: PhysFrame) -> bool {
+        let tables = PageTables {
+            root: read_cr3() & ADDRESS_MASK,
+            access: IdentityAccess,
+        };
+        let addr = frame.start_address().as_u64();
+        matches!(
+            tables.translate(addr),
+            Some(Translation { phys, writable: true }) if phys == addr
+        )
+    }
+
     /// Checks the paging mode, copies the firmware's root table into a
     /// frame from `frames` and loads it into CR3.
     ///
@@ -994,6 +1025,18 @@ mod tests {
         );
         assert_eq!(tables.access.tables[&tables.root][0], before);
         assert_eq!(tables.translate(0x5_4321).unwrap().phys, 0x5_4321);
+        assert_eq!(tables.access.flushed_all, 0);
+    }
+
+    #[test]
+    fn executable_ranges_must_fit_entirely_inside_the_new_map() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        let outside = PhysRange::new(PhysAddr::new(GIB - PAGE), 2 * PAGE);
+        assert_eq!(
+            tables.rebuild_identity(&mut frames, GIB, &[outside]),
+            Err(PagingError::RequiredRangeOutsideIdentityMap)
+        );
         assert_eq!(tables.access.flushed_all, 0);
     }
 

@@ -7,7 +7,8 @@ mod memory;
 mod shell;
 mod sync;
 
-use harlan_hal::frame::{FRAME_SIZE, PhysRange};
+use harlan_hal::addr::PhysAddr;
+use harlan_hal::frame::{FRAME_SIZE, PhysFrame, PhysRange};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
 use harlan_hal::{Console, PowerControl};
 use memory::frame_allocator::BitmapFrameAllocator;
@@ -32,6 +33,9 @@ pub struct BootInfo {
     /// keeps these pages executable and marks the rest of the identity map
     /// no-execute (docs/adr/0008-fase2-write-xor-execute.md).
     pub kernel_image: Option<PhysRange>,
+    /// The framebuffer still used by the hardware console. Rebuilding the
+    /// identity map is refused unless this entire range remains mapped.
+    pub framebuffer: Option<PhysRange>,
 }
 
 /// The kernel takes ownership of everything `boot` hands over (see
@@ -92,13 +96,33 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
     // withholds, so the bitmap can never be handed out as a frame.
     let mut frame_bitmap = [0u64; memory::FRAME_BITMAP_WORDS];
     let bitmap = BitmapFrameAllocator::new(&mut frame_bitmap, &boot_info.memory_map);
+
+    // Prove the invariant required by an identity `PhysWindow` before any
+    // allocated frame is touched: every frame the allocator may return is
+    // identity-mapped and writable by the active firmware tables.
+    #[cfg(target_arch = "x86_64")]
+    {
+        for number in 0..bitmap.covered_frames() {
+            let frame = PhysFrame::containing_address(PhysAddr::new(number * FRAME_SIZE));
+            // SAFETY: CR3 is still the firmware root and HARLAN has not
+            // changed any page table. This is the same precondition as the
+            // `take_over` call below; the method only walks the live tables.
+            let writable = unsafe {
+                harlan_arch_x86_64::paging::KernelPageTable::active_identity_frame_is_writable(
+                    frame,
+                )
+            };
+            if bitmap.manages(frame) && !writable {
+                panic!("allocator frame {frame:?} is not identity-mapped writable");
+            }
+        }
+        log::info!("HARLAN: allocator identity map verified");
+    }
     // Every frame leaves the allocator zeroed from here on: no page table
     // can start with junk entries and no frame carries what its previous
-    // owner left in it. The window is the firmware's identity map, which
-    // `KernelPageTable::take_over` checks before anything is written.
-    // SAFETY: the identity map covers every frame the allocator can hand
-    // out (it is the map the kernel is running under, and the allocator
-    // only hands out RAM below the covered range).
+    // owner left in it.
+    // SAFETY: immediately above, the live mapper verified every frame that
+    // `bitmap` can hand out is identity-mapped and writable.
     let mut frames = unsafe {
         memory::zeroed_frames::ZeroedFrames::new(
             bitmap,
@@ -113,10 +137,8 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
         frames.covered_frames() * FRAME_SIZE / MIB,
         frames.uncovered_usable_frames()
     );
-    // Virtual and physical addresses coincide (the firmware's identity map;
-    // `KernelPageTable::take_over` checks it before writing anything), so
-    // the address of a local is a physical address on the live stack. This
-    // self-test writes no frame, so it can run before that check.
+    // Virtual and physical addresses coincide (verified above), so the
+    // address of a local is a physical address on the live stack.
     let stack_probe = 0u8;
     memory::self_test(
         &mut frames,
@@ -157,6 +179,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             }
         }
     };
+
     #[cfg(target_arch = "x86_64")]
     if let Some(mapper) = &mut page_mapper {
         let test_page = harlan_hal::paging::Page::from_start_address(
@@ -230,6 +253,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             frames: heap_frames,
             map: heap_map,
             kernel_image: boot_info.kernel_image,
+            framebuffer: boot_info.framebuffer,
             heap_range,
             kernel_stacks,
             mapper,
@@ -264,6 +288,7 @@ struct KernelContext {
     frames: memory::zeroed_frames::KernelFrames<'static>,
     map: &'static MemoryMap,
     kernel_image: Option<PhysRange>,
+    framebuffer: Option<PhysRange>,
     /// Where the heap is and how big, to label its frames.
     heap_range: Option<(harlan_hal::addr::VirtAddr, u64)>,
     kernel_stacks: Option<(memory::stacks::Stack, memory::stacks::Stack)>,
@@ -297,13 +322,22 @@ fn kernel_main(context: &mut KernelContext) -> ! {
     // into it). Everything else in the map becomes no-execute.
     let mut executable = alloc::vec::Vec::new();
     executable.extend(context.kernel_image);
-    executable.extend(
-        context
-            .map
-            .iter()
-            .filter(|region| region.kind == MemoryRegionKind::RuntimeCode)
-            .map(|region| PhysRange::new(region.start_phys_addr, region.page_count * FRAME_SIZE)),
-    );
+    let mut executable_valid = true;
+    for region in context
+        .map
+        .iter()
+        .filter(|region| region.kind == MemoryRegionKind::RuntimeCode)
+    {
+        if let Some(len) = region.page_count.checked_mul(FRAME_SIZE) {
+            executable.push(PhysRange::new(region.start_phys_addr, len));
+        } else {
+            executable_valid = false;
+            log::error!(
+                "HARLAN: RuntimeCode range at {:#x} overflows; identity map will not be rebuilt",
+                region.start_phys_addr
+            );
+        }
+    }
     if executable.is_empty() {
         log::warn!(
             "HARLAN: no executable range known; the identity map would fault on its own code"
@@ -321,7 +355,20 @@ fn kernel_main(context: &mut KernelContext) -> ! {
     // (the kernel image and the firmware's runtime services); nothing
     // depends on the null page; single core, and no interrupt handler
     // touches page tables.
-    let own_tables = !executable.is_empty()
+    let framebuffer_valid = context.framebuffer.is_none_or(|range| {
+        range.len > 0
+            && range.start.as_u64() < DEFAULT_IDENTITY_LIMIT
+            && range.start.checked_add(range.len).is_some()
+            && range.end().as_u64() <= DEFAULT_IDENTITY_LIMIT
+    });
+    if !framebuffer_valid {
+        log::error!(
+            "HARLAN: framebuffer lies outside the identity-map limit; firmware tables stay in use"
+        );
+    }
+    let own_tables = executable_valid
+        && framebuffer_valid
+        && !executable.is_empty()
         && match unsafe {
             context.mapper.rebuild_identity_map(
                 &mut context.frames,
