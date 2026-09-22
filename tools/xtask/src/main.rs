@@ -59,6 +59,18 @@ enum XtaskCommand {
         #[arg(long)]
         heap_stress: bool,
     },
+    /// Boot a soak build (endless heap stress rounds instead of the shell)
+    /// and let it run for the whole duration. Fails on an early exit, a CPU
+    /// reset after boot, a panic or exception, a boot marker seen twice, or
+    /// too little progress (timer ticks, heap cycles).
+    SoakTest {
+        #[arg(long, default_value_t = 120)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 10_000)]
+        min_ticks: u64,
+        #[arg(long, default_value_t = 50_000)]
+        min_heap_cycles: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -66,7 +78,7 @@ fn main() -> Result<()> {
     let root = workspace_root();
 
     match cli.command {
-        XtaskCommand::Build => build(&root, false),
+        XtaskCommand::Build => build(&root, &[]),
         XtaskCommand::Run => run(&root),
         XtaskCommand::Test => test(&root),
         XtaskCommand::FmtLint { fix } => fmt_lint(&root, fix),
@@ -82,6 +94,16 @@ fn main() -> Result<()> {
             &marker,
             repeat,
             heap_stress,
+        ),
+        XtaskCommand::SoakTest {
+            duration_secs,
+            min_ticks,
+            min_heap_cycles,
+        } => soak_test(
+            &root,
+            Duration::from_secs(duration_secs),
+            min_ticks,
+            min_heap_cycles,
         ),
     }
 }
@@ -113,23 +135,32 @@ fn run_cargo(root: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn build(root: &Path, heap_stress: bool) -> Result<()> {
-    for args in build_commands(heap_stress) {
+fn build(root: &Path, features: &[&str]) -> Result<()> {
+    for command in build_commands(features) {
+        let args: Vec<&str> = command.iter().map(String::as_str).collect();
         run_cargo(root, &args)?;
     }
     assemble_esp(root)
 }
 
-/// The cargo invocations `build` runs. Pure so the feature plumbing is
-/// unit-testable: `harlan-boot` forwards `heap-stress` to `harlan-kernel`.
-fn build_commands(heap_stress: bool) -> [Vec<&'static str>; 2] {
-    let mut kernel = vec!["build", "-p", "harlan-kernel", "--target", KERNEL_TARGET];
-    let mut boot = vec!["build", "-p", "harlan-boot", "--target", UEFI_TARGET];
-    if heap_stress {
-        kernel.extend(["--features", "heap-stress"]);
-        boot.extend(["--features", "heap-stress"]);
-    }
-    [kernel, boot]
+/// The cargo invocations `build` runs, with `features` enabled on both
+/// crates (`harlan-boot` forwards each one to `harlan-kernel`). Pure so the
+/// feature plumbing is unit-testable.
+fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
+    [
+        ("harlan-kernel", KERNEL_TARGET),
+        ("harlan-boot", UEFI_TARGET),
+    ]
+    .map(|(package, target)| {
+        let mut command: Vec<String> = ["build", "-p", package, "--target", target]
+            .map(String::from)
+            .into();
+        if !features.is_empty() {
+            command.push("--features".to_string());
+            command.push(features.join(","));
+        }
+        command
+    })
 }
 
 fn assemble_esp(root: &Path) -> Result<()> {
@@ -261,6 +292,8 @@ struct QemuConfig {
     headless: bool,
     debug_stub: bool,
     debugcon_log: Option<PathBuf>,
+    /// QEMU's own diagnostics (`-d guest_errors,cpu_reset`), for soak runs.
+    qemu_log: Option<PathBuf>,
 }
 
 /// Pure function so the argument construction is unit-testable without
@@ -316,6 +349,13 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
         args.push("-S".to_string());
     }
 
+    if let Some(qemu_log) = &cfg.qemu_log {
+        args.push("-d".to_string());
+        args.push("guest_errors,cpu_reset".to_string());
+        args.push("-D".to_string());
+        args.push(qemu_log.display().to_string());
+    }
+
     args
 }
 
@@ -333,11 +373,12 @@ fn prepare_qemu_config(root: &Path, headless: bool, debug_stub: bool) -> Result<
         headless,
         debug_stub,
         debugcon_log: None,
+        qemu_log: None,
     })
 }
 
 fn run(root: &Path) -> Result<()> {
-    build(root, false)?;
+    build(root, &[])?;
     let cfg = prepare_qemu_config(root, false, false)?;
     let args = build_qemu_args(&cfg);
     let status = Command::new(qemu_binary())
@@ -351,7 +392,7 @@ fn run(root: &Path) -> Result<()> {
 }
 
 fn debug(root: &Path) -> Result<()> {
-    build(root, false)?;
+    build(root, &[])?;
     let cfg = prepare_qemu_config(root, false, true)?;
     let args = build_qemu_args(&cfg);
     println!("QEMU paused at reset; gdbstub listening on tcp::1234 (see .vscode/launch.json)");
@@ -372,7 +413,7 @@ fn boot_test(
     repeat: u32,
     heap_stress: bool,
 ) -> Result<()> {
-    build(root, heap_stress)?;
+    build(root, if heap_stress { &["heap-stress"] } else { &[] })?;
     for attempt in 1..=repeat {
         boot_test_once(root, timeout, marker)
             .with_context(|| format!("boot-test attempt {attempt}/{repeat} failed"))?;
@@ -441,6 +482,192 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str) -> Result<()> {
     }
 }
 
+/// Logged once by a soak build when it starts its stress rounds.
+const SOAK_MARKER: &str = "HARLAN: soak mode";
+/// Logged exactly once per boot: seeing one twice means the machine reset
+/// and booted again.
+const SOAK_ONCE_MARKERS: [&str; 3] = [
+    "HARLAN-PHASE2-POST-EXIT-OK",
+    "HARLAN-PHASE0-BOOT-OK",
+    SOAK_MARKER,
+];
+/// Written by the kernel's panic handler and exception handlers.
+const SOAK_TROUBLE: [&str; 4] = ["PANIC", "HARLAN: #", "unhandled exception", "NMI received"];
+
+fn soak_test(root: &Path, duration: Duration, min_ticks: u64, min_heap_cycles: u64) -> Result<()> {
+    build(root, &["soak"])?;
+    let mut cfg = prepare_qemu_config(root, true, false)?;
+    let target = root.join("target");
+    let log_path = target.join("soak-test.log");
+    let qemu_log_path = target.join("soak-test-qemu.log");
+    let stderr_path = target.join("soak-test-qemu-stderr.log");
+    for path in [&log_path, &qemu_log_path] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
+        }
+    }
+    cfg.debugcon_log = Some(log_path.clone());
+    cfg.qemu_log = Some(qemu_log_path.clone());
+    let args = build_qemu_args(&cfg);
+    let stderr_file = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut child = Command::new(qemu_binary())
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
+        .with_context(|| format!("failed to launch {}", qemu_binary()))?;
+    println!("soak-test: running for {duration:?}");
+
+    let start = Instant::now();
+    // QEMU logs its own resets while creating the machine, and how many
+    // depends on the QEMU version. Counting them the moment the kernel is
+    // up makes any later one stand out without hard-coding that number.
+    let mut resets_at_boot = None;
+    let mut early_exit = None;
+    while start.elapsed() < duration {
+        if let Some(status) = child.try_wait().context("failed to poll qemu")? {
+            early_exit = Some((status, start.elapsed()));
+            break;
+        }
+        if resets_at_boot.is_none()
+            && fs::read_to_string(&log_path).is_ok_and(|log| log.contains(SOAK_MARKER))
+        {
+            resets_at_boot = Some(count_resets(
+                &fs::read_to_string(&qemu_log_path).unwrap_or_default(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let debugcon = fs::read_to_string(&log_path).unwrap_or_default();
+    let qemu_log = fs::read_to_string(&qemu_log_path).unwrap_or_default();
+    let baseline = resets_at_boot.unwrap_or_else(|| count_resets(&qemu_log));
+    let verdict = analyze_soak(&debugcon, &qemu_log, baseline, min_ticks, min_heap_cycles);
+    let mut problems = verdict.as_ref().err().cloned().unwrap_or_default();
+    if let Some((status, after)) = early_exit {
+        problems.insert(0, format!("QEMU exited after {after:?} ({status})"));
+    }
+    match verdict {
+        Ok(summary) if problems.is_empty() => {
+            println!(
+                "soak-test: PASS after {duration:?}: {} ticks, {} heap cycles in {} rounds, \
+                 {baseline} CPU reset(s) at machine start and none after",
+                summary.ticks, summary.heap_cycles, summary.rounds
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "soak-test: FAIL\n  - {}\n(see {}, {} and {})",
+            problems.join("\n  - "),
+            log_path.display(),
+            qemu_log_path.display(),
+            stderr_path.display()
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SoakSummary {
+    ticks: u64,
+    heap_cycles: u64,
+    rounds: u64,
+}
+
+/// Judges a finished soak run from its debugcon log and QEMU's `-d
+/// cpu_reset` log; `resets_at_boot` is how many resets QEMU had logged
+/// when the kernel's soak marker appeared. Pure, so it is unit-tested.
+fn analyze_soak(
+    debugcon: &str,
+    qemu_log: &str,
+    resets_at_boot: usize,
+    min_ticks: u64,
+    min_heap_cycles: u64,
+) -> Result<SoakSummary, Vec<String>> {
+    let mut problems = Vec::new();
+    for line in debugcon.lines() {
+        if SOAK_TROUBLE.iter().any(|sign| line.contains(sign)) {
+            problems.push(format!("trouble in the log: {}", line.trim()));
+        }
+    }
+    for marker in SOAK_ONCE_MARKERS {
+        let seen = debugcon.matches(marker).count();
+        if seen != 1 {
+            problems.push(format!(
+                "{marker:?} logged {seen} time(s), expected exactly once"
+            ));
+        }
+    }
+
+    let ticks: Vec<u64> = debugcon
+        .lines()
+        .filter_map(|line| leading_number(line.split_once("HARLAN: ticks=")?.1))
+        .collect();
+    if ticks.windows(2).any(|pair| pair[1] <= pair[0]) {
+        problems.push("timer ticks went backwards or stalled".to_string());
+    }
+    let last_ticks = ticks.last().copied().unwrap_or(0);
+    if last_ticks < min_ticks {
+        problems.push(format!(
+            "only {last_ticks} timer ticks, minimum {min_ticks}"
+        ));
+    }
+
+    let rounds: Vec<(u64, u64)> = debugcon
+        .lines()
+        .filter_map(|line| {
+            let (round, rest) = line.split_once("HARLAN: soak round ")?.1.split_once(": ")?;
+            Some((round.parse().ok()?, leading_number(rest)?))
+        })
+        .collect();
+    if rounds
+        .iter()
+        .enumerate()
+        .any(|(i, &(round, _))| round != i as u64 + 1)
+    {
+        problems.push("soak rounds are not consecutive".to_string());
+    }
+    let (last_round, heap_cycles) = rounds.last().copied().unwrap_or((0, 0));
+    if heap_cycles < min_heap_cycles {
+        problems.push(format!(
+            "only {heap_cycles} heap cycles, minimum {min_heap_cycles}"
+        ));
+    }
+
+    let resets = count_resets(qemu_log);
+    if resets > resets_at_boot {
+        problems.push(format!(
+            "{} CPU reset(s) after the kernel booted",
+            resets - resets_at_boot
+        ));
+    }
+
+    if problems.is_empty() {
+        Ok(SoakSummary {
+            ticks: last_ticks,
+            heap_cycles,
+            rounds: last_round,
+        })
+    } else {
+        Err(problems)
+    }
+}
+
+/// QEMU (11.1, checked) starts every `-d cpu_reset` dump with this line.
+fn count_resets(qemu_log: &str) -> usize {
+    qemu_log
+        .lines()
+        .filter(|line| line.starts_with("CPU Reset"))
+        .count()
+}
+
+fn leading_number(text: &str) -> Option<u64> {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    text[..digits].parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +680,7 @@ mod tests {
             headless: false,
             debug_stub: false,
             debugcon_log: None,
+            qemu_log: None,
         }
     }
 
@@ -487,18 +715,125 @@ mod tests {
     }
 
     #[test]
-    fn heap_stress_builds_both_crates_with_the_feature() {
-        for command in build_commands(true) {
+    fn features_reach_both_crates() {
+        for command in build_commands(&["heap-stress", "soak"]) {
             assert!(
                 command
                     .windows(2)
-                    .any(|w| w == ["--features", "heap-stress"]),
+                    .any(|w| w == ["--features", "heap-stress,soak"]),
                 "{command:?}"
             );
         }
-        for command in build_commands(false) {
-            assert!(!command.contains(&"--features"), "{command:?}");
+        for command in build_commands(&[]) {
+            assert!(
+                !command.iter().any(|arg| arg == "--features"),
+                "{command:?}"
+            );
         }
+    }
+
+    #[test]
+    fn qemu_args_route_qemu_diagnostics_when_configured() {
+        let mut cfg = sample_config();
+        assert!(!build_qemu_args(&cfg).contains(&"-d".to_string()));
+        cfg.qemu_log = Some(PathBuf::from("target/soak-test-qemu.log"));
+        let args = build_qemu_args(&cfg);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-d", "guest_errors,cpu_reset"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-D" && w[1].ends_with("soak-test-qemu.log"))
+        );
+    }
+
+    /// A healthy soak log as the kernel writes it (trimmed).
+    fn healthy_soak_log() -> String {
+        let mut log = String::from(concat!(
+            "[ INFO]: boot\\src\\main.rs@040: HARLAN-PHASE2-POST-EXIT-OK\n",
+            "[ INFO]: kernel\\src\\lib.rs@066: HARLAN-PHASE0-BOOT-OK\n",
+            "[ INFO]: kernel\\src\\memory\\heap.rs@1: HARLAN: soak mode: heap stress rounds\n",
+        ));
+        for i in 1..=3u64 {
+            log += &format!(
+                "[ INFO]: heap.rs@2: HARLAN: soak round {i}: {} heap cycles, 0 corruption\n",
+                i * 20_000
+            );
+            log += &format!("[ INFO]: interrupts.rs@266: HARLAN: ticks={}\n", i * 100);
+        }
+        log
+    }
+
+    const TWO_RESETS: &str = "CPU Reset (CPU 0)\nEAX=00000000\nCPU Reset (CPU 0)\nEAX=00000000\n";
+
+    fn problems(log: &str, qemu_log: &str, min_ticks: u64, min_heap: u64) -> Vec<String> {
+        analyze_soak(log, qemu_log, 2, min_ticks, min_heap).unwrap_err()
+    }
+
+    #[test]
+    fn a_healthy_soak_passes_with_its_numbers() {
+        let summary = analyze_soak(&healthy_soak_log(), TWO_RESETS, 2, 300, 60_000).unwrap();
+        assert_eq!(
+            summary,
+            SoakSummary {
+                ticks: 300,
+                heap_cycles: 60_000,
+                rounds: 3
+            }
+        );
+    }
+
+    #[test]
+    fn too_little_progress_fails() {
+        let found = problems(&healthy_soak_log(), TWO_RESETS, 301, 60_001);
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn a_panic_or_an_exception_fails() {
+        for trouble in [
+            "[ERROR]: boot\\src\\panic.rs@027: HARLAN PANIC: panicked at heap.rs",
+            "[ERROR]: interrupts.rs@281: HARLAN: #GP error_code=0x0 at rip=0x1",
+        ] {
+            let log = healthy_soak_log() + trouble + "\n";
+            let found = problems(&log, TWO_RESETS, 0, 0);
+            assert!(found[0].contains("trouble"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_boot_fails() {
+        let log = healthy_soak_log() + &healthy_soak_log();
+        let found = problems(&log, TWO_RESETS, 0, 0);
+        assert!(
+            found.iter().any(|p| p.contains("logged 2 time(s)")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_boot_fails() {
+        let found = problems("", TWO_RESETS, 0, 0);
+        assert!(
+            found.iter().any(|p| p.contains("logged 0 time(s)")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn stalled_ticks_or_skipped_rounds_fail() {
+        let log = healthy_soak_log().replace("ticks=300", "ticks=200");
+        assert!(problems(&log, TWO_RESETS, 0, 0)[0].contains("ticks"));
+        let log = healthy_soak_log().replace("soak round 2:", "soak round 5:");
+        assert!(problems(&log, TWO_RESETS, 0, 0)[0].contains("consecutive"));
+    }
+
+    #[test]
+    fn a_cpu_reset_after_boot_fails() {
+        let qemu_log = format!("{TWO_RESETS}CPU Reset (CPU 0)\n");
+        let found = problems(&healthy_soak_log(), &qemu_log, 0, 0);
+        assert_eq!(found, ["1 CPU reset(s) after the kernel booted"]);
     }
 
     #[test]
