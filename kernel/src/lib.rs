@@ -7,7 +7,8 @@ mod memory;
 mod shell;
 mod sync;
 
-use harlan_hal::frame::{FRAME_SIZE, PhysRange};
+use harlan_hal::addr::PhysAddr;
+use harlan_hal::frame::{FRAME_SIZE, PhysFrame, PhysRange};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
 use harlan_hal::{Console, PowerControl};
 use memory::frame_allocator::BitmapFrameAllocator;
@@ -92,13 +93,44 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
     // withholds, so the bitmap can never be handed out as a frame.
     let mut frame_bitmap = [0u64; memory::FRAME_BITMAP_WORDS];
     let bitmap = BitmapFrameAllocator::new(&mut frame_bitmap, &boot_info.memory_map);
+    // The identity window below rests on one invariant: every frame the
+    // allocator may hand out is mapped, writable, at its own address. It
+    // was taken on faith from the map the kernel is running under; now it
+    // is asked of the live page tables, before a single frame is written.
+    // One walk per firmware page, not per frame: a 2 MiB or 1 GiB page has
+    // a single entry, so identity and writability hold for all of it.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let covered = bitmap.covered_frames();
+        let mut number = 0;
+        while number < covered {
+            let frame = PhysFrame::containing_address(PhysAddr::new(number * FRAME_SIZE));
+            // SAFETY: CR3 is still the firmware root and nothing has
+            // changed a page table yet (this runs before `take_over`);
+            // the call only reads them.
+            let run = unsafe {
+                harlan_arch_x86_64::paging::KernelPageTable::active_identity_writable_run(frame)
+            };
+            match run {
+                // `run` is a whole number of frames; `max(1)` only
+                // guarantees the loop moves.
+                Some(bytes) => number += (bytes / FRAME_SIZE).max(1),
+                None => {
+                    assert!(
+                        !bitmap.manages(frame),
+                        "the allocator would hand out {frame:?}, which the firmware does not map writable at its own address"
+                    );
+                    number += 1;
+                }
+            }
+        }
+        log::info!("HARLAN: identity window verified for {covered} covered frame(s)");
+    }
     // Every frame leaves the allocator zeroed from here on: no page table
     // can start with junk entries and no frame carries what its previous
-    // owner left in it. The window is the firmware's identity map, which
-    // `KernelPageTable::take_over` checks before anything is written.
-    // SAFETY: the identity map covers every frame the allocator can hand
-    // out (it is the map the kernel is running under, and the allocator
-    // only hands out RAM below the covered range).
+    // owner left in it.
+    // SAFETY: the loop above just proved, against the live tables, that
+    // every frame this allocator can hand out is identity-mapped writable.
     let mut frames = unsafe {
         memory::zeroed_frames::ZeroedFrames::new(
             bitmap,

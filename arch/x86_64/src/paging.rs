@@ -120,6 +120,10 @@ trait TableAccess {
 struct Translation {
     phys: u64,
     writable: bool,
+    /// Size of the page that resolved the walk (4 KiB, 2 MiB or 1 GiB).
+    /// Whoever asks about a whole range can skip to that page's end
+    /// instead of walking every frame inside it.
+    page_size: u64,
 }
 
 struct PageTables<A: TableAccess> {
@@ -179,6 +183,7 @@ impl<A: TableAccess> PageTables<A> {
                 return Some(Translation {
                     phys: base + (va & (size - 1)),
                     writable,
+                    page_size: size,
                 });
             }
             table = entry & ADDRESS_MASK;
@@ -407,6 +412,34 @@ pub struct KernelPageTable {
 }
 
 impl KernelPageTable {
+    /// How many bytes from `frame`'s start are identity-mapped writable by
+    /// the page tables in use right now, or `None` if `frame` itself is
+    /// not. This is the invariant an identity `PhysWindow` rests on, so
+    /// the kernel checks it before writing through one.
+    ///
+    /// The answer runs to the end of the page that maps `frame`, so
+    /// checking a whole range costs one walk per 2 MiB or 1 GiB page
+    /// instead of one per frame.
+    ///
+    /// # Safety
+    ///
+    /// The active CR3 must be the firmware root and its table frames must
+    /// be reachable at their physical addresses — the same precondition as
+    /// `take_over`, which this is meant to run just before.
+    pub unsafe fn active_identity_writable_run(frame: PhysFrame) -> Option<u64> {
+        let tables = PageTables {
+            root: read_cr3() & ADDRESS_MASK,
+            access: IdentityAccess,
+        };
+        let addr = frame.start_address().as_u64();
+        match tables.translate(addr) {
+            Some(t) if t.writable && t.phys == addr => {
+                Some(t.page_size - (addr & (t.page_size - 1)))
+            }
+            _ => None,
+        }
+    }
+
     /// Checks the paging mode, copies the firmware's root table into a
     /// frame from `frames` and loads it into CR3.
     ///
@@ -995,6 +1028,31 @@ mod tests {
         assert_eq!(tables.access.tables[&tables.root][0], before);
         assert_eq!(tables.translate(0x5_4321).unwrap().phys, 0x5_4321);
         assert_eq!(tables.access.flushed_all, 0);
+    }
+
+    #[test]
+    fn translate_reports_the_page_that_resolved_it() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        // Inside the firmware's 2 MiB pages, a walk that lands anywhere
+        // answers for the whole page, so a range check can skip to its end.
+        let inside = 5 * MIB + 0x123;
+        let large = tables.translate(inside).unwrap();
+        assert_eq!(
+            (large.page_size, large.phys, large.writable),
+            (LARGE_PAGE, inside, true)
+        );
+        // From a frame-aligned address the remaining run is a whole
+        // number of frames, which is how the kernel asks.
+        let aligned = 5 * MIB;
+        let run = large.page_size - (aligned & (large.page_size - 1));
+        assert_eq!(run, MIB);
+        assert_eq!(run % PAGE, 0);
+        // A 4 KiB mapping answers for 4 KiB only.
+        tables
+            .map(page(0), frame(0x50_0000), DATA, &mut frames)
+            .unwrap();
+        assert_eq!(tables.translate(page(0)).unwrap().page_size, PAGE);
     }
 
     #[test]
