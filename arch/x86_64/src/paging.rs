@@ -49,6 +49,12 @@ pub const KERNEL_STACKS_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 2 * 
 /// (docs/adr/0013-fase3-physical-window.md).
 pub const KERNEL_PHYSMAP_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 4 * (1 << 39));
 
+/// Where the firmware's runtime services are mapped once they have been
+/// told to move there: PML4 slot 261. A physical address `p` of theirs
+/// becomes `KERNEL_RUNTIME_START + p`, so filling in the map UEFI asks for
+/// is one addition (docs/adr/0016-fase3-set-virtual-address-map.md).
+pub const KERNEL_RUNTIME_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 5 * (1 << 39));
+
 /// Where the kernel's own image is mapped so that it can stop running from
 /// wherever the firmware put it: PML4 slot 259
 /// (docs/adr/0012-fase3-higher-half-kernel.md).
@@ -287,7 +293,7 @@ impl<A: TableAccess> PageTables<A> {
         if self.access.read(table, indices[3]) & PRESENT != 0 {
             return Err(MapError::AlreadyMapped);
         }
-        let mut leaf = frame.start_address().as_u64() | PRESENT;
+        let mut leaf = frame.start_address().as_u64() | PRESENT | cache_bits(flags.cache);
         if flags.writable {
             leaf |= WRITABLE;
         }

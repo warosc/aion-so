@@ -99,15 +99,20 @@ pub struct PageFlags {
     /// and a user access to it faults, which is what isolation is made of
     /// (docs/adr/0014-fase3-syscall-abi-v0.md).
     pub user: bool,
+    /// How it may be cached. RAM wants write-back; the registers of a
+    /// device do not (docs/adr/0016-fase3-set-virtual-address-map.md).
+    pub cache: CachePolicy,
 }
 
 impl PageFlags {
-    /// The kernel's own memory: never reachable from ring 3.
+    /// The kernel's own memory: never reachable from ring 3, ordinary
+    /// RAM unless told otherwise.
     pub const fn kernel(writable: bool, executable: bool) -> Self {
         Self {
             writable,
             executable,
             user: false,
+            cache: CachePolicy::WriteBack,
         }
     }
 
@@ -117,7 +122,13 @@ impl PageFlags {
             writable,
             executable,
             user: true,
+            cache: CachePolicy::WriteBack,
         }
+    }
+
+    /// The same page, cached as `cache` says.
+    pub const fn cached_as(self, cache: CachePolicy) -> Self {
+        Self { cache, ..self }
     }
 }
 
