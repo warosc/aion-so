@@ -55,10 +55,7 @@ pub fn map_with_guard(
     guard: Page,
     pages: u64,
 ) -> Result<Stack, MapError> {
-    let stack = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    let stack = PageFlags::kernel(true, false);
     let bottom = guard.start_address() + PAGE_SIZE;
     for index in 0..pages {
         let page = Page::containing_address(bottom + index * PAGE_SIZE);
@@ -105,14 +102,23 @@ fn unmap_stack(mapper: &mut dyn PageMapper, frames: &mut KernelFrames<'_>, stack
     rollback_stack(mapper, frames, stack.bottom(), stack.size() / PAGE_SIZE);
 }
 
-/// Maps the kernel stack and the double-fault stack inside the stacks area
-/// that starts at `base`, with a guard page below each one and above the
-/// last. Returns them in that order.
+/// How many pages the stack a syscall lands on gets. Same reasoning as
+/// the double-fault stack: small, but with a guard page at each end.
+pub const SYSCALL_STACK_PAGES: u64 = 4;
+
+/// Maps the kernel stack, the double-fault stack and the syscall stack
+/// inside the stacks area that starts at `base`, with a guard page below
+/// each one and above the last. Returns them in that order.
+///
+/// The syscall stack is a third one on purpose: `syscall` does not change
+/// the stack pointer, so the entry stub switches to this one, and it must
+/// not be the stack the kernel was already using — that one has frames of
+/// its own below the top (docs/adr/0014-fase3-syscall-abi-v0.md).
 pub fn map_kernel_stacks(
     mapper: &mut dyn PageMapper,
     frames: &mut KernelFrames<'_>,
     base: VirtAddr,
-) -> Result<(Stack, Stack), MapError> {
+) -> Result<(Stack, Stack, Stack), MapError> {
     let kernel = map_with_guard(
         mapper,
         frames,
@@ -132,7 +138,20 @@ pub fn map_kernel_stacks(
             return Err(err);
         }
     };
-    Ok((kernel, double_fault))
+    let syscall = match map_with_guard(
+        mapper,
+        frames,
+        Page::containing_address(double_fault.top()),
+        SYSCALL_STACK_PAGES,
+    ) {
+        Ok(stack) => stack,
+        Err(err) => {
+            unmap_stack(mapper, frames, double_fault);
+            unmap_stack(mapper, frames, kernel);
+            return Err(err);
+        }
+    };
+    Ok((kernel, double_fault, syscall))
 }
 
 #[cfg(test)]
@@ -142,7 +161,7 @@ mod tests {
     use crate::memory::zeroed_frames::{PhysWindow, ZeroedFrames};
     use harlan_hal::frame::FrameAllocator;
     use harlan_hal::frame::PhysFrame;
-    use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind};
+    use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind, RegionAttributes};
     use harlan_hal::paging::UnmapError;
     use std::collections::BTreeMap;
 
@@ -199,6 +218,7 @@ mod tests {
             start_phys_addr: PhysAddr::new(first),
             page_count: frames,
             kind: MemoryRegionKind::Usable,
+            attributes: RegionAttributes::none(),
         }));
         TestMemory {
             _buffer: buffer,
@@ -218,19 +238,22 @@ mod tests {
         let mut frames = unsafe { ZeroedFrames::new(allocator, PhysWindow::identity()) };
         let mut mapper = FakeMapper::default();
 
-        let (kernel, double_fault) = map_kernel_stacks(&mut mapper, &mut frames, BASE).unwrap();
+        let (kernel, double_fault, syscall) =
+            map_kernel_stacks(&mut mapper, &mut frames, BASE).unwrap();
 
         assert_eq!(kernel.bottom(), BASE + PAGE_SIZE);
         assert_eq!(kernel.size(), KERNEL_STACK_PAGES * PAGE_SIZE);
         assert_eq!(double_fault.bottom(), kernel.top() + PAGE_SIZE);
         assert_eq!(double_fault.size(), DOUBLE_FAULT_STACK_PAGES * PAGE_SIZE);
+        assert_eq!(syscall.bottom(), double_fault.top() + PAGE_SIZE);
+        assert_eq!(syscall.size(), SYSCALL_STACK_PAGES * PAGE_SIZE);
 
         // The guard pages: below each stack, and above the last one.
-        for guard in [BASE, kernel.top(), double_fault.top()] {
+        for guard in [BASE, kernel.top(), double_fault.top(), syscall.top()] {
             assert_eq!(mapper.translate(guard), None, "{guard:#x} is not a guard");
         }
-        // Every byte of both stacks is mapped, writable and not executable.
-        for stack in [kernel, double_fault] {
+        // Every byte of every stack is mapped, writable and not executable.
+        for stack in [kernel, double_fault, syscall] {
             for page in 0..stack.size() / PAGE_SIZE {
                 let addr = stack.bottom() + page * PAGE_SIZE;
                 assert!(mapper.translate(addr).is_some(), "{addr:#x} not mapped");
@@ -255,7 +278,7 @@ mod tests {
         distinct.dedup();
         assert_eq!(
             used.len(),
-            (KERNEL_STACK_PAGES + DOUBLE_FAULT_STACK_PAGES) as usize
+            (KERNEL_STACK_PAGES + DOUBLE_FAULT_STACK_PAGES + SYSCALL_STACK_PAGES) as usize
         );
         assert_eq!(distinct.len(), used.len(), "a frame was mapped twice");
     }

@@ -7,17 +7,24 @@ mod image;
 mod memory;
 mod panic;
 mod power;
+mod runtime;
 
 use console_hw::HardwareConsole;
+use harlan_hal::info;
 use power::UefiPower;
 use uefi::boot;
 use uefi::prelude::*;
 
 #[entry]
 fn efi_main() -> Status {
+    // The kernel's log sink, from the first line: the `log` crate's
+    // logger can only be registered once, and both halves of that pointer
+    // would name this image, which the kernel later stops mapping
+    // (docs/adr/0013-fase3-physical-window.md).
+    harlan_kernel::klog::install();
     uefi::helpers::init().unwrap();
 
-    log::info!("HARLAN OS - Fase 2 boot");
+    info!("HARLAN OS - Fase 2 boot");
 
     // The GOP protocol is a Boot Services object: it can only be queried
     // now. What it describes (the framebuffer memory) outlives the exit.
@@ -43,7 +50,7 @@ fn efi_main() -> Status {
     // transition (verified against its source, not assumed) — so this
     // line proves the transition itself succeeded, independent of
     // anything that follows.
-    log::info!("HARLAN-PHASE2-POST-EXIT-OK");
+    info!("HARLAN-PHASE2-POST-EXIT-OK");
 
     // SAFETY: writing 0xFF to the PIC's mask ports only reduces which IRQ
     // lines can reach the CPU; see `harlan_arch_x86_64::pic::mask_all`'s own
@@ -57,11 +64,16 @@ fn efi_main() -> Status {
     }
 
     let memory_map = memory::build_memory_map(&uefi_memory_map);
+    // The kernel decides when the firmware moves; the map it will need is
+    // kept here until then (ADR 0016).
+    // SAFETY: single-threaded boot path, before the kernel starts.
+    unsafe { runtime::remember(uefi_memory_map) };
     let boot_info = harlan_kernel::BootInfo {
         memory_map,
         kernel_image: kernel_image.as_ref().map(|image| image.range),
         kernel_code: kernel_image.as_ref().and_then(|image| image.code),
         framebuffer: framebuffer_range,
+        relocate_runtime: Some(runtime::relocate),
     };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
     // was current when it was queried, and nothing changes the display

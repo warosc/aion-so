@@ -53,6 +53,11 @@ impl<S: Surface> TextConsole<S> {
         }
     }
 
+    /// The surface, to tell it something only its owner knows.
+    pub fn surface_mut(&mut self) -> &mut S {
+        &mut self.surface
+    }
+
     pub fn write_str(&mut self, s: &str) {
         for byte in s.bytes() {
             self.put_byte(byte);
@@ -175,6 +180,17 @@ impl FramebufferSurface {
             cols,
             rows,
         })
+    }
+
+    /// Draws into the same framebuffer through a new address.
+    ///
+    /// # Safety
+    ///
+    /// `base` must name the same framebuffer this surface was built for,
+    /// mapped for volatile reads and writes of the size `new` checked, and
+    /// stay valid for as long as this surface is used.
+    pub unsafe fn rebase(&mut self, base: VirtAddr) {
+        self.base = base.as_ptr::<u32>();
     }
 
     fn put_pixel(&mut self, x: usize, y: usize, color: u32) {

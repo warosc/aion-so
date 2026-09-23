@@ -4,35 +4,57 @@
 
 use crate::addr::{PhysAddr, VirtAddr};
 use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame, PhysRange};
+use crate::memory_map::CachePolicy;
 
-/// A range that must stay executable in a map, and whether it must also
-/// stay writable.
+/// A range that has to stay mapped, and how.
 ///
-/// The kernel's own code does not: mapping it read-only is the other half
-/// of write xor execute. The firmware's runtime services code does —
-/// OVMF writes inside it, and `shutdown` faults with
-/// `#PF ... error_code=0x3` if that range is read-only (measured; see
-/// docs/adr/0011-fase2-write-xor-execute-inside-the-image.md).
+/// The kernel's own code is executable and never written: mapping it
+/// read-only is the other half of write xor execute. The firmware's
+/// runtime services code is executable **and** written — OVMF writes
+/// inside it, and `shutdown` faults with `#PF ... error_code=0x3` if that
+/// range is read-only (measured; see
+/// docs/adr/0011-fase2-write-xor-execute-inside-the-image.md). And what
+/// that code reads and writes is data: writable, never executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutableRange {
+pub struct MappedRange {
     pub range: PhysRange,
     pub writable: bool,
+    pub executable: bool,
+    /// How it may be cached. Mapping memory-mapped I/O write-back would
+    /// corrupt whatever is behind it, so this travels with the range
+    /// instead of being assumed.
+    pub cache: CachePolicy,
 }
 
-impl ExecutableRange {
-    /// Code the kernel controls: executable, never written.
-    pub const fn read_only(range: PhysRange) -> Self {
+impl MappedRange {
+    /// Code the kernel controls: executable, never written, ordinary RAM.
+    pub const fn read_only_code(range: PhysRange) -> Self {
         Self {
             range,
             writable: false,
+            executable: true,
+            cache: CachePolicy::WriteBack,
         }
     }
 
     /// Code someone else controls and writes into.
-    pub const fn writable(range: PhysRange) -> Self {
+    pub const fn writable_code(range: PhysRange, cache: CachePolicy) -> Self {
         Self {
             range,
             writable: true,
+            executable: true,
+            cache,
+        }
+    }
+
+    /// What that code reads and writes: its own data, or the registers of
+    /// a device it talks to.
+    pub const fn data(range: PhysRange, cache: CachePolicy) -> Self {
+        Self {
+            range,
+            writable: true,
+            executable: false,
+            cache,
         }
     }
 }
@@ -73,6 +95,41 @@ impl Page {
 pub struct PageFlags {
     pub writable: bool,
     pub executable: bool,
+    /// Reachable from ring 3. Without it the page belongs to the kernel
+    /// and a user access to it faults, which is what isolation is made of
+    /// (docs/adr/0014-fase3-syscall-abi-v0.md).
+    pub user: bool,
+    /// How it may be cached. RAM wants write-back; the registers of a
+    /// device do not (docs/adr/0016-fase3-set-virtual-address-map.md).
+    pub cache: CachePolicy,
+}
+
+impl PageFlags {
+    /// The kernel's own memory: never reachable from ring 3, ordinary
+    /// RAM unless told otherwise.
+    pub const fn kernel(writable: bool, executable: bool) -> Self {
+        Self {
+            writable,
+            executable,
+            user: false,
+            cache: CachePolicy::WriteBack,
+        }
+    }
+
+    /// A process's memory.
+    pub const fn user(writable: bool, executable: bool) -> Self {
+        Self {
+            writable,
+            executable,
+            user: true,
+            cache: CachePolicy::WriteBack,
+        }
+    }
+
+    /// The same page, cached as `cache` says.
+    pub const fn cached_as(self, cache: CachePolicy) -> Self {
+        Self { cache, ..self }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

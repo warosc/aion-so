@@ -12,7 +12,14 @@ use harlan_hal::addr::VirtAddr;
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const TSS_SELECTOR: u16 = 0x18;
+/// Ring 3, and in this order because `sysretq` says so: it loads `SS` from
+/// `STAR[63:48] + 8` and `CS` from `STAR[63:48] + 16`, both forced to
+/// RPL 3 (docs/adr/0014-fase3-syscall-abi-v0.md).
+pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
+pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
+/// What `STAR[63:48]` holds: `USER_DATA_SELECTOR - 8`, without its RPL.
+pub const SYSRET_SELECTOR_BASE: u16 = 0x10;
+pub const TSS_SELECTOR: u16 = 0x28;
 
 /// Index into `TaskStateSegment::ist` (IST1) reserved for the double-fault
 /// handler, so it always runs on a known-good stack even if the current
@@ -20,6 +27,13 @@ pub const TSS_SELECTOR: u16 = 0x18;
 pub const DOUBLE_FAULT_IST_INDEX: u8 = 1;
 
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+
+/// Builds a flat (base=0, limit=max) code or data segment descriptor for
+/// ring 3. Same shape as the kernel's, with DPL 3.
+pub(crate) const fn flat_user_descriptor(executable: bool, long_mode: bool) -> u64 {
+    const DPL_RING3: u64 = 3 << 5;
+    flat_descriptor(executable, true, long_mode) | (DPL_RING3 << 40)
+}
 
 /// Builds a flat (base=0, limit=max) code or data segment descriptor.
 ///
@@ -120,6 +134,8 @@ struct Gdt {
     null: u64,
     kernel_code: u64,
     kernel_data: u64,
+    user_data: u64,
+    user_code: u64,
     tss_low: u64,
     tss_high: u64,
 }
@@ -128,6 +144,9 @@ static mut GDT: Gdt = Gdt {
     null: 0,
     kernel_code: flat_descriptor(true, true, true),
     kernel_data: flat_descriptor(false, true, false),
+    // Data first, then code: the order `sysretq` reads them in.
+    user_data: flat_user_descriptor(false, false),
+    user_code: flat_user_descriptor(true, true),
     tss_low: 0,
     tss_high: 0,
 };
@@ -136,6 +155,33 @@ static mut GDT: Gdt = Gdt {
 struct DescriptorTablePointer {
     limit: u16,
     base: u64,
+}
+
+/// Points `RSP0` of the TSS at `top`.
+///
+/// This is the stack the CPU switches to when it takes an interrupt or an
+/// exception **while ring 3 is running**: there is no other. Left at zero,
+/// the first timer tick after entering user mode pushes onto address 0 and
+/// the machine triple faults without a word (measured, which is how this
+/// function came to exist).
+///
+/// # Safety
+///
+/// `top` must be the top of a mapped, writable stack of the kernel's own
+/// that nothing else uses while user code runs, and it must stay mapped
+/// for as long as the kernel runs. Single core.
+pub unsafe fn set_kernel_stack(top: VirtAddr) {
+    // SAFETY: writes one `u64` of the TSS, which the CPU only reads when
+    // it switches rings; single core, and the caller vouches for the
+    // stack. Unaligned for the same reason as IST1: the field is at an
+    // offset the 64-bit TSS does not align.
+    unsafe {
+        (&raw mut TSS)
+            .cast::<u8>()
+            .add(RSP0_OFFSET)
+            .cast::<u64>()
+            .write_unaligned(top.as_u64());
+    }
 }
 
 /// Points the double-fault handler's IST entry at `top`, the top
@@ -166,6 +212,10 @@ pub unsafe fn set_double_fault_stack(top: VirtAddr) {
 
 /// Byte offset of `ist[0]` (IST1) inside `TaskStateSegment`.
 const IST1_OFFSET: usize = core::mem::offset_of!(TaskStateSegment, ist);
+
+/// Where `rsp[0]` sits inside the TSS: the stack the CPU switches to on
+/// entry from ring 3.
+const RSP0_OFFSET: usize = core::mem::offset_of!(TaskStateSegment, rsp);
 
 /// Builds the GDT/TSS, loads them, and switches every segment register to
 /// the new flat selectors.
@@ -310,10 +360,42 @@ mod tests {
         );
     }
 
+    /// `sysretq` loads `SS` from `STAR[63:48] + 8` and `CS` from
+    /// `+ 16`, so the user descriptors have to sit in that order, at DPL 3.
+    #[test]
+    fn the_user_segments_sit_where_sysret_looks_for_them() {
+        assert_eq!(USER_DATA_SELECTOR & !3, SYSRET_SELECTOR_BASE + 8);
+        assert_eq!(USER_CODE_SELECTOR & !3, SYSRET_SELECTOR_BASE + 16);
+        assert_eq!(USER_DATA_SELECTOR & 3, 3, "ring 3");
+        assert_eq!(USER_CODE_SELECTOR & 3, 3, "ring 3");
+
+        // And they are where the selectors say inside the table.
+        let offset = |selector: u16| (selector & !3) as usize;
+        let gdt = &raw const GDT;
+        // SAFETY: reading the static GDT's bytes, single-threaded test.
+        let bytes = unsafe { core::slice::from_raw_parts(gdt.cast::<u8>(), size_of::<Gdt>()) };
+        let entry = |selector: u16| {
+            let at = offset(selector);
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+        };
+        let dpl = |descriptor: u64| (descriptor >> 45) & 3;
+        assert_eq!(dpl(entry(KERNEL_CODE_SELECTOR)), 0);
+        assert_eq!(dpl(entry(USER_DATA_SELECTOR)), 3);
+        assert_eq!(dpl(entry(USER_CODE_SELECTOR)), 3);
+        // The code segment is the 64-bit one; the data segment is not.
+        let long_mode = |descriptor: u64| (descriptor >> 53) & 1;
+        assert_eq!(long_mode(entry(USER_CODE_SELECTOR)), 1);
+        assert_eq!(long_mode(entry(USER_DATA_SELECTOR)), 0);
+    }
+
     #[test]
     fn task_state_segment_is_104_bytes() {
         assert_eq!(size_of::<TaskStateSegment>(), 104);
         assert_eq!(IST1_OFFSET, 36);
         assert_ne!(IST1_OFFSET % align_of::<u64>(), 0);
+        // Four reserved bytes, then the three ring stacks. Unaligned for
+        // the same reason.
+        assert_eq!(RSP0_OFFSET, 4);
+        assert_ne!(RSP0_OFFSET % align_of::<u64>(), 0);
     }
 }

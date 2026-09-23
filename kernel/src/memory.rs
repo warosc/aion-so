@@ -5,6 +5,7 @@
 pub mod frame_allocator;
 pub mod heap;
 pub mod higher_half;
+pub mod runtime;
 pub mod stacks;
 pub mod zeroed_frames;
 
@@ -18,6 +19,7 @@ use harlan_hal::addr::{PhysAddr, VirtAddr};
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame};
 use harlan_hal::memory_map::MemoryMap;
 use harlan_hal::paging::{MapError, PAGE_SIZE, Page, PageFlags, PageMapper, UnmapError};
+use harlan_hal::{info, warn};
 use zeroed_frames::{KernelFrames, ZeroedFrames};
 
 /// Size of the boot frame allocator's bitmap, in 64-frame words: 1024
@@ -120,7 +122,7 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: VirtAddr) {
     if before < 2 {
         // Not a broken allocator, just no memory to spare: say so and move
         // on (the round trip below needs two frames).
-        log::warn!("HARLAN: frame allocator self-test skipped: fewer than 2 free frames");
+        warn!("HARLAN: frame allocator self-test skipped: fewer than 2 free frames");
         return;
     }
     let a = frames
@@ -172,7 +174,7 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: VirtAddr) {
     assert_eq!(frames.deallocate_as(reused, FramePurpose::Kernel), Ok(()));
     assert_eq!(frames.deallocate_as(b, FramePurpose::Kernel), Ok(()));
     assert_eq!(frames.free_frames(), before);
-    log::info!("HARLAN: frame allocator self-test OK (frames arrive zeroed)");
+    info!("HARLAN: frame allocator self-test OK (frames arrive zeroed)");
 }
 
 /// Records what the frames behind `[start, start + len)` are used for, by
@@ -212,13 +214,10 @@ pub fn paging_self_test(
     test_page: Page,
 ) {
     let Some(frame) = frames.allocate() else {
-        log::warn!("HARLAN: page mapper self-test skipped: no free frame");
+        warn!("HARLAN: page mapper self-test skipped: no free frame");
         return;
     };
-    let data = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    let data = PageFlags::kernel(true, false);
     // SAFETY: `frame` was just allocated, so nothing else uses it; the only
     // other access is the deliberate read through its identity address
     // below.
@@ -253,5 +252,5 @@ pub fn paging_self_test(
         Err(UnmapError::NotMapped)
     );
     assert_eq!(frames.deallocate_as(frame, FramePurpose::Kernel), Ok(()));
-    log::info!("HARLAN: page mapper self-test OK");
+    info!("HARLAN: page mapper self-test OK");
 }

@@ -1,3 +1,4 @@
+use harlan_hal::info;
 use harlan_hal::{Console, ConsoleKey, PowerControl};
 
 /// Logged once the shell starts polling for input. Grepped by
@@ -13,7 +14,7 @@ const PROMPT: &str = crate::identity::SHELL_PROMPT;
 const LINE_MAX: usize = 128;
 
 pub fn run_shell(console: &mut dyn Console, power: &dyn PowerControl) -> ! {
-    log::info!("{SHELL_READY_MARKER}");
+    info!("{SHELL_READY_MARKER}");
     let mut buf = [0u8; LINE_MAX];
     loop {
         console.write_str(PROMPT);

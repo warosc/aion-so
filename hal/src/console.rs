@@ -22,4 +22,20 @@ pub trait Console {
     fn write_str(&mut self, s: &str);
 
     fn clear(&mut self);
+
+    /// The memory this console draws into can be reached at `base` now.
+    ///
+    /// The kernel moves the window it sees physical memory through
+    /// (docs/adr/0013-fase3-physical-window.md), and a console that holds
+    /// a pointer into the framebuffer has to be told. One that draws
+    /// nowhere ignores it.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the first byte of the same framebuffer, mapped for
+    /// volatile reads and writes of at least the size it was created with,
+    /// and it must stay so for as long as the console lives.
+    unsafe fn framebuffer_moved(&mut self, base: crate::addr::VirtAddr) {
+        let _ = base;
+    }
 }

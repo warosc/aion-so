@@ -6,4 +6,3 @@ publish = false
 
 [dependencies]
 harlan-hal = { path = "../../hal" }
-log = "0.4"

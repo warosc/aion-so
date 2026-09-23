@@ -128,10 +128,7 @@ unsafe fn map_alias(
             // executable and writable, as it was before ADR 0011.
             None => (true, false),
         };
-        let flags = PageFlags {
-            writable: !only_code,
-            executable: runs_code,
-        };
+        let flags = PageFlags::kernel(!only_code, runs_code);
         // SAFETY: the frames are the image's own, which the allocator has
         // always withheld, and this range of kernel space is used by
         // nothing else (the caller's contract).
@@ -160,11 +157,14 @@ unsafe fn relocate(image: PhysRange, delta: u64) -> Result<u64, MoveError> {
         )
     };
     let relocations = pe::relocations(bytes).map_err(MoveError::Image)?;
+
+    // `pe::relocations` settled that every one of these is inside the
+    // image before handing out the first: relocating is all or nothing,
+    // because an image half moved would then be run from the address it
+    // no longer agrees with.
     let mut applied = 0;
     for rva in relocations.iter() {
-        if rva + 8 > image.len {
-            return Err(MoveError::Image(PeError::Truncated));
-        }
+        debug_assert!(rva + 8 <= image.len);
         let slot = VirtAddr::new(image.start.as_u64() + rva).as_ptr::<u64>();
         // SAFETY: `slot` is inside the image, which is mapped writable,
         // and the relocation table says it holds an absolute address. The
@@ -273,27 +273,18 @@ mod tests {
         for offset in [0, PAGE_SIZE] {
             assert_eq!(
                 flags_at(offset),
-                PageFlags {
-                    writable: false,
-                    executable: true
-                },
+                PageFlags::kernel(false, true),
                 "the page at {offset:#x} is nothing but code"
             );
         }
         assert_eq!(
             flags_at(2 * PAGE_SIZE),
-            PageFlags {
-                writable: true,
-                executable: true
-            },
+            PageFlags::kernel(true, true),
             "code and data share this page, so it stays writable"
         );
         assert_eq!(
             flags_at(3 * PAGE_SIZE),
-            PageFlags {
-                writable: true,
-                executable: false
-            },
+            PageFlags::kernel(true, false),
             "plain data"
         );
         // Every page of the image is mapped to its own frame, in order.
@@ -318,10 +309,7 @@ mod tests {
         for offset in [0, PAGE_SIZE] {
             assert_eq!(
                 mapper.mapped[&(BASE + offset)].1,
-                PageFlags {
-                    writable: true,
-                    executable: true
-                }
+                PageFlags::kernel(true, true)
             );
         }
     }

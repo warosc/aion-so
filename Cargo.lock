@@ -263,7 +263,6 @@ name = "harlan-arch-x86_64"
 version = "0.0.1"
 dependencies = [
  "harlan-hal",
- "log",
 ]
 
 [[package]]
@@ -274,8 +273,8 @@ dependencies = [
  "harlan-fbcon",
  "harlan-hal",
  "harlan-kernel",
- "log",
  "uefi",
+ "uefi-raw",
 ]
 
 [[package]]
@@ -296,7 +295,6 @@ version = "0.0.1"
 dependencies = [
  "harlan-arch-x86_64",
  "harlan-hal",
- "log",
 ]
 
 [[package]]

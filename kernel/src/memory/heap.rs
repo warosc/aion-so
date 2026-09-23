@@ -15,6 +15,7 @@ use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
 use super::frame_allocator::FramePurpose;
 use super::zeroed_frames::KernelFrames;
 use crate::sync::IrqLock;
+use harlan_hal::{error, info, warn};
 
 /// Fixed for Fase 2: the heap is mapped once at boot and never grows.
 pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
@@ -91,25 +92,22 @@ pub fn init<I: InterruptControl>(
     frames: &mut KernelFrames<'_>,
     start: Page,
 ) -> usize {
-    let data = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    let data = PageFlags::kernel(true, false);
     let mut mapped = 0;
     while mapped < HEAP_SIZE {
         let page = Page::containing_address(start.start_address() + mapped as u64);
         let Some(frame) = frames.allocate_for(FramePurpose::Heap) else {
-            log::warn!("HARLAN: heap: out of frames after {mapped} bytes");
+            warn!("HARLAN: heap: out of frames after {mapped} bytes");
             break;
         };
         // SAFETY: `frame` is fresh from the allocator, so nothing else uses
         // it; the heap's range of kernel space is used by the heap alone.
         if let Err(err) = unsafe { mapper.map(page, frame, data, frames) } {
-            log::warn!("HARLAN: heap: mapping stopped after {mapped} bytes: {err:?}");
+            warn!("HARLAN: heap: mapping stopped after {mapped} bytes: {err:?}");
             // Never mapped: it goes straight back. Saying so out loud,
             // because a frame that cannot be returned is a leak.
             if let Err(err) = frames.deallocate_as(frame, FramePurpose::Heap) {
-                log::error!("HARLAN: heap: the unused frame could not be returned: {err:?}");
+                error!("HARLAN: heap: the unused frame could not be returned: {err:?}");
             }
             break;
         }
@@ -239,12 +237,12 @@ pub const SOAK_ROUND_CYCLES: u64 = 20_000;
 /// Logs a running total after every round; any corruption panics.
 #[cfg(target_arch = "x86_64")]
 pub fn soak() -> ! {
-    log::info!("HARLAN: soak mode: heap stress rounds instead of the shell");
+    info!("HARLAN: soak mode: heap stress rounds instead of the shell");
     let (mut round, mut total) = (0u64, 0u64);
     loop {
         round += 1;
         total += stress(&HEAP, SOAK_ROUND_CYCLES, 0x534F_414B ^ round).cycles;
-        log::info!("HARLAN: soak round {round}: {total} heap cycles, 0 corruption");
+        info!("HARLAN: soak round {round}: {total} heap cycles, 0 corruption");
     }
 }
 
@@ -281,7 +279,7 @@ pub fn self_test(heap_start: VirtAddr, heap_bytes: usize) {
     drop((numbers, boxed, text));
 
     let report = stress(&HEAP, STRESS_CYCLES, 0x4841_524C_414E);
-    log::info!(
+    info!(
         "HARLAN: heap stress complete, {} cycles, 0 corruption (peak {} live bytes; after: {} hole(s), {} of {} bytes free)",
         report.cycles,
         report.peak_live_bytes,
