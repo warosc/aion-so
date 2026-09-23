@@ -812,12 +812,25 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // Two processes, each with a space of its own and a kernel stack
-        // of its own, taking turns (ADR 0017 and ADR 0018).
+        // Four processes, each with a space of its own and a kernel stack
+        // of its own. Two say who they are and take turns (ADR 0017 and
+        // ADR 0018); the other two exchange a message, which is what
+        // Fase 3 set out to show (ADR 0019).
+        //
+        // The receiver is spawned **before** the sender on purpose: round
+        // robin reaches it first, it finds an empty mailbox and parks, and
+        // the sender is what wakes it. The other order would never wait.
+        const RECEIVER_SLOT: u8 = 2;
+        let talking_one = user::talker_program(b'1');
+        let talking_two = user::talker_program(b'2');
+        let receiving = user::receiver_program();
+        let sending = user::sender_program(RECEIVER_SLOT);
+        let programs: [&[u8]; 4] = [&talking_one, &talking_two, &receiving, &sending];
+
         let mut next_stack = syscall_stack.top();
         let mut started = 0;
         let mut first_entry = None;
-        for which in 0..2 {
+        for (which, program) in programs.iter().enumerate() {
             let stack = memory::stacks::map_with_guard(
                 &mut context.mapper,
                 &mut context.frames,
@@ -831,14 +844,8 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             next_stack = stack.top();
             // SAFETY: the kernel owns its tables and reaches frames
             // through its own window; nothing else uses what this takes.
-            let spawned = unsafe {
-                process::spawn(
-                    &mut context.mapper,
-                    &mut context.frames,
-                    &user::program_for(b'1' + which as u8),
-                    stack,
-                )
-            };
+            let spawned =
+                unsafe { process::spawn(&mut context.mapper, &mut context.frames, program, stack) };
             match spawned {
                 Ok(process) => {
                     let entry = process.entry();
@@ -846,7 +853,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                     match (first_entry, here) {
                         (None, _) => first_entry = here,
                         (Some(before), Some(now)) if before != now => info!(
-                            "HARLAN: {entry:#x} is {before} in one process and {now} in the other: different memory, same address"
+                            "HARLAN: {entry:#x} is {before} in one process and {now} in another: different memory, same address"
                         ),
                         (before, now) => error!(
                             "HARLAN: the processes do not have separate memory at {entry:#x} ({before:?}, {now:?})"
@@ -856,10 +863,16 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                     // SAFETY: `spawn` built it, and its kernel stack is
                     // its own.
                     match unsafe { scheduler::add(process) } {
-                        Some(slot) => {
+                        // The sender was built naming a slot, so a
+                        // process that lands somewhere else would be
+                        // sending to a stranger.
+                        Some(slot) if slot == which => {
                             info!("HARLAN: process {which} runs in slot {slot}");
                             started += 1;
                         }
+                        Some(slot) => error!(
+                            "HARLAN: process {which} landed in slot {slot}, not the one it was built for"
+                        ),
                         None => error!("HARLAN: no room in the scheduler for process {which}"),
                     }
                 }
