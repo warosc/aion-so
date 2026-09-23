@@ -6,15 +6,22 @@
 //! process, out of the switch it made last time
 //! (docs/adr/0018-fase3-context-switch.md).
 //!
-//! Round robin over a fixed list. With two processes and a 100 Hz timer,
-//! anything else would be decoration.
+//! Round robin over a fixed list. With a handful of processes and a 100 Hz
+//! timer, anything else would be decoration.
+//!
+//! Since there are messages (docs/adr/0019-fase3-ipc-v0.md) a process can
+//! be alive and still not be given the CPU: one waiting for a message
+//! keeps its slot and its memory and gets no turns until somebody writes
+//! to its mailbox. `State::can_run` is where that distinction lives.
 
 use harlan_hal::addr::VirtAddr;
-use harlan_hal::info;
+use harlan_hal::frame::PhysRange;
+use harlan_hal::{error, info};
 
+use crate::ipc::{self, Delivery, Mailbox, TakeError};
 use crate::process::Process;
 
-/// How many processes there can be at once. Two is what Fase 3 needs; the
+/// How many processes there can be at once. Four is what Fase 3 runs; the
 /// limit is here so that running out is an error and not a `Vec` growing
 /// inside an interrupt handler.
 pub const MAX_PROCESSES: usize = 8;
@@ -24,9 +31,33 @@ pub enum State {
     /// Never run: its stack is prepared for a first switch.
     New,
     Runnable,
+    /// Waiting for a message (ADR 0019). It exists, it is alive, and it
+    /// does not get turns until somebody writes to its mailbox.
+    Blocked,
     /// Left through `exit`. Its memory is gone; its slot stays so that
     /// nothing reuses its id while the log still mentions it.
     Dead,
+}
+
+impl State {
+    /// Whether a process in this state can be handed the CPU.
+    pub fn can_run(self) -> bool {
+        matches!(self, State::New | State::Runnable)
+    }
+
+    /// What waiting for a message turns this state into, or `None` when a
+    /// process in it has no business waiting: the dead, and one that is
+    /// already waiting.
+    pub fn waiting(self) -> Option<State> {
+        self.can_run().then_some(State::Blocked)
+    }
+
+    /// And what a message arriving turns it into. Only a process that was
+    /// waiting is woken: a message for one that is running changes
+    /// nothing about whose turn it is.
+    pub fn woken(self) -> Option<State> {
+        (self == State::Blocked).then_some(State::Runnable)
+    }
 }
 
 /// What the scheduler keeps about each process.
@@ -38,6 +69,10 @@ pub struct Slot {
     /// The top of that stack, which is what the CPU needs to know when it
     /// enters the kernel from ring 3.
     pub kernel_stack_top: VirtAddr,
+    /// Where a message sent to it waits. In the kernel's memory, so that
+    /// it is reachable whichever space is active
+    /// (docs/adr/0019-fase3-ipc-v0.md).
+    pub mailbox: Mailbox,
 }
 
 /// The whole scheduler: who exists, and who is running.
@@ -90,15 +125,55 @@ impl Scheduler {
 
     /// Marks the running process as gone.
     pub fn kill_current(&mut self) {
-        if let Some(slot) = self.slots[self.current].as_mut() {
+        self.kill(self.current);
+    }
+
+    /// Marks one process as gone, wherever it is.
+    pub fn kill(&mut self, index: usize) {
+        if let Some(slot) = self.slots.get_mut(index).and_then(Option::as_mut) {
             slot.state = State::Dead;
         }
     }
 
-    /// Who runs after `from`, skipping the dead. `None` when nobody else
-    /// can.
+    /// Stops giving turns to the process in `index`, which is waiting for
+    /// a message. Answers whether it was there to be stopped.
+    pub fn block(&mut self, index: usize) -> bool {
+        self.move_to(index, State::waiting)
+    }
+
+    /// Gives it turns again, a message having arrived.
+    pub fn unblock(&mut self, index: usize) -> bool {
+        self.move_to(index, State::woken)
+    }
+
+    /// Moves the process in `index` to wherever `transition` says, and
+    /// answers whether there was one and it went.
+    fn move_to(&mut self, index: usize, transition: fn(State) -> Option<State>) -> bool {
+        match self.slots.get_mut(index).and_then(Option::as_mut) {
+            Some(slot) => match transition(slot.state) {
+                Some(state) => {
+                    slot.state = state;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// How many are waiting for a message.
+    pub fn blocked(&self) -> usize {
+        self.states()
+            .iter()
+            .flatten()
+            .filter(|state| **state == State::Blocked)
+            .count()
+    }
+
+    /// Who runs after `from`, skipping those that cannot. `None` when
+    /// nobody else can.
     pub fn next_after(&self, from: usize) -> Option<usize> {
-        next_alive(&self.states(), from)
+        next_runnable(&self.states(), from)
     }
 
     /// How many processes are still alive.
@@ -127,15 +202,16 @@ impl Scheduler {
     }
 }
 
-/// Who runs after `from`, skipping the dead and wrapping round.
+/// Who runs after `from`, skipping whoever cannot run — the dead and
+/// whoever is waiting for a message — and wrapping round.
 ///
 /// Pure, so that the order — the whole of the policy — is testable
 /// without processes, page tables or stacks.
-pub fn next_alive(states: &[Option<State>], from: usize) -> Option<usize> {
+pub fn next_runnable(states: &[Option<State>], from: usize) -> Option<usize> {
     let len = states.len();
     (1..=len)
         .map(|step| (from + step) % len)
-        .find(|&index| states[index].is_some_and(|state| state != State::Dead))
+        .find(|&index| states[index].is_some_and(State::can_run))
 }
 
 // ---------------------------------------------------------------------
@@ -189,6 +265,7 @@ pub unsafe fn add(process: &'static mut Process) -> Option<usize> {
         state: State::New,
         kernel_rsp,
         kernel_stack_top,
+        mailbox: Mailbox::new(),
     })
 }
 
@@ -223,8 +300,20 @@ pub unsafe fn run_until_empty(kernel_cr3: u64) {
     // around the swap.
     unsafe { harlan_arch_x86_64::switch::switch(&raw mut KERNEL_RSP, rsp, cr3) };
     // SAFETY: back in the kernel, with no process running.
-    unsafe { the_scheduler() }.handed_over = false;
-    info!("HARLAN: every process has exited; the kernel has the CPU back");
+    let scheduler = unsafe { the_scheduler() };
+    scheduler.handed_over = false;
+    // Nobody can run. Whoever is still waiting for a message would wait
+    // for ever, so the kernel says so and gives it up (ADR 0019,
+    // point 7); its memory goes back with the rest.
+    for index in 0..MAX_PROCESSES {
+        if scheduler.state(index) == Some(State::Blocked) {
+            error!(
+                "HARLAN: the process in slot {index} is still waiting for a message that will not come"
+            );
+            scheduler.kill(index);
+        }
+    }
+    info!("HARLAN: every process is gone; the kernel has the CPU back");
 }
 
 /// Tells the CPU where the process in `index` enters the kernel. The
@@ -240,6 +329,37 @@ fn prepare_cpu_for(scheduler: &Scheduler, index: usize) {
         harlan_arch_x86_64::set_kernel_stack(slot.kernel_stack_top);
         harlan_arch_x86_64::syscall::set_kernel_stack(slot.kernel_stack_top.as_u64());
     }
+}
+
+/// The switch itself, from the process in `from` to the one in `to`.
+/// `yield`, `exit` and waiting for a message all end here, so that there
+/// is one place where a stack is left and another taken up.
+///
+/// # Safety
+///
+/// Both slots must hold a process, `to` must be able to run, and this must
+/// be called with interrupts off from somewhere that can be resumed later:
+/// a syscall handler or the timer handler.
+unsafe fn switch_to(scheduler: &mut Scheduler, from: usize, to: usize) {
+    scheduler.switching = true;
+    scheduler.current = to;
+    let (next_rsp, next_cr3) = {
+        let slot = scheduler.slots[to].as_ref().expect("the slot just found");
+        (slot.kernel_rsp, slot.process.space.root())
+    };
+    prepare_cpu_for(scheduler, to);
+    let save_to = &raw mut scheduler.slots[from]
+        .as_mut()
+        .expect("the process leaving")
+        .kernel_rsp;
+    // SAFETY: both are kernel stacks of processes, `next_cr3` is the
+    // incoming one's tables — whose higher half holds this code — and
+    // interrupts are off.
+    unsafe { harlan_arch_x86_64::switch::switch(save_to, next_rsp, next_cr3) };
+    // Back here as `from`, whenever its turn comes round again. The
+    // borrow above went with the other stack, so this asks again.
+    // SAFETY: as above.
+    unsafe { the_scheduler() }.switching = false;
 }
 
 /// Gives the CPU to whoever is next, and comes back when this process's
@@ -264,25 +384,9 @@ pub unsafe fn switch_to_next() {
     if next == current {
         return;
     }
-    scheduler.switching = true;
-    scheduler.current = next;
-    let (next_rsp, next_cr3) = {
-        let slot = scheduler.slots[next].as_ref().expect("the slot just found");
-        (slot.kernel_rsp, slot.process.space.root())
-    };
-    prepare_cpu_for(scheduler, next);
-    let save_to = &raw mut scheduler.slots[current]
-        .as_mut()
-        .expect("the running process")
-        .kernel_rsp;
-    // SAFETY: both are kernel stacks of processes, `next_cr3` is the
-    // incoming one's tables — whose higher half holds this code — and
-    // interrupts are off.
-    unsafe { harlan_arch_x86_64::switch::switch(save_to, next_rsp, next_cr3) };
-    // Back here as `current`, whenever its turn comes round again. The
-    // binding above is gone with the other stack, so this asks again.
-    // SAFETY: as above.
-    unsafe { the_scheduler() }.switching = false;
+    // SAFETY: as this function's contract; `next` can run and is not
+    // `current`.
+    unsafe { switch_to(scheduler, current, next) };
 }
 
 /// Marks the running process as gone and gives the CPU away for good.
@@ -298,19 +402,9 @@ pub unsafe fn exit_current(code: u64) {
     info!("HARLAN: the process in slot {current} exited with {code}");
     match scheduler.next_after(current) {
         Some(next) if next != current => {
-            scheduler.current = next;
-            let (next_rsp, next_cr3) = {
-                let slot = scheduler.slots[next].as_ref().expect("the slot just found");
-                (slot.kernel_rsp, slot.process.space.root())
-            };
-            prepare_cpu_for(scheduler, next);
-            let save_to = &raw mut scheduler.slots[current]
-                .as_mut()
-                .expect("the running process")
-                .kernel_rsp;
-            // SAFETY: as in `switch_to_next`. This one never returns: the
-            // process is dead and nothing switches back into it.
-            unsafe { harlan_arch_x86_64::switch::switch(save_to, next_rsp, next_cr3) };
+            // SAFETY: as in `switch_to_next`. This one never comes back:
+            // the process is dead and nothing switches into it again.
+            unsafe { switch_to(scheduler, current, next) };
         }
         _ => {
             // SAFETY: as above.
@@ -395,32 +489,221 @@ unsafe extern "C" fn run_first(_argument: *mut u8) -> ! {
     unsafe { crate::user::enter(process) }
 }
 
+// ---------------------------------------------------------------------
+// Messages between processes (docs/adr/0019-fase3-ipc-v0.md)
+// ---------------------------------------------------------------------
+
+/// What the syscall handler needs to know about the process it is
+/// serving: which slot it is, and what memory it owns. Copied out rather
+/// than borrowed, so that the handler can go on to touch the scheduler —
+/// and so that the checks it makes are testable without a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Running {
+    pub slot: usize,
+    pub ranges: [PhysRange; 2],
+}
+
+impl Running {
+    /// Whether `[ptr, ptr + len)` is memory this process owns (ADR 0014,
+    /// point 9).
+    pub fn owns(&self, ptr: u64, len: u64) -> bool {
+        crate::process::owned_by(&self.ranges, ptr, len)
+    }
+}
+
+/// Who has the CPU, if anyone. The one answer to that question: a second
+/// copy of it somewhere else is a copy that goes stale on the next switch.
+///
+/// # Safety
+///
+/// As `the_scheduler`.
+pub unsafe fn running() -> Option<Running> {
+    // SAFETY: forwarded from this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    if !scheduler.handed_over {
+        return None;
+    }
+    let slot = scheduler.current;
+    let held = scheduler.slots[slot].as_ref()?;
+    if held.state == State::Dead {
+        return None;
+    }
+    Some(Running {
+        slot,
+        ranges: [held.process.code, held.process.stack],
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// Nothing in that slot, or what was there has exited.
+    NoSuchProcess,
+    /// Its mailbox already holds a message nobody has read.
+    Busy,
+    /// Not a message a mailbox can hold.
+    Rejected(ipc::DeliverError),
+}
+
+/// Puts `message` in the mailbox of the process in `to`, and gives it
+/// turns again if it was waiting for one.
+///
+/// # Safety
+///
+/// As `the_scheduler`. `message` must be readable: the sender's own
+/// memory, checked by the caller, in the space that is active.
+pub unsafe fn deliver(to: usize, from: usize, message: &[u8]) -> Result<Delivery, SendError> {
+    // SAFETY: forwarded from this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    let slot = scheduler
+        .slots
+        .get_mut(to)
+        .and_then(Option::as_mut)
+        .ok_or(SendError::NoSuchProcess)?;
+    if slot.state == State::Dead {
+        return Err(SendError::NoSuchProcess);
+    }
+    let delivery = slot
+        .mailbox
+        .deliver(from, message)
+        .map_err(|err| match err {
+            ipc::DeliverError::Busy => SendError::Busy,
+            other => SendError::Rejected(other),
+        })?;
+    // One way to wake a process, wherever the waking comes from.
+    scheduler.unblock(to);
+    Ok(delivery)
+}
+
+/// Takes the message waiting for whoever is running into `into`.
+///
+/// # Safety
+///
+/// As `the_scheduler`. `into` must be writable memory of the running
+/// process, checked by the caller, in the space that is active.
+pub unsafe fn take_message(into: &mut [u8]) -> Result<Delivery, TakeError> {
+    // SAFETY: forwarded from this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    let current = scheduler.current;
+    match scheduler.slots[current].as_mut() {
+        Some(slot) => slot.mailbox.take_into(into),
+        None => Err(TakeError::Nothing),
+    }
+}
+
+/// Parks whoever is running until somebody writes to its mailbox, and
+/// comes back once somebody has.
+///
+/// Answers `false`, having parked nobody, when nobody else could ever
+/// write it: a wait with no end is worse than an error (ADR 0019,
+/// point 7).
+///
+/// # Safety
+///
+/// From the syscall handler, with interrupts off, while a process is
+/// running.
+pub unsafe fn wait_for_message() -> bool {
+    // SAFETY: as this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    let current = scheduler.current;
+    match scheduler.next_after(current) {
+        Some(next) if next != current => {
+            if !scheduler.block(current) {
+                return false;
+            }
+            // SAFETY: as this function's contract; `next` can run, and it
+            // is not the process being parked.
+            unsafe { switch_to(scheduler, current, next) };
+            true
+        }
+        // Nobody else can run, so nobody could ever deliver.
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harlan_hal::addr::PhysAddr;
+    use harlan_hal::paging::PAGE_SIZE;
 
-    /// The turn goes round, skips the dead, and comes back.
+    /// The turn goes round, skips whoever cannot run, and comes back.
     #[test]
-    fn the_turn_goes_round_and_skips_the_dead() {
+    fn the_turn_goes_round_and_skips_whoever_cannot_run() {
         let mut states = [None; MAX_PROCESSES];
         states[0] = Some(State::Runnable);
         states[2] = Some(State::New);
         states[5] = Some(State::Dead);
 
-        assert_eq!(next_alive(&states, 0), Some(2));
-        assert_eq!(next_alive(&states, 2), Some(0), "round, not forward only");
-        assert_eq!(next_alive(&states, 5), Some(0), "the dead do not run");
-        assert_eq!(next_alive(&states, 7), Some(0));
+        assert_eq!(next_runnable(&states, 0), Some(2));
+        assert_eq!(
+            next_runnable(&states, 2),
+            Some(0),
+            "round, not forward only"
+        );
+        assert_eq!(next_runnable(&states, 5), Some(0), "the dead do not run");
+        assert_eq!(next_runnable(&states, 7), Some(0));
 
         // A process still gets its own turn when it is the last one.
         let mut alone = [None; MAX_PROCESSES];
         alone[3] = Some(State::Runnable);
-        assert_eq!(next_alive(&alone, 3), Some(3));
+        assert_eq!(next_runnable(&alone, 3), Some(3));
 
         // And when there is nobody, there is nobody.
-        assert_eq!(next_alive(&[None; MAX_PROCESSES], 0), None);
+        assert_eq!(next_runnable(&[None; MAX_PROCESSES], 0), None);
         let all_dead = [Some(State::Dead); MAX_PROCESSES];
-        assert_eq!(next_alive(&all_dead, 0), None);
+        assert_eq!(next_runnable(&all_dead, 0), None);
+    }
+
+    /// Waiting for a message is being alive and not being runnable, which
+    /// is the distinction the whole of IPC rests on: a blocked process
+    /// keeps its memory and its slot, and gets no turns.
+    #[test]
+    fn whoever_waits_for_a_message_gets_no_turns() {
+        let mut states = [None; MAX_PROCESSES];
+        states[0] = Some(State::Runnable);
+        states[1] = Some(State::Blocked);
+        states[2] = Some(State::Runnable);
+
+        assert_eq!(next_runnable(&states, 0), Some(2), "1 is waiting");
+        assert_eq!(next_runnable(&states, 2), Some(0));
+        // Even asked directly, and even as the only one left.
+        assert_eq!(next_runnable(&states, 1), Some(2));
+        let mut only_waiting = [None; MAX_PROCESSES];
+        only_waiting[4] = Some(State::Blocked);
+        assert_eq!(
+            next_runnable(&only_waiting, 4),
+            None,
+            "nobody can run, which is what makes it a deadlock to report"
+        );
+
+        assert!(State::New.can_run());
+        assert!(State::Runnable.can_run());
+        assert!(!State::Blocked.can_run());
+        assert!(!State::Dead.can_run());
+    }
+
+    /// Who may start waiting, and who may be woken. A process that needs
+    /// a slot to exist cannot be tested here, so the rule itself is kept
+    /// where it can be.
+    #[test]
+    fn only_some_states_can_start_or_stop_waiting() {
+        assert_eq!(State::New.waiting(), Some(State::Blocked));
+        assert_eq!(State::Runnable.waiting(), Some(State::Blocked));
+        assert_eq!(
+            State::Blocked.waiting(),
+            None,
+            "already waiting: waiting twice would park it for ever"
+        );
+        assert_eq!(State::Dead.waiting(), None, "the dead do not wait");
+
+        assert_eq!(State::Blocked.woken(), Some(State::Runnable));
+        assert_eq!(State::New.woken(), None, "it had not started waiting");
+        assert_eq!(State::Runnable.woken(), None);
+        assert_eq!(
+            State::Dead.woken(),
+            None,
+            "a message does not bring anyone back"
+        );
     }
 
     /// A tick that arrives before the kernel has handed the CPU over, or
@@ -446,6 +729,39 @@ mod tests {
         let scheduler = Scheduler::new();
         assert_eq!(scheduler.next_after(0), None);
         assert_eq!(scheduler.alive(), 0);
+        assert_eq!(scheduler.blocked(), 0);
         assert_eq!(scheduler.state(0), None);
+    }
+
+    /// Blocking, unblocking and killing a slot that is not there must
+    /// answer no rather than reaching past the array.
+    #[test]
+    fn a_slot_that_is_not_there_cannot_be_blocked_or_woken() {
+        let mut scheduler = Scheduler::new();
+        assert!(!scheduler.block(0));
+        assert!(!scheduler.unblock(0));
+        assert!(!scheduler.block(MAX_PROCESSES));
+        assert!(!scheduler.unblock(MAX_PROCESSES + 100));
+        scheduler.kill(MAX_PROCESSES);
+        assert_eq!(scheduler.state(0), None);
+    }
+
+    /// What the syscall handler checks every pointer against, without a
+    /// process — which would need page tables.
+    #[test]
+    fn the_handler_only_trusts_the_running_process_s_own_memory() {
+        let running = Running {
+            slot: 1,
+            ranges: [
+                PhysRange::new(PhysAddr::new(0x0040_0000), PAGE_SIZE),
+                PhysRange::new(PhysAddr::new(0x0050_0000), PAGE_SIZE),
+            ],
+        };
+        assert!(running.owns(0x0040_0000, 8), "its code");
+        assert!(running.owns(0x0050_0000, PAGE_SIZE), "its whole stack");
+        assert!(!running.owns(0x0040_0000, PAGE_SIZE + 1), "past the page");
+        assert!(!running.owns(0x0045_0000, 8), "the gap between the two");
+        assert!(!running.owns(0xFFFF_8000_0000_0000, 8), "the kernel's half");
+        assert!(!running.owns(0x0040_0000, 0), "nothing at all");
     }
 }
