@@ -13,7 +13,7 @@ pub mod user;
 
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame, PhysRange};
-use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
+use harlan_hal::memory_map::{CachePolicy, MemoryMap, MemoryRegionKind};
 use harlan_hal::paging::MappedRange;
 use harlan_hal::{Console, PowerControl};
 use harlan_hal::{error, info, warn};
@@ -532,7 +532,11 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // The headers could not be read: the whole image stays
         // executable, and writable, which is what the kernel did before
         // ADR 0011. Its data lives in there too.
-        None => executable.extend(context.kernel_image.map(MappedRange::writable_code)),
+        None => executable.extend(
+            context
+                .kernel_image
+                .map(|image| MappedRange::writable_code(image, CachePolicy::WriteBack)),
+        ),
     }
     let mut ranges_sound = true;
     for region in context
@@ -546,10 +550,10 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             // Writable: OVMF writes inside its own runtime code, and
             // `shutdown` faults with `#PF error_code=0x3` if this range is
             // read-only (measured; ADR 0011).
-            Some(len) => executable.push(MappedRange::writable_code(PhysRange::new(
-                region.start_phys_addr,
-                len,
-            ))),
+            Some(len) => executable.push(MappedRange::writable_code(
+                PhysRange::new(region.start_phys_addr, len),
+                region.attributes.cache,
+            )),
             None => {
                 ranges_sound = false;
                 error!(
@@ -592,33 +596,46 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
     // there at all: only the firmware's own code stays, at the addresses
     // it was compiled for (ADR 0013).
     let own_tables = if let (Some(window), true) = (context.physmap, ranges_sound) {
-        // Everything of the firmware's that a runtime call touches: its
-        // code, and the data that code keeps between calls. Leaving the
-        // data out faults on `shutdown` (measured).
-        let mut firmware: alloc::vec::Vec<_> = executable
-            .iter()
-            .copied()
-            .filter(|code| code.writable)
-            .collect();
+        // Everything the firmware still needs: UEFI asks for every
+        // descriptor carrying EFI_MEMORY_RUNTIME to stay mapped, whatever
+        // its type — the memory-mapped I/O a runtime service talks to
+        // carries it too — and with the caching it was reported with.
+        let mut firmware: alloc::vec::Vec<harlan_hal::paging::MappedRange> = alloc::vec::Vec::new();
         let mut every_range_sound = true;
         for region in context
             .map
             .iter()
-            .filter(|region| region.kind == MemoryRegionKind::RuntimeData)
+            .filter(|region| region.attributes.runtime)
         {
-            match region.page_count.checked_mul(FRAME_SIZE) {
-                Some(len) => firmware.push(harlan_hal::paging::MappedRange::data(PhysRange::new(
-                    region.start_phys_addr,
-                    len,
-                ))),
-                None => {
-                    every_range_sound = false;
-                    error!(
-                        "HARLAN: the RuntimeData region at {} claims {} pages, which overflows",
-                        region.start_phys_addr, region.page_count
-                    );
-                }
-            }
+            let Some(len) = region.page_count.checked_mul(FRAME_SIZE) else {
+                every_range_sound = false;
+                error!(
+                    "HARLAN: the runtime region at {} claims {} pages, which overflows",
+                    region.start_phys_addr, region.page_count
+                );
+                continue;
+            };
+            let range = PhysRange::new(region.start_phys_addr, len);
+            let cache = region.attributes.cache;
+            let executable = region.kind == MemoryRegionKind::RuntimeCode;
+            info!(
+                "HARLAN: the firmware keeps {}..{} ({} KiB, {}, {cache:?})",
+                range.start,
+                range.end(),
+                range.len / 1024,
+                if executable { "code" } else { "data" }
+            );
+            firmware.push(if executable {
+                harlan_hal::paging::MappedRange::writable_code(range, cache)
+            } else {
+                harlan_hal::paging::MappedRange::data(range, cache)
+            });
+        }
+        // A map with a hole in it cannot say what may go: the region that
+        // was dropped might be one the firmware needs.
+        if !context.map.is_complete() {
+            every_range_sound = false;
+            error!("HARLAN: the firmware's memory map was truncated, so nothing here is complete");
         }
         // Emptying the lower half without everything a runtime call needs
         // would turn `shutdown` into a fault, so a map that cannot be

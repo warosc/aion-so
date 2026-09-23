@@ -161,7 +161,7 @@ mod tests {
     use crate::memory::zeroed_frames::{PhysWindow, ZeroedFrames};
     use harlan_hal::frame::FrameAllocator;
     use harlan_hal::frame::PhysFrame;
-    use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind};
+    use harlan_hal::memory_map::{MemoryMap, MemoryRegion, MemoryRegionKind, RegionAttributes};
     use harlan_hal::paging::UnmapError;
     use std::collections::BTreeMap;
 
@@ -218,6 +218,7 @@ mod tests {
             start_phys_addr: PhysAddr::new(first),
             page_count: frames,
             kind: MemoryRegionKind::Usable,
+            attributes: RegionAttributes::none(),
         }));
         TestMemory {
             _buffer: buffer,

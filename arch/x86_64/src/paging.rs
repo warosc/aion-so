@@ -23,6 +23,7 @@ use core::arch::asm;
 
 use harlan_hal::addr::{PhysAddr, VirtAddr};
 use harlan_hal::frame::{FrameAllocator, PhysFrame};
+use harlan_hal::memory_map::CachePolicy;
 use harlan_hal::paging::{MapError, MappedRange, Page, PageFlags, PageMapper, UnmapError};
 
 /// First address of kernel space: PML4 slot 256, the start of the
@@ -67,6 +68,11 @@ const PRESENT: u64 = 1 << 0;
 /// Reachable from ring 3. Every level of the walk has to have it.
 const USER: u64 = 1 << 2;
 const WRITABLE: u64 = 1 << 1;
+/// Page-level write-through (PWT) and cache disable (PCD). With the
+/// default PAT, neither set means write-back, PWT alone write-through and
+/// both together uncacheable.
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 /// In a PDPT or PD entry: this entry maps a 1 GiB or 2 MiB page itself.
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
@@ -128,6 +134,19 @@ pub struct IdentityMapStats {
     /// mapped read-only. A page that mixes code and data cannot be, so
     /// the two numbers differ if any section is not page-aligned.
     pub read_only_pages: u64,
+}
+
+/// The page-table bits that reproduce a cache policy.
+///
+/// Write-combining needs the PAT reprogrammed, which this kernel does not
+/// do; until it does, a range that asked for it is mapped uncacheable —
+/// slower, never wrong.
+const fn cache_bits(policy: CachePolicy) -> u64 {
+    match policy {
+        CachePolicy::WriteBack | CachePolicy::Unspecified => 0,
+        CachePolicy::WriteThrough => WRITE_THROUGH,
+        CachePolicy::WriteCombining | CachePolicy::Uncacheable => CACHE_DISABLE | WRITE_THROUGH,
+    }
 }
 
 /// How the walker reaches table memory, given a table's physical address.
@@ -526,7 +545,7 @@ impl<A: TableAccess> PageTables<A> {
                         entry & ADDRESS_MASK
                     };
                 }
-                let mut leaf = page | PRESENT;
+                let mut leaf = page | PRESENT | cache_bits(code.cache);
                 if code.writable {
                     leaf |= WRITABLE;
                 }
@@ -1425,8 +1444,8 @@ mod tests {
             .keep_only(
                 &mut frames,
                 &[
-                    MappedRange::writable_code(firmware),
-                    MappedRange::data(data),
+                    MappedRange::writable_code(firmware, CachePolicy::WriteBack),
+                    MappedRange::data(data, CachePolicy::WriteBack),
                 ],
             )
             .expect("keeping the firmware");
@@ -1457,13 +1476,57 @@ mod tests {
         }
     }
 
+    /// Memory-mapped I/O the firmware talks to has to keep the caching
+    /// it was reported with: write-back there would corrupt the device
+    /// behind it.
+    #[test]
+    fn what_stays_mapped_keeps_the_caching_it_was_reported_with() {
+        let mut frames = Frames(vec![
+            0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000, 0x40_5000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        let mmio = PhysRange::new(PhysAddr::new(0x60_0000), PAGE);
+        let ram = PhysRange::new(PhysAddr::new(0x60_1000), PAGE);
+        tables
+            .keep_only(
+                &mut frames,
+                &[
+                    MappedRange::data(mmio, CachePolicy::Uncacheable),
+                    MappedRange::data(ram, CachePolicy::WriteBack),
+                ],
+            )
+            .expect("keeping both");
+
+        let device = leaf_entry(&tables, mmio.start.as_u64());
+        assert_ne!(device & CACHE_DISABLE, 0, "the device must not be cached");
+        assert_ne!(device & WRITE_THROUGH, 0);
+        let memory = leaf_entry(&tables, ram.start.as_u64());
+        assert_eq!(
+            memory & (CACHE_DISABLE | WRITE_THROUGH),
+            0,
+            "RAM is write-back"
+        );
+
+        // Write-combining is not available until the PAT is reprogrammed,
+        // so it is mapped uncacheable: slower, never wrong.
+        assert_eq!(
+            cache_bits(CachePolicy::WriteCombining),
+            cache_bits(CachePolicy::Uncacheable)
+        );
+        assert_eq!(cache_bits(CachePolicy::WriteThrough), WRITE_THROUGH);
+        assert_eq!(cache_bits(CachePolicy::Unspecified), 0);
+    }
+
     #[test]
     fn keeping_a_range_that_is_not_in_the_lower_half_is_refused() {
         let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000]);
         let mut tables = adopted(&mut frames);
         let too_high = PhysRange::new(PhysAddr::new(512 * GIB), PAGE);
         assert_eq!(
-            tables.keep_only(&mut frames, &[MappedRange::writable_code(too_high)]),
+            tables.keep_only(
+                &mut frames,
+                &[MappedRange::writable_code(too_high, CachePolicy::WriteBack)]
+            ),
             Err(PagingError::RequiredRangeOutsideIdentityMap)
         );
     }
@@ -1506,7 +1569,11 @@ mod tests {
         ]);
         let mut tables = adopted(&mut frames);
         let stats = tables
-            .rebuild_identity(&mut frames, GIB, &[MappedRange::writable_code(firmware)])
+            .rebuild_identity(
+                &mut frames,
+                GIB,
+                &[MappedRange::writable_code(firmware, CachePolicy::WriteBack)],
+            )
             .unwrap();
         assert_eq!((stats.executable_pages, stats.read_only_pages), (2, 0));
         for addr in [firmware.start.as_u64(), firmware.end().as_u64() - PAGE] {

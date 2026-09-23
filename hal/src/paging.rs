@@ -4,6 +4,7 @@
 
 use crate::addr::{PhysAddr, VirtAddr};
 use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame, PhysRange};
+use crate::memory_map::CachePolicy;
 
 /// A range that has to stay mapped, and how.
 ///
@@ -19,33 +20,41 @@ pub struct MappedRange {
     pub range: PhysRange,
     pub writable: bool,
     pub executable: bool,
+    /// How it may be cached. Mapping memory-mapped I/O write-back would
+    /// corrupt whatever is behind it, so this travels with the range
+    /// instead of being assumed.
+    pub cache: CachePolicy,
 }
 
 impl MappedRange {
-    /// Code the kernel controls: executable, never written.
+    /// Code the kernel controls: executable, never written, ordinary RAM.
     pub const fn read_only_code(range: PhysRange) -> Self {
         Self {
             range,
             writable: false,
             executable: true,
+            cache: CachePolicy::WriteBack,
         }
     }
 
     /// Code someone else controls and writes into.
-    pub const fn writable_code(range: PhysRange) -> Self {
+    pub const fn writable_code(range: PhysRange, cache: CachePolicy) -> Self {
         Self {
             range,
             writable: true,
             executable: true,
+            cache,
         }
     }
 
-    /// What that code keeps between calls.
-    pub const fn data(range: PhysRange) -> Self {
+    /// What that code reads and writes: its own data, or the registers of
+    /// a device it talks to.
+    pub const fn data(range: PhysRange, cache: CachePolicy) -> Self {
         Self {
             range,
             writable: true,
             executable: false,
+            cache,
         }
     }
 }

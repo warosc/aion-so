@@ -466,6 +466,7 @@ mod tests {
                 start_phys_addr: PhysAddr::new(start_phys_addr),
                 page_count,
                 kind,
+                attributes: harlan_hal::memory_map::RegionAttributes::none(),
             }));
         }
         map
