@@ -46,6 +46,15 @@ static SINK: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Safe to call again whenever the address of the code changes: that is
 /// the whole point.
+///
+/// **With more than one core this is not enough.** `Release`/`Acquire`
+/// keeps the pointer itself intact, but one core can load the old sink,
+/// another publish a new one and unmap the code the first is about to
+/// jump to. Stronger orderings do not fix that — it is a lifetime
+/// problem, not an ordering one. Whoever moves the kernel's image will
+/// have to stop the other cores first, or wait for a grace period in
+/// which none of them is inside a sink. Raised by Codex reviewing
+/// Incremento 17.
 pub fn set_sink(sink: Sink) {
     SINK.store(sink as usize, Ordering::Release);
 }

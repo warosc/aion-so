@@ -7,6 +7,68 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 19 — El mapa del firmware, entero y con sus atributos
+
+`docs/adr/0015-fase3-runtime-memory-map.md`. Sale de la **revisión cruzada
+de Codex** de los PRs #23 y #24: tres hallazgos suyos, dos de ellos altos,
+y ninguno visible desde las pruebas que había.
+
+### Lo que encontró Codex
+
+1. **Conservábamos por tipo, no por atributo.** Lo que obliga a mantener un
+   rango mapeado es `EFI_MEMORY_RUNTIME`, que también llevan descriptores de
+   otros tipos. En QEMU se estaba descartando
+   `0xFFC0_0000..0x1_0000_0000`: 4 MiB de flash del firmware, uncacheable.
+   Y los atributos de caché no viajaban, así que un MMIO acabaría
+   write-back, que corrompe lo que haya detrás.
+2. **Un mapa truncado se trataba como completo**, y con él se decidía qué
+   desmapear.
+3. **La relocalización escribía y validaba a la vez**: un destino malo a
+   mitad de tabla dejaba la imagen medio reubicada, y el camino de vuelta
+   pretendía seguir desde la dirección vieja.
+4. **`klog` bajo SMP** necesita quiescencia, no ordenaciones: un núcleo
+   puede cargar el sumidero viejo mientras otro desmapea el código al que
+   va a saltar. Con un núcleo basta; queda escrito en el contrato.
+
+### Qué hace
+
+- `hal::memory_map::classify_attributes` traduce el campo crudo del
+  descriptor —`runtime` y la caché— al lado del `classify_memory_type` que
+  ya existía: puro y probado en host, con el cargador pasando solo bits.
+- La caché se elige por **lo más permisivo que el firmware ofrezca**,
+  porque el campo lista capacidades: la RAM queda write-back y el MMIO,
+  que solo anuncia uncacheable, queda uncacheable.
+- Las tablas la reproducen con PWT/PCD. Write-combining exige reprogramar
+  el PAT; hasta entonces se mapea uncacheable —más lento, nunca incorrecto.
+- Se conserva **todo** rango con el bit runtime, y el arranque registra
+  cada uno con su tamaño, tipo y caché.
+- `MemoryMap` recuerda si se truncó, y entonces **no se vacía nada**.
+- `pe::relocations` valida que cada dirección quepa en la imagen **antes**
+  de entregar la primera: relocalizar es todo o nada.
+
+### Verificación ejecutada
+
+- Host: 215 pruebas en verde.
+- QEMU: pasan de 5 a **6 rangos conservados** en 10 tablas, con el MMIO
+  uncacheable que antes se perdía:
+  `the firmware keeps 0xffc00000..0x100000000 (4096 KiB, data, Uncacheable)`.
+- `boot-test --repeat 10` 10/10, soak 120 s PASS, `shutdown` apaga,
+  `reboot` rearranca, ring 3 sigue entrando y saliendo.
+- Mutación: 6, las 6 detectadas. Dos solo lo fueron **después** de mover la
+  traducción de atributos de `boot` —que no tiene pruebas de host— a `hal`.
+  Ese movimiento es la lección: lo que no se puede probar en host, no vive
+  en el cargador.
+
+### Riesgos y límites
+
+- Write-combining sigue mapeándose uncacheable.
+- La elección de caché es una heurística sobre una lista de capacidades; si
+  algún firmware anuncia write-back en un rango que no lo tolera, esto lo
+  creería.
+- Y el de siempre, ahora con fecha: los runtime services viven en lo que va
+  a ser espacio de usuario. Lo cierra `SetVirtualAddressMap` en el
+  Incremento 20.
+
 ## Incremento 18 — Ring 3
 
 `docs/adr/0014-fase3-syscall-abi-v0.md`. Por fin corre algo sin
