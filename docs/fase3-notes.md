@@ -1,11 +1,121 @@
 # Notas de Fase 3 — Procesos y aislamiento
 
 Lo más reciente arriba. Salida de la fase (ROADMAP.md): dos procesos
-aislados se comunican sin compartir memoria no autorizada.
+aislados se comunican sin compartir memoria no autorizada. **Cumplida en
+el Incremento 24**: el mensaje cruza porque el kernel lo copia, la misma
+dirección es memoria distinta en cada proceso, y los cuatro intentos de
+salirse de ahí acaban con el proceso que los hizo y con nadie más.
 
 Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
+
+## Incremento 24 — Aislamiento demostrado: la salida de Fase 3
+
+`docs/adr/0020-fase3-a-fault-belongs-to-the-process.md`. Dos procesos
+aislados ya se comunican (Incremento 23). Faltaba la otra mitad de lo que
+"aislado" significa: que uno pueda portarse mal sin arrastrar a nadie.
+
+Hasta aquí no era así. Toda excepción terminaba en `halt()`, así que un
+programa de usuario que leyera una dirección que no era suya paraba la
+máquina entera. Y de los 32 vectores de excepción, solo seis tenían
+puerta: alcanzar cualquiera de los otros —`ud2` ocupa dos bytes— daba un
+`#GP` cuyo código de error nombraba un selector de segmento sin relación
+con lo ocurrido.
+
+### Qué hace
+
+- **Quién causó la falta lo dice la CPU**: los dos bits bajos del `CS` que
+  apiló la interrupción. `came_from_ring_3` es una función con nombre y con
+  prueba, fijada contra los selectores que la GDT usa de verdad, porque es
+  entera la diferencia entre "lo hizo el proceso" y "lo hizo el kernel".
+- **Si fue ring 3, el proceso termina** y la CPU pasa al siguiente, por el
+  mismo camino que `exit`. El marco que dejó la excepción en su pila de
+  kernel se abandona con ella; nadie la reanuda.
+- **Si fue ring 0, la máquina se para donde está.** Una falta dentro del
+  kernel no tiene a quién culpar.
+- **`arch` sigue sin saber qué es un proceso**: la falta se entrega por
+  puntero a función, como el reloj. Hasta que el kernel lo instala, una
+  falta en ring 3 para la máquina igual que antes.
+- **Los 32 vectores tienen puerta** y el despachador los nombra. Qué
+  vectores llevan código de error está escrito dos veces, en sitios
+  distintos —la lista que genera los stubs y una función que copia la tabla
+  6-1 del SDM— y una prueba las compara: equivocarse ahí desplaza ocho
+  bytes todo el marco.
+- **Cuatro programas nuevos que intentan lo que no debe funcionar**: leer
+  memoria del kernel, escribir en su propia página de código, ejecutar su
+  pila, y entregarle al kernel un puntero a la mitad alta. Cada uno es un
+  proceso, porque lo primero que intenta es lo último que hace.
+
+### Verificación ejecutada: la salida de fase
+
+Ocho procesos en un arranque. Cuatro trabajan, cuatro delinquen, y lo que
+se demuestra no es que cada intento falle, sino que los otros acaban su
+trabajo después, en una máquina que sigue viva.
+
+- `0xffff818000016b00 is kernel code, mapped at 0xddc1b00`: la dirección a
+  la que apuntan dos de los intrusos es memoria del kernel real, mapeada,
+  con algo dentro. Sin eso, no leerla no probaría nada.
+- Leer esa dirección desde ring 3: `#PF error_code=0x5` —presente, en modo
+  usuario— y `the process in slot 4 caused #PF page fault (...); it does
+  not run again`. La página existe y ring 3 no la alcanza.
+- Escribir en su propio código: `#PF error_code=0x7` —presente, escritura,
+  usuario—. W^X vale también para el usuario.
+- Saltar a su propia pila: `#PF accessing 0x500000, error_code=0x15,
+  rip=0x500000` —presente, usuario, búsqueda de instrucción—. La escritura
+  sí funcionó, era su pila; la ejecución no. Es la otra mitad de W^X.
+- Entregarle al kernel un puntero a la mitad alta:
+  `syscall log(0xffff818000016b00, 8) is not this process's memory`, y
+  **el proceso sigue vivo**: sale con código 2, el número de la negativa.
+  Una negativa vista desde el otro lado es una respuesta, no un choque.
+- Y mientras: los dos que hablan registran sus dos líneas y salen con 7, y
+  el mensaje cruza igual que antes (`slot 2 took 55 byte(s) sent by slot
+  3`, `this crossed from one address space to another`, `exited with 3`).
+  `48 frame(s) back`, seis por proceso, los de los muertos incluidos.
+- Host: 243 pruebas en verde (236 + 7: las puertas, los nombres, los
+  códigos de error, el discriminador de ring 3 y los cuatro intrusos).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+
+### Pruebas negativas
+
+Tres sondas temporales, revertidas después:
+
+1. **Una falta en el kernel, con todos los procesos ya muertos**:
+   `#PF accessing 0xffff8f0000000000, error_code=0x0` —supervisor— sin
+   línea de atribución y sin llegar al shell. La máquina se para.
+2. **Una falta en el kernel *con un proceso corriendo***, metida dentro de
+   `log`: `PROBE faulting inside the kernel, on behalf of slot 0`, y otra
+   vez `#PF error_code=0x0` sin culpar a nadie y sin shell. Es la sonda que
+   prueba el discriminador: si decidiera por "¿hay un proceso corriendo?"
+   en vez de por el nivel de privilegio, aquí habría matado a la ranura 0 y
+   habría seguido con el kernel roto.
+3. **Un proceso que ejecuta basura**: `#UD invalid opcode (vector=6)`,
+   nombrado y atribuido, solo ese proceso muere, los demás acaban y el
+   arranque llega al shell. Vector 6 no tenía puerta hasta este incremento.
+
+### Mutación
+
+10, las 10 detectadas. Dos de ellas sobre el discriminador —invertirlo, y
+hacerlo decidir por el descriptor en vez de por el RPL— que es lo que
+obligó a sacarlo a una función con nombre: dentro de un `if` no había nada
+que una prueba de host pudiera alcanzar.
+
+### Riesgos y límites
+
+- **Sin señales**: un proceso no puede enterarse de su propia falta ni
+  decidir qué hacer con ella. Hace falta un formato de marco, una pila
+  alternativa y un camino de vuelta a ring 3; nada de eso se diseña bien
+  con programas escritos a mano en hexadecimal.
+- **Sin memoria bajo demanda**: ninguna falta se resuelve mapeando algo y
+  reintentando, porque no hay nada que mapear.
+- Una falta se registra dos veces: la línea de `arch`, que dice lo que vio
+  la CPU, y la del kernel, que dice de quién era.
+- Las tablas de páginas de un proceso muerto siguen sin liberarse: cinco
+  marcos por proceso, y ahora son ocho procesos. Es lo primero que hay que
+  arreglar de la deuda de Fase 3.
+- El `#MC` (machine check) se trata como todo lo demás. Si llega desde ring
+  3, mata al proceso, y una comprobación de máquina no es culpa del
+  proceso. Queda dicho; hace falta hardware real para que importe.
 
 ## Incremento 23 — IPC mínimo: un mensaje cruza de un espacio a otro
 
