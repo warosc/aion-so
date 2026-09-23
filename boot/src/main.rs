@@ -9,15 +9,21 @@ mod panic;
 mod power;
 
 use console_hw::HardwareConsole;
+use harlan_hal::info;
 use power::UefiPower;
 use uefi::boot;
 use uefi::prelude::*;
 
 #[entry]
 fn efi_main() -> Status {
+    // The kernel's log sink, from the first line: the `log` crate's
+    // logger can only be registered once, and both halves of that pointer
+    // would name this image, which the kernel later stops mapping
+    // (docs/adr/0013-fase3-physical-window.md).
+    harlan_kernel::klog::install();
     uefi::helpers::init().unwrap();
 
-    log::info!("HARLAN OS - Fase 2 boot");
+    info!("HARLAN OS - Fase 2 boot");
 
     // The GOP protocol is a Boot Services object: it can only be queried
     // now. What it describes (the framebuffer memory) outlives the exit.
@@ -43,7 +49,7 @@ fn efi_main() -> Status {
     // transition (verified against its source, not assumed) — so this
     // line proves the transition itself succeeded, independent of
     // anything that follows.
-    log::info!("HARLAN-PHASE2-POST-EXIT-OK");
+    info!("HARLAN-PHASE2-POST-EXIT-OK");
 
     // SAFETY: writing 0xFF to the PIC's mask ports only reduces which IRQ
     // lines can reach the CPU; see `harlan_arch_x86_64::pic::mask_all`'s own

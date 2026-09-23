@@ -92,6 +92,17 @@ impl<A: FrameAllocator> ZeroedFrames<A> {
         }
     }
 
+    /// Points the kernel at physical memory somewhere else.
+    ///
+    /// # Safety
+    ///
+    /// Every frame this allocator may hand out must be mapped, readable
+    /// and writable, through `window`, and nothing else may be using that
+    /// range. The caller has just proved it by mapping the window.
+    pub unsafe fn set_window(&mut self, window: PhysWindow) {
+        self.window = window;
+    }
+
     pub fn window(&self) -> PhysWindow {
         self.window
     }

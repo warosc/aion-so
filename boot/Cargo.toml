@@ -9,9 +9,8 @@ heap-stress = ["harlan-kernel/heap-stress"]
 soak = ["harlan-kernel/soak"]
 
 [dependencies]
-log = "0.4"
 harlan-kernel = { path = "../kernel" }
-uefi = { version = "0.40.0", features = ["logger", "log-debugcon"] }
+uefi = { version = "0.40.0" }
 harlan-hal = { path = "../hal" }
 harlan-fbcon = { path = "../drivers/fbcon" }
 

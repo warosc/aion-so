@@ -6,6 +6,7 @@ mod cpu;
 pub mod frame;
 pub mod framebuffer;
 mod interrupts;
+pub mod klog;
 pub mod memory_map;
 pub mod paging;
 pub mod pe;

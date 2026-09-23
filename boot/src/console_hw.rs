@@ -9,6 +9,7 @@
 use harlan_arch_x86_64::keyboard::Keyboard;
 use harlan_fbcon::{FramebufferSurface, TextConsole};
 use harlan_hal::framebuffer::FramebufferInfo;
+use harlan_hal::warn;
 use harlan_hal::{Console, ConsoleKey};
 
 pub struct HardwareConsole {
@@ -32,9 +33,7 @@ impl HardwareConsole {
             // SAFETY: forwarded from this function's own contract.
             let surface = unsafe { FramebufferSurface::new(&info) };
             if surface.is_none() {
-                log::warn!(
-                    "HARLAN: framebuffer description is inconsistent; running without a display"
-                );
+                warn!("HARLAN: framebuffer description is inconsistent; running without a display");
             }
             surface.map(TextConsole::new)
         });
@@ -53,6 +52,13 @@ impl Console for HardwareConsole {
     fn write_str(&mut self, s: &str) {
         if let Some(display) = &mut self.display {
             display.write_str(s);
+        }
+    }
+
+    unsafe fn framebuffer_moved(&mut self, base: harlan_hal::addr::VirtAddr) {
+        if let Some(display) = &mut self.display {
+            // SAFETY: forwarded from this method's own contract.
+            unsafe { display.surface_mut().rebase(base) };
         }
     }
 

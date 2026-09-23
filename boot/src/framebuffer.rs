@@ -6,6 +6,7 @@
 
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::framebuffer::FramebufferInfo;
+use harlan_hal::{info, warn};
 use uefi::boot;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 
@@ -19,14 +20,14 @@ pub fn query() -> Option<FramebufferInfo> {
     let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(handle) => handle,
         Err(err) => {
-            log::warn!("HARLAN: no GOP handle ({err}); running without a display");
+            warn!("HARLAN: no GOP handle ({err}); running without a display");
             return None;
         }
     };
     let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
         Ok(gop) => gop,
         Err(err) => {
-            log::warn!("HARLAN: cannot open GOP ({err}); running without a display");
+            warn!("HARLAN: cannot open GOP ({err}); running without a display");
             return None;
         }
     };
@@ -39,7 +40,7 @@ pub fn query() -> Option<FramebufferInfo> {
     match mode.pixel_format() {
         PixelFormat::Rgb | PixelFormat::Bgr => {}
         other => {
-            log::warn!("HARLAN: unsupported GOP pixel format {other:?}; running without a display");
+            warn!("HARLAN: unsupported GOP pixel format {other:?}; running without a display");
             return None;
         }
     }
@@ -56,13 +57,9 @@ pub fn query() -> Option<FramebufferInfo> {
         stride: u32::try_from(stride).ok()?,
         size_bytes: frame_buffer.size() as u64,
     };
-    log::info!(
+    info!(
         "HARLAN: framebuffer {}x{} stride={} at {:#x} ({} bytes)",
-        info.width,
-        info.height,
-        info.stride,
-        info.base_addr,
-        info.size_bytes
+        info.width, info.height, info.stride, info.base_addr, info.size_bytes
     );
     Some(info)
 }

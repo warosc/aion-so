@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
 use harlan_hal::{CpuControl, InterruptControl};
+use harlan_hal::{error, info, warn};
 
 /// Written only by the timer ISR (`VECTOR_TIMER` below); read by
 /// `ticks()`, `hal::TickCounter`'s sole consumer today.
@@ -240,7 +241,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
     let frame = unsafe { &*frame };
     match frame.vector as u8 {
         VECTOR_DIVIDE_ERROR => {
-            log::error!("HARLAN: #DE divide error at rip={:#x}", frame.rip);
+            error!("HARLAN: #DE divide error at rip={:#x}", frame.rip);
             halt();
         }
         VECTOR_NMI => {
@@ -248,10 +249,10 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             // principle arrive even during Incremento 1's cli-before-lidt
             // window. Nothing in this codebase intentionally raises one;
             // logging and returning is the safe default.
-            log::warn!("HARLAN: NMI received (non-fatal)");
+            warn!("HARLAN: NMI received (non-fatal)");
         }
         VECTOR_BREAKPOINT => {
-            log::info!("HARLAN: breakpoint handler OK");
+            info!("HARLAN: breakpoint handler OK");
         }
         VECTOR_TIMER => {
             let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -263,7 +264,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
                 crate::pic::send_eoi();
             }
             if count.is_multiple_of(100) {
-                log::info!("HARLAN: ticks={count}");
+                info!("HARLAN: ticks={count}");
             }
         }
         VECTOR_KEYBOARD => {
@@ -277,25 +278,22 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             }
         }
         VECTOR_GENERAL_PROTECTION => {
-            log::error!(
+            error!(
                 "HARLAN: #GP error_code={:#x} at rip={:#x}",
-                frame.error_code,
-                frame.rip
+                frame.error_code, frame.rip
             );
             halt();
         }
         VECTOR_PAGE_FAULT => {
             let faulting_address = read_cr2();
-            log::error!(
+            error!(
                 "HARLAN: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
-                faulting_address,
-                frame.error_code,
-                frame.rip
+                faulting_address, frame.error_code, frame.rip
             );
             halt();
         }
         other => {
-            log::error!(
+            error!(
                 "HARLAN: unhandled exception vector={other} at rip={:#x}",
                 frame.rip
             );
@@ -349,7 +347,7 @@ extern "C" fn double_fault_handler() {
     // The address says which stack this ran on: the IST stack the kernel
     // mapped with guard pages, or the static one used before that.
     let here = 0u8;
-    log::error!(
+    error!(
         "HARLAN: #DF DOUBLE FAULT on the stack at {:#x} - halting",
         core::ptr::addr_of!(here) as u64
     );

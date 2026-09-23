@@ -9,6 +9,7 @@
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::PhysRange;
 use harlan_hal::pe;
+use harlan_hal::{info, warn};
 use uefi::boot;
 use uefi::proto::loaded_image::LoadedImage;
 
@@ -29,13 +30,13 @@ pub fn query() -> Option<PhysRange> {
     let loaded = match boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) {
         Ok(loaded) => loaded,
         Err(err) => {
-            log::warn!("HARLAN: cannot ask where this image is loaded ({err})");
+            warn!("HARLAN: cannot ask where this image is loaded ({err})");
             return None;
         }
     };
     let (base, size) = loaded.info();
     let range = PhysRange::new(PhysAddr::new(base as usize as u64), size);
-    log::info!(
+    info!(
         "HARLAN: kernel image at {:#x}..{:#x} ({} KiB)",
         range.start,
         range.end(),
@@ -63,7 +64,7 @@ pub fn query_with_code() -> Option<Image> {
     let code = match pe::code_sections(bytes).map(|sections| sections.at(range.start)) {
         Ok(Some(code)) => {
             for section in code.iter() {
-                log::info!(
+                info!(
                     "HARLAN: kernel code at {:#x}..{:#x} ({} KiB)",
                     section.start,
                     section.end(),
@@ -73,15 +74,13 @@ pub fn query_with_code() -> Option<Image> {
             Some(code)
         }
         Ok(None) => {
-            log::warn!(
+            warn!(
                 "HARLAN: the image's code sections do not fit in memory; keeping it all executable"
             );
             None
         }
         Err(err) => {
-            log::warn!(
-                "HARLAN: cannot read this image's sections ({err:?}); keeping it all executable"
-            );
+            warn!("HARLAN: cannot read this image's sections ({err:?}); keeping it all executable");
             None
         }
     };

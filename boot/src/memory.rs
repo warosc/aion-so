@@ -5,6 +5,7 @@
 
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::memory_map::{MemoryMap, MemoryRegion, classify_memory_type};
+use harlan_hal::warn;
 use uefi::mem::memory_map::{MemoryMap as UefiMemoryMapTrait, MemoryMapOwned};
 
 pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
@@ -21,7 +22,7 @@ pub fn build_memory_map(uefi_map: &MemoryMapOwned) -> MemoryMap {
         }
     }
     if dropped > 0 {
-        log::warn!(
+        warn!(
             "HARLAN: memory map truncated, {dropped} region(s) dropped (capacity {})",
             MemoryMap::CAPACITY
         );

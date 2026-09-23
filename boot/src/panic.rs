@@ -2,6 +2,7 @@ use core::panic::PanicInfo;
 
 #[cfg(target_arch = "x86_64")]
 use harlan_hal::CpuControl;
+use harlan_hal::error;
 
 /// HARLAN OS's own panic handler. Logs through the same `log`/debugcon pipeline
 /// everything else in this codebase already uses, so a panic is visible to
@@ -24,7 +25,7 @@ use harlan_hal::CpuControl;
 /// - Never returns.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    log::error!("HARLAN PANIC: {info}");
+    error!("HARLAN PANIC: {info}");
 
     #[cfg(target_arch = "x86_64")]
     {
