@@ -62,18 +62,47 @@ pub fn map_with_guard(
     let bottom = guard.start_address() + PAGE_SIZE;
     for index in 0..pages {
         let page = Page::containing_address(bottom + index * PAGE_SIZE);
-        let frame = frames
-            .allocate_for(FramePurpose::Stack)
-            .ok_or(MapError::OutOfFrames)?;
+        let Some(frame) = frames.allocate_for(FramePurpose::Stack) else {
+            rollback_stack(mapper, frames, bottom, index);
+            return Err(MapError::OutOfFrames);
+        };
         // SAFETY: the frame is fresh from the allocator, so nothing else
         // uses it, and this area of kernel space belongs to the stacks
         // alone.
-        unsafe { mapper.map(page, frame, stack, frames) }?;
+        if let Err(err) = unsafe { mapper.map(page, frame, stack, frames) } {
+            let returned = frames.deallocate_as(frame, FramePurpose::Stack);
+            debug_assert!(returned.is_ok());
+            rollback_stack(mapper, frames, bottom, index);
+            return Err(err);
+        }
     }
     Ok(Stack {
         bottom,
         top: bottom + pages * PAGE_SIZE,
     })
+}
+
+fn rollback_stack(
+    mapper: &mut dyn PageMapper,
+    frames: &mut KernelFrames<'_>,
+    bottom: VirtAddr,
+    mapped_pages: u64,
+) {
+    for index in 0..mapped_pages {
+        let page = Page::containing_address(bottom + index * PAGE_SIZE);
+        // SAFETY: only pages successfully mapped by `map_with_guard` in
+        // this attempt are visited, and no caller can observe them yet.
+        let frame = unsafe { mapper.unmap(page) };
+        debug_assert!(frame.is_ok());
+        if let Ok(frame) = frame {
+            let returned = frames.deallocate_as(frame, FramePurpose::Stack);
+            debug_assert!(returned.is_ok());
+        }
+    }
+}
+
+fn unmap_stack(mapper: &mut dyn PageMapper, frames: &mut KernelFrames<'_>, stack: Stack) {
+    rollback_stack(mapper, frames, stack.bottom(), stack.size() / PAGE_SIZE);
 }
 
 /// Maps the kernel stack and the double-fault stack inside the stacks area
@@ -91,12 +120,18 @@ pub fn map_kernel_stacks(
         KERNEL_STACK_PAGES,
     )?;
     // The page above the kernel stack is this one's guard page.
-    let double_fault = map_with_guard(
+    let double_fault = match map_with_guard(
         mapper,
         frames,
         Page::containing_address(kernel.top()),
         DOUBLE_FAULT_STACK_PAGES,
-    )?;
+    ) {
+        Ok(stack) => stack,
+        Err(err) => {
+            unmap_stack(mapper, frames, kernel);
+            return Err(err);
+        }
+    };
     Ok((kernel, double_fault))
 }
 
@@ -236,5 +271,7 @@ mod tests {
             map_kernel_stacks(&mut mapper, &mut frames, BASE),
             Err(MapError::OutOfFrames)
         );
+        assert!(mapper.mapped.is_empty(), "partial stack mappings leaked");
+        assert_eq!(frames.free_frames(), 4, "partial stack frames leaked");
     }
 }
