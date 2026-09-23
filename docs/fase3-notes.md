@@ -7,6 +7,59 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 17 — La mitad baja deja de ser del kernel
+
+`docs/adr/0013-fase3-physical-window.md`. El Incremento 16 sacó el código
+del kernel de la mitad baja; quedaban la ventana física, el framebuffer y
+el registro.
+
+### Qué hace
+
+- **Ventana onto la memoria física en PML4 260**: `[0, 4 GiB)` en páginas
+  de 2 MiB, escribible y nunca ejecutable. Los marcos se ponen a cero por
+  ahí y **las tablas de páginas se leen y escriben por ahí**, en vez de por
+  su dirección física.
+- **La consola sigue a su framebuffer** (`Console::framebuffer_moved`).
+- **El registro deja de pasar por el crate `log`**: `hal::klog` es una
+  fachada con un puntero a función que el kernel reapunta tras la mudanza.
+- **La mitad baja se vacía**, salvo el código del firmware y —esto costó un
+  fallo— **sus datos**, que `hal` distingue ahora como `RuntimeData`.
+
+### Lo que la máquina enseñó, otra vez
+
+Dos fallos que solo se vieron arrancando:
+
+1. **El logger seguía apuntando abajo.** Escribí
+   `let _ = log::set_logger_racy(...)` y el error quedó escondido: el
+   crate rechaza un segundo logger, así que el del cargador siguió puesto y
+   la primera línea tras vaciar la mitad baja fue un `#PF` leyendo `.data`
+   en su dirección vieja. De ahí la fachada propia: un puntero a función se
+   puede reapuntar, un `&'static dyn Log` no.
+2. **`shutdown` falló con `#PF accessing 0xf5ec070`**: se conservó el
+   código de los runtime services pero no sus datos, que hasta ahora
+   estaban en el mismo saco que el resto de lo reservado.
+
+### Verificación ejecutada
+
+- Host: 201 pruebas en verde.
+- Prueba negativa: leer `0x10_0000` da `#PF accessing 0x100000,
+  error_code=0x0`. La mitad baja está de verdad desmapeada.
+- QEMU: la ventana cuesta 5 tablas; abajo quedan 5 rangos del firmware en 7
+  tablas. `boot-test --repeat 10` 10/10, con 512 MiB 1/1, soak de 120 s
+  PASS, `shutdown` apaga, `reboot` rearranca, la pantalla sigue dibujando
+  (captura con `version` y `help`).
+- Mutación: 6. Cinco detectadas; la sexta —enlazar la ventana antes de
+  construirla— ni siquiera compila, que es mejor garantía.
+
+### Riesgos y límites
+
+- **Los runtime services del firmware siguen en la mitad baja**, que será
+  espacio de usuario. Con el shell dentro del kernel no hay conflicto; en
+  cuanto haya procesos, `reboot` y `shutdown` tendrán que llamarse con el
+  CR3 del kernel. Es el cabo suelto que hereda el incremento siguiente.
+- La ventana cubre 4 GiB fijos, como el mapa de identidad que sustituye.
+  Más RAM que eso seguiría sin ser alcanzable, igual que antes.
+
 ## Incremento 16 — El kernel corre desde la mitad alta
 
 `docs/adr/0012-fase3-higher-half-kernel.md`. Hasta ahora el kernel se
