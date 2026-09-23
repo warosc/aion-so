@@ -4,6 +4,8 @@
 //! Vol. 3, §3.4.5 ("Segment Descriptors") and §7.2.3 ("TSS Descriptor in
 //! 64-bit mode").
 
+#[cfg(test)]
+use core::mem::align_of;
 use core::mem::size_of;
 
 use harlan_hal::addr::VirtAddr;
@@ -158,7 +160,7 @@ pub unsafe fn set_double_fault_stack(top: VirtAddr) {
             .cast::<u8>()
             .add(IST1_OFFSET)
             .cast::<u64>()
-            .write(top.as_u64());
+            .write_unaligned(top.as_u64());
     }
 }
 
@@ -311,5 +313,7 @@ mod tests {
     #[test]
     fn task_state_segment_is_104_bytes() {
         assert_eq!(size_of::<TaskStateSegment>(), 104);
+        assert_eq!(IST1_OFFSET, 36);
+        assert_ne!(IST1_OFFSET % align_of::<u64>(), 0);
     }
 }
