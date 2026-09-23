@@ -96,6 +96,28 @@ pub unsafe fn prepare_first_run(
     stack_top - FIRST_RUN_FRAME as u64
 }
 
+/// Moves the argument to where the ABI expects it and jumps to the entry
+/// point, with the stack aligned the way a called function expects.
+///
+/// # Safety
+///
+/// Only reached by `switch` returning off a stack `prepare_first_run`
+/// built.
+#[unsafe(naked)]
+unsafe extern "C" fn first_run_trampoline() -> ! {
+    naked_asm!(
+        // `rdi` came off the stack with the other saved registers; the
+        // Microsoft ABI wants the first argument in `rcx`.
+        "mov rcx, rdi",
+        "pop rax",
+        // A called function finds the stack 8 past 16-byte aligned, and
+        // this one is jumped to. The address pushed can only fault, which
+        // is right: the entry point never returns.
+        "push 0",
+        "jmp rax",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,26 +167,4 @@ mod tests {
         // And the whole frame is accounted for: nothing below was touched.
         assert!(memory[..memory.len() - 10].iter().all(|word| *word == 0));
     }
-}
-
-/// Moves the argument to where the ABI expects it and jumps to the entry
-/// point, with the stack aligned the way a called function expects.
-///
-/// # Safety
-///
-/// Only reached by `switch` returning off a stack `prepare_first_run`
-/// built.
-#[unsafe(naked)]
-unsafe extern "C" fn first_run_trampoline() -> ! {
-    naked_asm!(
-        // `rdi` came off the stack with the other saved registers; the
-        // Microsoft ABI wants the first argument in `rcx`.
-        "mov rcx, rdi",
-        "pop rax",
-        // A called function finds the stack 8 past 16-byte aligned, and
-        // this one is jumped to. The address pushed can only fault, which
-        // is right: the entry point never returns.
-        "push 0",
-        "jmp rax",
-    )
 }
