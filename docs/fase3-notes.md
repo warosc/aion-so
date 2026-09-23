@@ -75,6 +75,11 @@ trabajo después, en una máquina que sigue viva.
 - Host: 243 pruebas en verde (236 + 7: las puertas, los nombres, los
   códigos de error, el discriminador de ring 3 y los cuatro intrusos).
 - `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Interactivo, por el monitor de QEMU: después de los ocho procesos la
+  shell sigue respondiendo (`help`, `version`), `shutdown` apaga la
+  máquina sola, y `reboot` rearranca y vuelve a hacerlo todo —dos
+  marcadores de shell, dos autopruebas del mapeador, seis faltas
+  atribuidas y dos mensajes cruzados, tres y uno por arranque—.
 
 ### Pruebas negativas
 
