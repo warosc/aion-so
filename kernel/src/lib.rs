@@ -49,6 +49,11 @@ pub struct BootInfo {
     /// kernel refuses to rebuild the identity map if that would leave this
     /// range unmapped, because the next character would fault.
     pub framebuffer: Option<PhysRange>,
+    /// The one UEFI call the kernel cannot make itself: telling the
+    /// firmware where its runtime services will answer from now on. The
+    /// bootloader lends it; the kernel decides the address and the moment
+    /// (docs/adr/0016-fase3-set-virtual-address-map.md).
+    pub relocate_runtime: Option<memory::runtime::Relocate>,
 }
 
 /// The kernel takes ownership of everything `boot` hands over (see
@@ -282,6 +287,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             kernel_image: boot_info.kernel_image,
             kernel_code: boot_info.kernel_code,
             framebuffer: boot_info.framebuffer,
+            relocate_runtime: boot_info.relocate_runtime,
             physmap: None,
             heap_range,
             kernel_stacks,
@@ -319,6 +325,7 @@ struct KernelContext<C: Console + 'static, P: PowerControl + 'static> {
     kernel_image: Option<PhysRange>,
     kernel_code: Option<harlan_hal::pe::CodeRanges>,
     framebuffer: Option<PhysRange>,
+    relocate_runtime: Option<memory::runtime::Relocate>,
     /// Where physical memory is readable, once it is not the lower half.
     physmap: Option<harlan_hal::addr::VirtAddr>,
     /// Where the heap is and how big, to label its frames.
@@ -646,20 +653,47 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             );
             false
         } else {
+            // First the firmware is asked to move out of the lower half
+            // altogether (ADR 0016). If it will not, its ranges stay where
+            // they are and the kernel keeps them mapped, as before.
+            let runtime = harlan_arch_x86_64::paging::KERNEL_RUNTIME_START;
+            let moved = context.relocate_runtime.and_then(|relocate| {
+                // SAFETY: the kernel owns its tables and reaches frames
+                // through its own window; the firmware's old mappings are
+                // still in place, and this is the only call.
+                unsafe {
+                    memory::runtime::move_to_kernel_space(
+                        &mut context.mapper,
+                        &mut context.frames,
+                        context.map,
+                        runtime,
+                        relocate,
+                    )
+                }
+                .ok()
+            });
+            let keep: &[harlan_hal::paging::MappedRange] =
+                if moved.is_some() { &[] } else { &firmware };
             // SAFETY: the kernel's code, stack, heap, page tables and the
             // window it reaches frames through are all in kernel space by
             // now, and the console draws through the window. What is left
-            // below is the firmware's, which keeps its addresses.
+            // below, if anything, is the firmware's at its own addresses.
             match unsafe {
                 context
                     .mapper
-                    .keep_only_in_lower_half(&mut context.frames, &firmware)
+                    .keep_only_in_lower_half(&mut context.frames, keep)
             } {
                 Ok(tables) => {
-                    info!(
-                        "HARLAN: the lower half is free: {} firmware range(s) kept through {tables} table(s), everything else unmapped; the kernel reaches memory at {window:#x}",
-                        firmware.len()
-                    );
+                    if moved.is_some() {
+                        info!(
+                            "HARLAN: the lower half is empty: nothing of the firmware's is left there, and the kernel reaches memory at {window:#x}"
+                        );
+                    } else {
+                        info!(
+                            "HARLAN: the lower half is free: {} firmware range(s) kept through {tables} table(s), everything else unmapped; the kernel reaches memory at {window:#x}",
+                            keep.len()
+                        );
+                    }
                     true
                 }
                 Err(err) => {
