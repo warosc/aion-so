@@ -29,6 +29,10 @@ mod offsets {
     pub const SECTION_VIRTUAL_SIZE: usize = 8;
     pub const SECTION_VIRTUAL_ADDRESS: usize = 12;
     pub const SECTION_CHARACTERISTICS: usize = 36;
+    /// Data directories follow the fixed part of a PE32+ optional header.
+    pub const DATA_DIRECTORIES: usize = OPTIONAL_HEADER + 112;
+    /// The base relocation table is the sixth directory.
+    pub const BASE_RELOCATION_DIRECTORY: usize = 5;
 }
 
 const SIGNATURE: [u8; 4] = *b"PE\0\0";
@@ -36,6 +40,14 @@ const SIGNATURE: [u8; 4] = *b"PE\0\0";
 const MAGIC_PE32_PLUS: u16 = 0x20B;
 /// `IMAGE_SCN_MEM_EXECUTE`.
 const EXECUTABLE: u32 = 0x2000_0000;
+
+/// Padding inside a relocation block; carries no address.
+const RELOCATION_ABSOLUTE: u16 = 0;
+/// The whole 64-bit value at the address gets the delta added. The only
+/// kind of relocation an x86_64 image needs.
+const RELOCATION_DIR64: u16 = 10;
+/// A relocation block starts with the page RVA and its own size.
+const RELOCATION_BLOCK_HEADER: usize = 8;
 
 /// How many code sections are kept. Linkers produce one (`.text`); a
 /// handful covers anything unusual, and going over is reported rather
@@ -53,6 +65,11 @@ pub enum PeError {
     NoCode,
     /// More executable sections than `MAX_CODE_SECTIONS`.
     TooManySections,
+    /// The image cannot be moved: it has no relocation table.
+    NotRelocatable,
+    /// A relocation this code does not know how to apply. Refusing beats
+    /// leaving an address behind pointing at the old place.
+    UnsupportedRelocation(u16),
 }
 
 /// Where the code lives inside an image, as `(offset from the image base,
@@ -107,6 +124,21 @@ pub struct CodeRanges {
 }
 
 impl CodeRanges {
+    /// A set built from ranges already placed in memory, for a caller that
+    /// learned where the code is some other way. `None` if there are more
+    /// than `MAX_CODE_SECTIONS`.
+    pub fn new(ranges: &[PhysRange]) -> Option<Self> {
+        if ranges.len() > MAX_CODE_SECTIONS {
+            return None;
+        }
+        let mut built = Self {
+            ranges: [PhysRange::new(PhysAddr::new(0), 0); MAX_CODE_SECTIONS],
+            len: ranges.len(),
+        };
+        built.ranges[..ranges.len()].copy_from_slice(ranges);
+        Some(built)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = PhysRange> + '_ {
         self.ranges[..self.len].iter().copied()
     }
@@ -131,17 +163,8 @@ impl CodeRanges {
 /// slice before it is read, so a malformed header is an error and never a
 /// read out of bounds.
 pub fn code_sections(image: &[u8]) -> Result<CodeSections, PeError> {
-    let signature = read_u32(image, offsets::LFANEW)? as usize;
-    let end = signature
-        .checked_add(SIGNATURE.len())
-        .ok_or(PeError::Truncated)?;
-    if image.get(signature..end).ok_or(PeError::Truncated)? != SIGNATURE {
-        return Err(PeError::NotPe32Plus);
-    }
+    let signature = signature_offset(image)?;
     let optional = signature + offsets::OPTIONAL_HEADER;
-    if read_u16(image, optional)? != MAGIC_PE32_PLUS {
-        return Err(PeError::NotPe32Plus);
-    }
     let count = read_u16(image, signature + offsets::NUMBER_OF_SECTIONS)? as usize;
     let optional_size = read_u16(image, signature + offsets::SIZE_OF_OPTIONAL_HEADER)? as usize;
     let table = optional
@@ -293,6 +316,16 @@ mod tests {
     }
 
     #[test]
+    fn a_set_of_ranges_can_be_built_by_hand_up_to_the_limit() {
+        let one = PhysRange::new(PhysAddr::new(0x1000), 0x2000);
+        let built = CodeRanges::new(&[one]).unwrap();
+        assert_eq!(built.iter().collect::<std::vec::Vec<_>>(), [one]);
+        assert_eq!(built.total_bytes(), 0x2000);
+        let too_many = std::vec![one; MAX_CODE_SECTIONS + 1];
+        assert_eq!(CodeRanges::new(&too_many), None);
+    }
+
+    #[test]
     fn an_image_without_code_is_refused() {
         let image = image_with(&[(0x1000, 0x1000, DATA)]);
         assert_eq!(code_sections(&image), Err(PeError::NoCode));
@@ -325,6 +358,109 @@ mod tests {
         assert_eq!(code_sections(&wild), Err(PeError::Truncated));
     }
 
+    /// Writes a relocation table into `image` and points the directory at
+    /// it. `blocks` is `(page rva, [(kind, offset)])`.
+    fn with_relocations(
+        mut image: std::vec::Vec<u8>,
+        blocks: &[(u32, std::vec::Vec<(u16, u16)>)],
+    ) -> std::vec::Vec<u8> {
+        let table = image.len();
+        let mut bytes = std::vec::Vec::new();
+        for (page, entries) in blocks {
+            let size = RELOCATION_BLOCK_HEADER + entries.len() * 2;
+            bytes.extend_from_slice(&page.to_le_bytes());
+            bytes.extend_from_slice(&(size as u32).to_le_bytes());
+            for (kind, offset) in entries {
+                bytes.extend_from_slice(&((kind << 12) | offset).to_le_bytes());
+            }
+        }
+        let directory = SIGNATURE_AT
+            + offsets::DATA_DIRECTORIES
+            + offsets::BASE_RELOCATION_DIRECTORY * DATA_DIRECTORY_SIZE;
+        image[directory..directory + 4].copy_from_slice(&(table as u32).to_le_bytes());
+        image[directory + 4..directory + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        image.extend_from_slice(&bytes);
+        image
+    }
+
+    fn one_code_section() -> std::vec::Vec<u8> {
+        image_with(&[(0x1000, 0x2000, CODE)])
+    }
+
+    #[test]
+    fn relocations_list_every_absolute_address_and_skip_the_padding() {
+        let image = with_relocations(
+            one_code_section(),
+            &[
+                (
+                    0x1000,
+                    std::vec![
+                        (RELOCATION_DIR64, 0x18),
+                        (RELOCATION_ABSOLUTE, 0),
+                        (RELOCATION_DIR64, 0x20),
+                    ],
+                ),
+                (0x2000, std::vec![(RELOCATION_DIR64, 0x8)]),
+            ],
+        );
+        let found: std::vec::Vec<u64> = relocations(&image).unwrap().iter().collect();
+        assert_eq!(found, [0x1018, 0x1020, 0x2008]);
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_moved_says_so() {
+        assert_eq!(
+            relocations(&one_code_section()),
+            Err(PeError::NotRelocatable)
+        );
+    }
+
+    #[test]
+    fn a_relocation_kind_we_cannot_apply_is_refused() {
+        // 3 is HIGHLOW, for 32-bit images.
+        let image = with_relocations(one_code_section(), &[(0x1000, std::vec![(3, 0x10)])]);
+        assert_eq!(relocations(&image), Err(PeError::UnsupportedRelocation(3)));
+    }
+
+    #[test]
+    fn a_relocation_table_that_does_not_fit_is_refused_instead_of_walked() {
+        let image = with_relocations(
+            one_code_section(),
+            &[(0x1000, std::vec![(RELOCATION_DIR64, 0x10)])],
+        );
+        // The table is announced longer than the image.
+        let directory = SIGNATURE_AT
+            + offsets::DATA_DIRECTORIES
+            + offsets::BASE_RELOCATION_DIRECTORY * DATA_DIRECTORY_SIZE;
+        let mut too_long = image.clone();
+        too_long[directory + 4..directory + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(relocations(&too_long), Err(PeError::Truncated));
+        let table =
+            u32::from_le_bytes(image[directory..directory + 4].try_into().unwrap()) as usize;
+        // A block that claims to run past the end of the table. Even, so
+        // that it is its length that rejects it and not its parity.
+        let mut bad_block = image.clone();
+        bad_block[table + 4..table + 8].copy_from_slice(&1000u32.to_le_bytes());
+        assert_eq!(relocations(&bad_block), Err(PeError::Truncated));
+        // And one whose size would cut an entry in half. Followed by a
+        // block that does parse, so that only the odd size can reject it.
+        let mut odd = one_code_section();
+        let raw = {
+            let mut bytes = std::vec::Vec::new();
+            bytes.extend_from_slice(&0x1000u32.to_le_bytes());
+            bytes.extend_from_slice(&9u32.to_le_bytes()); // one byte of entries
+            bytes.push(0);
+            bytes.extend_from_slice(&0x2000u32.to_le_bytes());
+            bytes.extend_from_slice(&8u32.to_le_bytes()); // a block with none
+            bytes
+        };
+        let at = odd.len();
+        odd[directory..directory + 4].copy_from_slice(&(at as u32).to_le_bytes());
+        odd[directory + 4..directory + 8].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+        odd.extend_from_slice(&raw);
+        assert_eq!(relocations(&odd), Err(PeError::Truncated));
+    }
+
     #[test]
     fn something_that_is_not_a_pe32_plus_image_is_refused() {
         let mut no_signature = image_with(&[(0x1000, 0x1000, CODE)]);
@@ -336,4 +472,103 @@ mod tests {
         pe32[magic_at..magic_at + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
         assert_eq!(code_sections(&pe32), Err(PeError::NotPe32Plus));
     }
+}
+
+/// The base relocation table of a loaded image: where every absolute
+/// 64-bit address sits, so the image can be moved.
+///
+/// The firmware already relocated the image once, to where it loaded it.
+/// Applying the table again, with the difference to a new address, is what
+/// lets the kernel run from somewhere else
+/// (docs/adr/0012-fase3-higher-half-kernel.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relocations<'a> {
+    blocks: &'a [u8],
+}
+
+impl<'a> Relocations<'a> {
+    /// Offsets from the image base of the 64-bit slots to fix up.
+    ///
+    /// Infallible: `relocations` walked the whole table first, so every
+    /// block and entry here is known to fit and to be a kind this code
+    /// applies.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + 'a {
+        let mut blocks = self.blocks;
+        let mut entries: &[u8] = &[];
+        let mut page = 0u32;
+        core::iter::from_fn(move || {
+            loop {
+                if let Some((entry, rest)) = entries.split_at_checked(2) {
+                    entries = rest;
+                    let value = u16::from_le_bytes([entry[0], entry[1]]);
+                    if value >> 12 == RELOCATION_ABSOLUTE {
+                        continue;
+                    }
+                    return Some(u64::from(page) + u64::from(value & 0xFFF));
+                }
+                let header = blocks.get(..RELOCATION_BLOCK_HEADER)?;
+                page = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                let size =
+                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+                entries = &blocks[RELOCATION_BLOCK_HEADER..size];
+                blocks = &blocks[size..];
+            }
+        })
+    }
+}
+
+/// Reads the base relocation table of `image`.
+///
+/// Walks it completely, so a table that runs off the end of the image or
+/// carries a relocation kind this code cannot apply is an error here
+/// rather than a bad write later.
+pub fn relocations(image: &[u8]) -> Result<Relocations<'_>, PeError> {
+    let signature = signature_offset(image)?;
+    let directory = signature
+        + offsets::DATA_DIRECTORIES
+        + offsets::BASE_RELOCATION_DIRECTORY * DATA_DIRECTORY_SIZE;
+    let start = read_u32(image, directory)? as usize;
+    let size = read_u32(image, directory + 4)? as usize;
+    if start == 0 || size == 0 {
+        return Err(PeError::NotRelocatable);
+    }
+    let end = start.checked_add(size).ok_or(PeError::Truncated)?;
+    let blocks = image.get(start..end).ok_or(PeError::Truncated)?;
+
+    // Walk it once to reject anything the iterator could not handle.
+    let mut rest = blocks;
+    while !rest.is_empty() {
+        let header = rest
+            .get(..RELOCATION_BLOCK_HEADER)
+            .ok_or(PeError::Truncated)?;
+        let block = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if block < RELOCATION_BLOCK_HEADER || block > rest.len() || !block.is_multiple_of(2) {
+            return Err(PeError::Truncated);
+        }
+        for entry in rest[RELOCATION_BLOCK_HEADER..block].as_chunks::<2>().0 {
+            let kind = u16::from_le_bytes(*entry) >> 12;
+            if kind != RELOCATION_ABSOLUTE && kind != RELOCATION_DIR64 {
+                return Err(PeError::UnsupportedRelocation(kind));
+            }
+        }
+        rest = &rest[block..];
+    }
+    Ok(Relocations { blocks })
+}
+
+/// Each data directory is an RVA and a size.
+const DATA_DIRECTORY_SIZE: usize = 8;
+
+fn signature_offset(image: &[u8]) -> Result<usize, PeError> {
+    let signature = read_u32(image, offsets::LFANEW)? as usize;
+    let end = signature
+        .checked_add(SIGNATURE.len())
+        .ok_or(PeError::Truncated)?;
+    if image.get(signature..end).ok_or(PeError::Truncated)? != SIGNATURE {
+        return Err(PeError::NotPe32Plus);
+    }
+    if read_u16(image, signature + offsets::OPTIONAL_HEADER)? != MAGIC_PE32_PLUS {
+        return Err(PeError::NotPe32Plus);
+    }
+    Ok(signature)
 }
