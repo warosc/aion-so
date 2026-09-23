@@ -64,6 +64,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_IDENTITY_LIMIT: u64 = 4 * GIB;
 
 const PRESENT: u64 = 1 << 0;
+/// Reachable from ring 3. Every level of the walk has to have it.
+const USER: u64 = 1 << 2;
 const WRITABLE: u64 = 1 << 1;
 /// In a PDPT or PD entry: this entry maps a 1 GiB or 2 MiB page itself.
 const HUGE: u64 = 1 << 7;
@@ -227,22 +229,39 @@ impl<A: TableAccess> PageTables<A> {
         flags: PageFlags,
         frames: &mut dyn FrameAllocator,
     ) -> Result<(), MapError> {
-        if page < KERNEL_SPACE_BASE {
+        // The lower half is user space: only a page that says so out loud
+        // may be mapped there, and the kernel's own pages never may.
+        if flags.user != (page < KERNEL_SPACE_BASE) {
             return Err(MapError::OutsideKernelSpace);
         }
         let indices = table_indices(page);
         let mut table = self.root;
+        let mut upgraded = false;
         for &index in &indices[..3] {
             let entry = self.access.read(table, index);
+            // Every level of the walk has to allow it, so a user page
+            // carries the bit all the way up.
+            let reachable = if flags.user {
+                PRESENT | WRITABLE | USER
+            } else {
+                PRESENT | WRITABLE
+            };
             table = if entry & PRESENT == 0 {
                 let new = self.new_table(frames)?;
                 // Linked only once fully zeroed: the hardware walker never
                 // sees a half-built table.
-                self.access.write(table, index, new | PRESENT | WRITABLE);
+                self.access.write(table, index, new | reachable);
                 new
             } else if entry & HUGE != 0 {
                 return Err(MapError::HugePageInTheWay);
             } else {
+                // A table built for the kernel and now on a program's path
+                // has to allow ring 3 too: the CPU ands the bit down the
+                // walk.
+                if flags.user && entry & USER == 0 {
+                    self.access.write(table, index, entry | USER);
+                    upgraded = true;
+                }
                 entry & ADDRESS_MASK
             };
         }
@@ -256,8 +275,16 @@ impl<A: TableAccess> PageTables<A> {
         if !flags.executable {
             leaf |= NO_EXECUTE;
         }
+        if flags.user {
+            leaf |= USER;
+        }
         self.access.write(table, indices[3], leaf);
         self.access.flush(page);
+        if upgraded {
+            // Pages under those tables were cached with the old, stricter
+            // permissions.
+            self.access.flush_all();
+        }
         Ok(())
     }
 
@@ -510,7 +537,11 @@ impl<A: TableAccess> PageTables<A> {
             }
         }
 
-        self.access.write(self.root, 0, pdpt | PRESENT | WRITABLE);
+        // The lower half is user space from here on. What is actually
+        // reachable from ring 3 is decided by the leaves, and the
+        // firmware's have no user bit.
+        self.access
+            .write(self.root, 0, pdpt | PRESENT | WRITABLE | USER);
         for slot in 1..table_indices(KERNEL_SPACE_BASE)[0] {
             self.access.write(self.root, slot, 0);
         }
@@ -840,6 +871,9 @@ mod tests {
     /// non-table memory), and so does writing a firmware table.
     #[derive(Default)]
     struct FakeMemory {
+        /// What the walker adds to a table's physical address, as the
+        /// kernel's window does once the lower half is gone.
+        window: u64,
         tables: BTreeMap<u64, [u64; ENTRIES]>,
         firmware: BTreeSet<u64>,
         writes: Vec<(u64, usize, u64)>,
@@ -848,6 +882,10 @@ mod tests {
     }
 
     impl TableAccess for FakeMemory {
+        fn window(&self) -> u64 {
+            self.window
+        }
+
         fn read(&self, table: u64, index: usize) -> u64 {
             self.tables
                 .get(&table)
@@ -885,10 +923,7 @@ mod tests {
     const FW_PDPT: u64 = 0x20_1000;
     const FW_PD: u64 = 0x20_2000;
     const MIB: u64 = 1 << 20;
-    const DATA: PageFlags = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    const DATA: PageFlags = PageFlags::kernel(true, false);
 
     /// Firmware-style tables: identity map of the first 16 MiB in 2 MiB
     /// pages, with the 2 MiB page that holds the tables themselves mapped
@@ -1089,10 +1124,7 @@ mod tests {
     fn read_only_executable_flags_give_a_bare_present_leaf() {
         let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
         let mut tables = adopted(&mut frames);
-        let flags = PageFlags {
-            writable: false,
-            executable: true,
-        };
+        let flags = PageFlags::kernel(false, true);
         tables
             .map(page(0), frame(0x90_0000), flags, &mut frames)
             .unwrap();
@@ -1482,6 +1514,88 @@ mod tests {
             assert_eq!(entry & NO_EXECUTE, 0, "{addr:#x} must run");
             assert_ne!(entry & WRITABLE, 0, "{addr:#x} must stay writable");
         }
+    }
+
+    /// A page for ring 3 carries the user bit all the way up the walk —
+    /// the CPU ands them — and the kernel's pages never carry it.
+    #[test]
+    fn user_pages_are_reachable_from_ring_three_and_kernel_pages_are_not() {
+        let mut frames = Frames(vec![
+            0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000, 0x40_5000, 0x40_6000, 0x40_7000,
+            0x40_8000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        // The lower half has to be the kernel's before anything can be
+        // mapped into it: the firmware's tables are read-only, which is
+        // exactly what `keep_only` leaves behind (Incremento 17).
+        // The kernel reaches tables through its window from here on,
+        // exactly as it does after Incremento 17.
+        let window = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        tables
+            .map_physical_window(&mut frames, window, GIB)
+            .expect("the window");
+        tables.access.window = window;
+        tables.keep_only(&mut frames, &[]).expect("emptying it");
+        let user = 0x0000_0000_2000_0000;
+        tables
+            .map(
+                user,
+                frame(0x50_0000),
+                PageFlags::user(true, true),
+                &mut frames,
+            )
+            .expect("mapping a page for the program");
+
+        let mut table = tables.root;
+        for (level, index) in table_indices(user).into_iter().enumerate() {
+            let entry = tables.access.read(table, index);
+            assert_ne!(entry & USER, 0, "level {level} must allow ring 3");
+            if level == 3 {
+                assert_eq!(entry & NO_EXECUTE, 0, "the program has to run");
+                break;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+
+        // A page of the kernel's, mapped the same way, stays out of
+        // reach from ring 3.
+        tables
+            .map(
+                page(0),
+                frame(0x51_0000),
+                PageFlags::kernel(true, false),
+                &mut frames,
+            )
+            .expect("mapping a page of the kernel's");
+        assert_eq!(leaf_entry(&tables, page(0)) & USER, 0);
+    }
+
+    #[test]
+    fn a_page_is_either_the_kernel_s_or_a_program_s_and_says_which() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        // Refused before any table is even looked at, so no `keep_only`
+        // is needed here.
+        // The kernel cannot take a page of user space...
+        assert_eq!(
+            tables.map(
+                0x2000_0000,
+                frame(0x50_0000),
+                PageFlags::kernel(true, false),
+                &mut frames
+            ),
+            Err(MapError::OutsideKernelSpace)
+        );
+        // ...and a program cannot be handed one of the kernel's.
+        assert_eq!(
+            tables.map(
+                page(0),
+                frame(0x50_0000),
+                PageFlags::user(true, false),
+                &mut frames
+            ),
+            Err(MapError::OutsideKernelSpace)
+        );
     }
 
     #[test]

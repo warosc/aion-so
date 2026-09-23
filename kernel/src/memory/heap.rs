@@ -92,10 +92,7 @@ pub fn init<I: InterruptControl>(
     frames: &mut KernelFrames<'_>,
     start: Page,
 ) -> usize {
-    let data = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    let data = PageFlags::kernel(true, false);
     let mut mapped = 0;
     while mapped < HEAP_SIZE {
         let page = Page::containing_address(start.start_address() + mapped as u64);

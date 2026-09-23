@@ -86,6 +86,30 @@ impl Page {
 pub struct PageFlags {
     pub writable: bool,
     pub executable: bool,
+    /// Reachable from ring 3. Without it the page belongs to the kernel
+    /// and a user access to it faults, which is what isolation is made of
+    /// (docs/adr/0014-fase3-syscall-abi-v0.md).
+    pub user: bool,
+}
+
+impl PageFlags {
+    /// The kernel's own memory: never reachable from ring 3.
+    pub const fn kernel(writable: bool, executable: bool) -> Self {
+        Self {
+            writable,
+            executable,
+            user: false,
+        }
+    }
+
+    /// A process's memory.
+    pub const fn user(writable: bool, executable: bool) -> Self {
+        Self {
+            writable,
+            executable,
+            user: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

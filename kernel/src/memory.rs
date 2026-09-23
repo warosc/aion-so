@@ -216,10 +216,7 @@ pub fn paging_self_test(
         warn!("HARLAN: page mapper self-test skipped: no free frame");
         return;
     };
-    let data = PageFlags {
-        writable: true,
-        executable: false,
-    };
+    let data = PageFlags::kernel(true, false);
     // SAFETY: `frame` was just allocated, so nothing else uses it; the only
     // other access is the deliberate read through its identity address
     // below.

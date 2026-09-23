@@ -128,10 +128,7 @@ unsafe fn map_alias(
             // executable and writable, as it was before ADR 0011.
             None => (true, false),
         };
-        let flags = PageFlags {
-            writable: !only_code,
-            executable: runs_code,
-        };
+        let flags = PageFlags::kernel(!only_code, runs_code);
         // SAFETY: the frames are the image's own, which the allocator has
         // always withheld, and this range of kernel space is used by
         // nothing else (the caller's contract).
@@ -273,27 +270,18 @@ mod tests {
         for offset in [0, PAGE_SIZE] {
             assert_eq!(
                 flags_at(offset),
-                PageFlags {
-                    writable: false,
-                    executable: true
-                },
+                PageFlags::kernel(false, true),
                 "the page at {offset:#x} is nothing but code"
             );
         }
         assert_eq!(
             flags_at(2 * PAGE_SIZE),
-            PageFlags {
-                writable: true,
-                executable: true
-            },
+            PageFlags::kernel(true, true),
             "code and data share this page, so it stays writable"
         );
         assert_eq!(
             flags_at(3 * PAGE_SIZE),
-            PageFlags {
-                writable: true,
-                executable: false
-            },
+            PageFlags::kernel(true, false),
             "plain data"
         );
         // Every page of the image is mapped to its own frame, in order.
@@ -318,10 +306,7 @@ mod tests {
         for offset in [0, PAGE_SIZE] {
             assert_eq!(
                 mapper.mapped[&(BASE + offset)].1,
-                PageFlags {
-                    writable: true,
-                    executable: true
-                }
+                PageFlags::kernel(true, true)
             );
         }
     }
