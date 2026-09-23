@@ -65,6 +65,9 @@ pub enum PeError {
     NoCode,
     /// More executable sections than `MAX_CODE_SECTIONS`.
     TooManySections,
+    /// A relocation names eight bytes that are not inside the image. Found
+    /// while reading the table, so that nothing is ever half applied.
+    RelocationOutsideImage(u64),
     /// The image cannot be moved: it has no relocation table.
     NotRelocatable,
     /// A relocation this code does not know how to apply. Refusing beats
@@ -358,6 +361,29 @@ mod tests {
         assert_eq!(code_sections(&wild), Err(PeError::Truncated));
     }
 
+    /// As `with_relocations`, but first pads the image so that everything
+    /// the table names is inside it. Most tests want this: they are about
+    /// the walking, not about the bounds check.
+    fn with_relocations_inside(
+        image: std::vec::Vec<u8>,
+        blocks: &[(u32, std::vec::Vec<(u16, u16)>)],
+    ) -> std::vec::Vec<u8> {
+        let needed = blocks
+            .iter()
+            .flat_map(|(page, entries)| {
+                entries
+                    .iter()
+                    .map(move |(_, offset)| *page as usize + *offset as usize + 8)
+            })
+            .max()
+            .unwrap_or(0);
+        let mut padded = image;
+        if padded.len() < needed {
+            padded.resize(needed, 0);
+        }
+        with_relocations(padded, blocks)
+    }
+
     /// Writes a relocation table into `image` and points the directory at
     /// it. `blocks` is `(page rva, [(kind, offset)])`.
     fn with_relocations(
@@ -389,7 +415,7 @@ mod tests {
 
     #[test]
     fn relocations_list_every_absolute_address_and_skip_the_padding() {
-        let image = with_relocations(
+        let image = with_relocations_inside(
             one_code_section(),
             &[
                 (
@@ -415,10 +441,48 @@ mod tests {
         );
     }
 
+    /// The addresses have to be inside the image, and that is settled
+    /// before any of them is handed out: relocating is all or nothing.
+    #[test]
+    fn a_relocation_that_points_outside_the_image_is_refused() {
+        let image = with_relocations_inside(
+            one_code_section(),
+            &[(0x1000, std::vec![(RELOCATION_DIR64, 0x10)])],
+        );
+        // Padded, so 0x1010..0x1018 is inside it.
+        assert!(relocations(&image).is_ok());
+
+        // One that starts inside the image and runs off the end. The page
+        // is patched after the table is written, because writing it makes
+        // the image longer.
+        let mut past =
+            with_relocations(one_code_section(), &[(0, std::vec![(RELOCATION_DIR64, 0)])]);
+        let directory = SIGNATURE_AT
+            + offsets::DATA_DIRECTORIES
+            + offsets::BASE_RELOCATION_DIRECTORY * DATA_DIRECTORY_SIZE;
+        let table = u32::from_le_bytes(past[directory..directory + 4].try_into().unwrap()) as usize;
+        let straddles = (past.len() - 4) as u32;
+        past[table..table + 4].copy_from_slice(&straddles.to_le_bytes());
+        assert_eq!(
+            relocations(&past),
+            Err(PeError::RelocationOutsideImage(u64::from(straddles)))
+        );
+
+        // And one nowhere near it.
+        let far = with_relocations(
+            one_code_section(),
+            &[(0x10_0000, std::vec![(RELOCATION_DIR64, 0)])],
+        );
+        assert_eq!(
+            relocations(&far),
+            Err(PeError::RelocationOutsideImage(0x10_0000))
+        );
+    }
+
     #[test]
     fn a_relocation_kind_we_cannot_apply_is_refused() {
         // 3 is HIGHLOW, for 32-bit images.
-        let image = with_relocations(one_code_section(), &[(0x1000, std::vec![(3, 0x10)])]);
+        let image = with_relocations_inside(one_code_section(), &[(0x1000, std::vec![(3, 0x10)])]);
         assert_eq!(relocations(&image), Err(PeError::UnsupportedRelocation(3)));
     }
 
@@ -535,20 +599,35 @@ pub fn relocations(image: &[u8]) -> Result<Relocations<'_>, PeError> {
     let end = start.checked_add(size).ok_or(PeError::Truncated)?;
     let blocks = image.get(start..end).ok_or(PeError::Truncated)?;
 
-    // Walk it once to reject anything the iterator could not handle.
+    // Walk it once and reject anything the iterator could not handle, or
+    // that the caller could not apply: every address it hands out is
+    // checked here, so relocating is all-or-nothing. Checking while
+    // writing would leave an image half moved.
     let mut rest = blocks;
     while !rest.is_empty() {
         let header = rest
             .get(..RELOCATION_BLOCK_HEADER)
             .ok_or(PeError::Truncated)?;
+        let page = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let block = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if block < RELOCATION_BLOCK_HEADER || block > rest.len() || !block.is_multiple_of(2) {
             return Err(PeError::Truncated);
         }
         for entry in rest[RELOCATION_BLOCK_HEADER..block].as_chunks::<2>().0 {
-            let kind = u16::from_le_bytes(*entry) >> 12;
-            if kind != RELOCATION_ABSOLUTE && kind != RELOCATION_DIR64 {
+            let value = u16::from_le_bytes(*entry);
+            let kind = value >> 12;
+            if kind == RELOCATION_ABSOLUTE {
+                continue;
+            }
+            if kind != RELOCATION_DIR64 {
                 return Err(PeError::UnsupportedRelocation(kind));
+            }
+            let at = u64::from(page) + u64::from(value & 0xFFF);
+            let fits = at
+                .checked_add(8)
+                .is_some_and(|end| end <= image.len() as u64);
+            if !fits {
+                return Err(PeError::RelocationOutsideImage(at));
             }
         }
         rest = &rest[block..];
