@@ -274,6 +274,7 @@ dependencies = [
  "harlan-hal",
  "harlan-kernel",
  "uefi",
+ "uefi-raw",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@ mod image;
 mod memory;
 mod panic;
 mod power;
+mod runtime;
 
 use console_hw::HardwareConsole;
 use harlan_hal::info;
@@ -63,11 +64,16 @@ fn efi_main() -> Status {
     }
 
     let memory_map = memory::build_memory_map(&uefi_memory_map);
+    // The kernel decides when the firmware moves; the map it will need is
+    // kept here until then (ADR 0016).
+    // SAFETY: single-threaded boot path, before the kernel starts.
+    unsafe { runtime::remember(uefi_memory_map) };
     let boot_info = harlan_kernel::BootInfo {
         memory_map,
         kernel_image: kernel_image.as_ref().map(|image| image.range),
         kernel_code: kernel_image.as_ref().and_then(|image| image.code),
         framebuffer: framebuffer_range,
+        relocate_runtime: Some(runtime::relocate),
     };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
     // was current when it was queried, and nothing changes the display

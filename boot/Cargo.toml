@@ -11,6 +11,7 @@ soak = ["harlan-kernel/soak"]
 [dependencies]
 harlan-kernel = { path = "../kernel" }
 uefi = { version = "0.40.0" }
+uefi-raw = "0.16.0"
 harlan-hal = { path = "../hal" }
 harlan-fbcon = { path = "../drivers/fbcon" }
 
