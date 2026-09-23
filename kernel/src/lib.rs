@@ -8,6 +8,8 @@ pub mod klog;
 mod memory;
 mod shell;
 mod sync;
+#[cfg(target_arch = "x86_64")]
+pub mod user;
 
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame, PhysRange};
@@ -240,20 +242,22 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             &mut frames,
             harlan_arch_x86_64::paging::KERNEL_STACKS_START,
         ) {
-            Ok((kernel, double_fault)) => {
+            Ok((kernel, double_fault, syscall)) => {
                 // SAFETY: `double_fault` was just mapped for this, is
                 // writable, stays mapped for the life of the kernel and
                 // nothing else uses it. Not called from a double fault.
                 unsafe { harlan_arch_x86_64::set_double_fault_stack(double_fault.top()) };
                 info!(
-                    "HARLAN: stacks = kernel {} KiB at {:#x}, double fault {} KiB at {:#x}, guard pages around both",
+                    "HARLAN: stacks = kernel {} KiB at {:#x}, double fault {} KiB at {:#x}, syscall {} KiB at {:#x}, guard pages around each",
                     kernel.size() / 1024,
                     kernel.bottom(),
                     double_fault.size() / 1024,
-                    double_fault.bottom()
+                    double_fault.bottom(),
+                    syscall.size() / 1024,
+                    syscall.bottom()
                 );
                 kernel_stack_top = Some(kernel.top());
-                kernel_stacks = Some((kernel, double_fault));
+                kernel_stacks = Some((kernel, double_fault, syscall));
             }
             Err(err) => error!(
                 "HARLAN: no guarded kernel stacks ({err:?}); staying on the firmware's stack"
@@ -319,7 +323,11 @@ struct KernelContext<C: Console + 'static, P: PowerControl + 'static> {
     physmap: Option<harlan_hal::addr::VirtAddr>,
     /// Where the heap is and how big, to label its frames.
     heap_range: Option<(harlan_hal::addr::VirtAddr, u64)>,
-    kernel_stacks: Option<(memory::stacks::Stack, memory::stacks::Stack)>,
+    kernel_stacks: Option<(
+        memory::stacks::Stack,
+        memory::stacks::Stack,
+        memory::stacks::Stack,
+    )>,
     mapper: harlan_arch_x86_64::paging::KernelPageTable,
     // Not `dyn`: a trait object's vtable pointer is written at runtime
     // and names the image where the firmware loaded it, which stops being
@@ -428,7 +436,7 @@ extern "C" fn continue_in_kernel_space<C: Console + 'static, P: PowerControl + '
     // SAFETY: interrupts are disabled, the relocations are applied, and
     // the double-fault stack is reinstalled right below.
     unsafe { harlan_arch_x86_64::interrupts::reinstall_descriptors() };
-    if let Some((_, double_fault)) = context.kernel_stacks {
+    if let Some((_, double_fault, _)) = context.kernel_stacks {
         // SAFETY: the same stack as in `kmain`: mapped, guarded, used by
         // nothing else, and this is not a double fault.
         unsafe { harlan_arch_x86_64::set_double_fault_stack(double_fault.top()) };
@@ -706,7 +714,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                 FramePurpose::Heap,
             );
         }
-        for stack in context.kernel_stacks.iter().flat_map(|(a, b)| [a, b]) {
+        for stack in context.kernel_stacks.iter().flat_map(|(a, b, c)| [a, b, c]) {
             memory::label_mapped_frames(
                 &context.mapper,
                 &mut context.frames,
@@ -735,6 +743,60 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         memory::heap::soak();
     }
 
+    // Ring 3, if the lower half is the kernel's to map into and there is
+    // a stack for syscalls to land on (ADR 0014). The program says hello
+    // and exits; the kernel carries on in `into_the_shell`, on that same
+    // syscall stack.
+    if let (true, Some((_, _, syscall_stack))) = (own_tables, context.kernel_stacks) {
+        // SAFETY: the kernel is where it means to stay, and this stack is
+        // its own, guarded, and used by nothing else.
+        unsafe { harlan_arch_x86_64::syscall::init(syscall_stack.top().as_u64()) };
+        // Where the CPU lands when it takes an interrupt while ring 3 is
+        // running. Same stack: a syscall cannot be interrupted (`FMASK`
+        // clears `IF`), so the two never use it at once.
+        // SAFETY: as above.
+        unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
+        // SAFETY: the lower half is the kernel's since `keep_only`, and
+        // nothing else uses the program's addresses.
+        match unsafe { user::load(&mut context.mapper, &mut context.frames) } {
+            Ok(program) => {
+                info!(
+                    "HARLAN: the program is {} byte(s) at {:#x}, its stack at {:#x}",
+                    user::PROGRAM.len(),
+                    user::PROGRAM_BASE,
+                    user::STACK_BASE
+                );
+                // SAFETY: `init` ran above, `load` mapped the pages, and
+                // `into_the_shell` is a function of this kernel's, safe to
+                // run on the syscall stack.
+                unsafe {
+                    user::enter(
+                        program,
+                        into_the_shell::<C, P>,
+                        (context as *mut KernelContext<C, P>).cast(),
+                    )
+                }
+            }
+            Err(err) => error!("HARLAN: the program could not be loaded ({err:?})"),
+        }
+    }
+
+    into_the_shell::<C, P>((context as *mut KernelContext<C, P>).cast())
+}
+
+/// Where the kernel goes once the program has exited — or straight away,
+/// if there was none to run.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn into_the_shell<C: Console + 'static, P: PowerControl + 'static>(
+    context: *mut u8,
+) -> ! {
+    use harlan_hal::InterruptControl;
+
+    // A syscall runs with interrupts off (`FMASK`), and the shell needs
+    // the keyboard.
+    harlan_arch_x86_64::Cpu.enable();
+    // SAFETY: the same context `run` was given; nothing else refers to it.
+    let context = unsafe { &mut *context.cast::<KernelContext<C, P>>() };
     let console = &mut *context.console;
     banner(console);
     shell::run_shell(console, context.power)
