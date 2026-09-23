@@ -11,11 +11,12 @@
 
 use harlan_arch_x86_64::paging::AddressSpace;
 use harlan_hal::addr::{PhysAddr, VirtAddr};
-use harlan_hal::frame::PhysRange;
+use harlan_hal::frame::{PhysFrame, PhysRange};
 use harlan_hal::info;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags};
 
 use crate::memory::frame_allocator::FramePurpose;
+use crate::memory::stacks::{self, Stack};
 use crate::memory::zeroed_frames::KernelFrames;
 
 /// Where a program's code goes, in every process: they do not share a
@@ -45,6 +46,12 @@ pub struct Process {
     /// against (ADR 0014, point 9).
     pub code: PhysRange,
     pub stack: PhysRange,
+    /// The frames behind that memory, so that they can be given back when
+    /// it exits.
+    pub frames: [PhysFrame; 2],
+    /// Where it enters the kernel: its own stack, with guard pages
+    /// (docs/adr/0018-fase3-context-switch.md).
+    pub kernel_stack: Stack,
 }
 
 /// Whether `[ptr, ptr + len)` falls inside one of `ranges`.
@@ -103,6 +110,7 @@ pub unsafe fn spawn(
     mapper: &mut harlan_arch_x86_64::paging::KernelPageTable,
     frames: &mut KernelFrames<'_>,
     program: &[u8],
+    kernel_stack: Stack,
 ) -> Result<Process, SpawnError> {
     if program.len() > PAGE_SIZE as usize {
         return Err(SpawnError::ProgramTooBig);
@@ -162,7 +170,41 @@ pub unsafe fn spawn(
         space,
         code: PhysRange::new(PhysAddr::new(CODE_BASE.as_u64()), PAGE_SIZE),
         stack: PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
+        frames: [code_frame, stack_frame],
+        kernel_stack,
     })
+}
+
+/// Gives back what a process that has exited was using: its memory and
+/// its kernel stack.
+///
+/// Its page tables are **not** given back: the mapper does not yet know
+/// which tables belong to which space, so five frames per dead process
+/// stay held. Named here rather than forgotten
+/// (docs/adr/0018-fase3-context-switch.md).
+///
+/// # Safety
+///
+/// The process must not be running, and nothing may still be using its
+/// memory or its kernel stack — including the stack this is called on.
+pub unsafe fn destroy(
+    mapper: &mut dyn harlan_hal::paging::PageMapper,
+    frames: &mut KernelFrames<'_>,
+    process: &Process,
+) -> u64 {
+    let mut returned = 0;
+    for (frame, purpose) in [
+        (process.frames[0], FramePurpose::Kernel),
+        (process.frames[1], FramePurpose::Stack),
+    ] {
+        if frames.deallocate_as(frame, purpose).is_ok() {
+            returned += 1;
+        }
+    }
+    // SAFETY: the process is not running and nothing points into its
+    // kernel stack any more (the caller's contract).
+    returned += unsafe { stacks::unmap(mapper, frames, process.kernel_stack) };
+    returned
 }
 
 #[cfg(test)]
