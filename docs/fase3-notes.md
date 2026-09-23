@@ -4,11 +4,86 @@ Lo más reciente arriba. Salida de la fase (ROADMAP.md): dos procesos
 aislados se comunican sin compartir memoria no autorizada. **Cumplida en
 el Incremento 24**: el mensaje cruza porque el kernel lo copia, la misma
 dirección es memoria distinta en cada proceso, y los cuatro intentos de
-salirse de ahí acaban con el proceso que los hizo y con nadie más.
+salirse de ahí acaban con el proceso que los hizo y con nadie más. El
+Incremento 25 paga la primera deuda que la fase dejó: un proceso muerto no
+se queda con nada.
 
 Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
+
+## Incremento 25 — Un proceso muerto no se queda con nada
+
+`docs/adr/0021-fase3-reclaiming-a-dead-space.md`. La primera deuda que
+Fase 3 dejó nombrada, pagada: las tablas de páginas de un proceso que
+termina vuelven al asignador.
+
+Era una nota al pie mientras corría un proceso. Con la demostración de
+salida de fase —ocho procesos, todos muertos— pasó a ser medible, y crece
+con cada proceso que el sistema llegue a arrancar.
+
+### Qué hace
+
+- **`AddressSpace::destroy` recorre la mitad baja** de su propio árbol y
+  ofrece cada marco de tabla al asignador, la raíz incluida.
+- **Solo la mitad baja**: las entradas del PML4 en y por encima de
+  `KERNEL_SPACE_BASE` apuntan a las tablas del kernel, compartidas por
+  referencia, y liberar una desmapearía el kernel de todos los demás
+  espacios —incluido el que la CPU está recorriendo—.
+- **Una entrada hoja no es una tabla**: lo que apunta una página de 2 MiB
+  o de 1 GiB es memoria de alguien, y el recorrido no baja de ahí.
+- **Quién decide si un marco era una tabla es el asignador.** `destroy`
+  recibe una función que devuelve si lo aceptó, y el kernel le pasa
+  `deallocate_as(frame, PageTable)`. Un marco etiquetado de otra cosa se
+  rechaza, así que la memoria del proceso no puede volver dos veces aunque
+  el recorrido se equivocara. Es la propiedad por marco del ADR 0004
+  haciendo de red, y es toda la seguridad del recorrido.
+- **Se cuenta lo que volvió**, no lo que se ofreció.
+- **El arranque comprueba que no queda nada**: el kernel anota los marcos
+  libres antes de que exista ningún proceso y, cuando todos han muerto,
+  compara.
+
+### La cifra estaba mal
+
+Los ADR 0017 y 0018 decían cinco marcos por proceso. Medida, es **cuatro**:
+el código en 4 MiB y la pila en 5 MiB caen en la misma entrada del
+directorio —que cubre 2 MiB— así que comparten tabla de páginas. Raíz,
+puntero de directorios, directorio y tabla. Los dos ADR contaron una tabla
+por región mapeada sin mirar la granularidad. El ADR 0021 lo corrige con
+el número medido.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+  `80 frame(s) back from the processes that ended; the allocator has the
+  62771 it started with`. Ochenta en vez de cuarenta y ocho: treinta y dos
+  más, cuatro por proceso. Y la segunda mitad de la línea es la que
+  importa —el asignador tiene exactamente los marcos que tenía antes de
+  que existiera ningún proceso—.
+- Diez marcos por proceso mientras vive —código, pila de usuario, cuatro
+  páginas de pila de kernel y cuatro tablas— y cero cuando muere.
+- Host: 246 pruebas (243 + 3: que devuelve exactamente las tablas que tomó
+  y ninguna del kernel, que una página grande no se confunde con una
+  tabla, y que un marco rechazado no se cuenta).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Prueba negativa del propio detector: pidiéndole las tablas al asignador
+  con la etiqueta equivocada —que las rechaza— el arranque dice
+  `48 frame(s) back from the processes that ended, but 32 are still held`.
+  La línea nueva no solo está: dispara, y con el número exacto.
+- Mutación: 8, las 8 detectadas. Una sobrevivió primero y era un `match`
+  sobre una conversión que no puede fallar —`ADDRESS_MASK` ya alinea la
+  dirección—, es decir código muerto disfrazado de manejo de errores.
+  Sustituido por el constructor infalible y una prueba que comprueba la
+  alineación que lo justifica, no queda rama inalcanzable que mutar.
+
+### Riesgos y límites
+
+- El recorrido supone que **nada de la mitad baja se comparte entre
+  espacios**. Hoy es cierto: cada proceso tiene su código y su pila y nada
+  más. El día que haya memoria compartida o copy-on-write hará falta un
+  recuento de referencias por tabla, que el ADR 0021 aplaza con nombre.
+- `dead_processes` entrega los procesos como `&mut`, porque vaciar un árbol
+  lo modifica.
 
 ## Incremento 24 — Aislamiento demostrado: la salida de Fase 3
 
@@ -117,7 +192,8 @@ que una prueba de host pudiera alcanzar.
   la CPU, y la del kernel, que dice de quién era.
 - Las tablas de páginas de un proceso muerto siguen sin liberarse: cinco
   marcos por proceso, y ahora son ocho procesos. Es lo primero que hay que
-  arreglar de la deuda de Fase 3.
+  arreglar de la deuda de Fase 3. **Pagado en el Incremento 25**, y eran
+  cuatro por proceso, no cinco: treinta y dos marcos por arranque.
 - El `#MC` (machine check) se trata como todo lo demás. Si llega desde ring
   3, mata al proceso, y una comprobación de máquina no es culpa del
   proceso. Queda dicho; hace falta hardware real para que importe.
@@ -212,7 +288,8 @@ turnan diciendo quiénes son, y los otros dos se pasan un mensaje.
 - **El remitente lleva la ranura del destino escrita por el kernel que lo
   arranca**: v0 no tiene forma de que un programa pregunte quién hay.
 - Las tablas de páginas de un proceso muerto siguen sin liberarse (cinco
-  marcos por proceso), como en el Incremento 22.
+  marcos por proceso), como en el Incremento 22. **Pagado en el
+  Incremento 25.**
 
 ## Incremento 22 — El scheduler: dos procesos turnándose
 
@@ -280,7 +357,8 @@ interrupciones desactivadas.
 - **Una syscall ya no puede dar por hecho que vuelve al mismo proceso.** Si
   cede, vuelve más tarde y en otra pila.
 - Las tablas de un proceso muerto no se recuperan: cinco marcos por
-  proceso. El mapper todavía no sabe qué tablas son de quién.
+  proceso. El mapper todavía no sabe qué tablas son de quién. **Pagado en
+  el Incremento 25**, y eran cuatro, no cinco.
 - Sin prioridades y sin dormir: un proceso que no hace nada sigue
   gastando su turno.
 - `swapgs` volverá con SMP, y entonces el camino de interrupción tendrá que
