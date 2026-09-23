@@ -907,19 +907,28 @@ mod tests {
 
     #[test]
     fn progress_that_stopped_before_the_end_fails() {
-        let found = analyze_soak(
-            &healthy_soak_log(),
-            TWO_RESETS,
-            2,
-            300,
-            60_000,
-            ProgressFreshness {
-                ticks_stalled: false,
-                heap_stalled: true,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(found, ["heap made no progress during the final 10 seconds"]);
+        // Each counter on its own, so neither branch can be dropped
+        // without a test noticing.
+        for (freshness, expected) in [
+            (
+                ProgressFreshness {
+                    ticks_stalled: false,
+                    heap_stalled: true,
+                },
+                "heap made no progress during the final 10 seconds",
+            ),
+            (
+                ProgressFreshness {
+                    ticks_stalled: true,
+                    heap_stalled: false,
+                },
+                "timer made no progress during the final 10 seconds",
+            ),
+        ] {
+            let found = analyze_soak(&healthy_soak_log(), TWO_RESETS, 2, 300, 60_000, freshness)
+                .unwrap_err();
+            assert_eq!(found, [expected]);
+        }
     }
 
     #[test]
