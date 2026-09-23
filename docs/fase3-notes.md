@@ -7,6 +7,72 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 18 — Ring 3
+
+`docs/adr/0014-fase3-syscall-abi-v0.md`. Por fin corre algo sin
+privilegios, y el kernel deja de estar a su alcance.
+
+### Qué hace
+
+- **Descriptores de usuario** en la GDT, en el orden que `sysretq` exige
+  (`SS` de `STAR[63:48] + 8`, `CS` de `+ 16`), y el TSS pasa a `0x28`.
+- **`syscall`/`sysret`**: `EFER.SCE`, `STAR`, `LSTAR` y `FMASK` (que limpia
+  `IF`, `DF` y `AC`). El stub entra con `swapgs`, cambia a una **tercera
+  pila con guard pages** —`syscall` no cambia de pila sola— construye el
+  marco de registros y llama al kernel.
+- **`PageFlags::user`**: el bit de usuario se pone en la hoja **y en cada
+  nivel del recorrido**, porque la CPU los ANDea. El mapper deja de
+  rechazar la mitad baja cuando la bandera está puesta, y **sigue
+  rechazando** mezclar los dos mundos: una página es del kernel o de un
+  programa, y lo dice.
+- **Un programa plano de 59 bytes** ensamblado a mano dentro de la imagen,
+  copiado a una página propia: dice hola con `log(ptr, len)` y sale con
+  `exit(7)`.
+- **Todo puntero que llega de ring 3 se valida** contra la memoria que el
+  programa tiene, antes de leer un byte.
+
+### Lo que la máquina enseñó
+
+**`TSS.rsp0` estaba sin poner.** Es la pila a la que salta la CPU cuando
+toma una interrupción o una excepción **mientras corre ring 3**; sin ella,
+el primer tick del temporizador después de entrar en modo usuario empuja
+sobre la dirección 0 y la máquina triplefaultea sin decir nada. El primer
+arranque con el programa corto funcionó **por suerte**: no llegó a caer un
+tick. Lo destapó la prueba negativa, que sí provocaba una excepción.
+
+### Verificación ejecutada
+
+- Host: 210 pruebas en verde.
+- QEMU, el registro de arranque:
+  `entering ring 3 at 0x400000` → `from ring 3: HARLAN: hello from ring 3`
+  → `the program exited with 7`, y el kernel sigue hasta el shell.
+- **Prueba negativa del aislamiento**: un programa que lee una dirección
+  del kernel produce
+  `#PF accessing 0xffff800000000000, error_code=0x4, rip=0x400000`. El
+  `0x4` es el bit de usuario: la CPU dice que quien lo intentó era ring 3.
+  Y el kernel sobrevive para contarlo.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` apaga,
+  `reboot` rearranca, `fmt-lint` limpio.
+- Mutación: 6. Cinco a la primera; la sexta —tomar un puntero de ring 3 sin
+  comprobarlo— **sobrevivió** porque el manejador no tenía prueba en host.
+  Escrita, las 6 detectadas.
+
+### Riesgos y límites
+
+- **Un solo programa, sin espacio de direcciones propio**: comparte las
+  tablas del kernel, y lo que lo protege es el bit de usuario, no un CR3
+  aparte. El Incremento 19 le da uno.
+- **La pila de syscalls es única**: vale mientras haya un proceso y las
+  syscalls no se interrumpan (`FMASK` limpia `IF`). Con scheduler habrá que
+  darle una por proceso.
+- `exit` no vuelve a quien lanzó el programa: continúa el kernel en una
+  función guardada, sobre la pila de syscalls. Es un cambio de contexto de
+  juguete; el de verdad llega con el scheduler.
+- El código del firmware sigue en la mitad baja, o sea en espacio de
+  usuario: todavía sin conflicto, porque el programa vive en `0x40_0000` y
+  el firmware mucho más arriba, pero sigue siendo el cabo suelto del ADR
+  0013.
+
 ## Incremento 17 — La mitad baja deja de ser del kernel
 
 `docs/adr/0013-fase3-physical-window.md`. El Incremento 16 sacó el código
