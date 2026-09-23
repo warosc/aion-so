@@ -19,24 +19,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: cargo clippy -p aion-hal -p aion-arch-x86_64 -p aion-fbcon -p aion-kernel -p xtask --all-targets -- -D warnings
-      - run: cargo clippy -p aion-kernel --target x86_64-unknown-none -- -D warnings
-      - run: cargo clippy -p aion-boot --target x86_64-unknown-uefi -- -D warnings
+      - run: cargo clippy -p harlan-hal -p harlan-arch-x86_64 -p harlan-fbcon -p harlan-kernel -p xtask --all-targets -- -D warnings
+      - run: cargo clippy -p harlan-kernel --target x86_64-unknown-none -- -D warnings
+      - run: cargo clippy -p harlan-boot --target x86_64-unknown-uefi -- -D warnings
 
   host-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: cargo test -p aion-hal -p aion-arch-x86_64 -p aion-fbcon -p aion-kernel -p xtask
+      - run: cargo test -p harlan-hal -p harlan-arch-x86_64 -p harlan-fbcon -p harlan-kernel -p xtask
 
   build-freestanding:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: cargo build -p aion-kernel --target x86_64-unknown-none --release
-      - run: cargo build -p aion-boot --target x86_64-unknown-uefi --release
+      - run: cargo build -p harlan-kernel --target x86_64-unknown-none --release
+      - run: cargo build -p harlan-boot --target x86_64-unknown-uefi --release
 
   boot-smoke-test:
     needs: build-freestanding
@@ -49,3 +49,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
       - run: cargo xtask boot-test --timeout-secs 30 --repeat 10
+      # Quoted: an unquoted ": " inside the marker would break the YAML.
+      - run: 'cargo xtask boot-test --timeout-secs 120 --heap-stress --marker "HARLAN: heap stress complete, 200000 cycles"'
+
+  soak-test:
+    needs: build-freestanding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+      - run: cargo xtask soak-test --duration-secs 120 --min-ticks 10000 --min-heap-cycles 50000

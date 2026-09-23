@@ -8,7 +8,7 @@ los drivers en sí, construidos sobre esas interfaces.
 
 Hoy:
 
-- `fbcon/` (`aion-fbcon`): consola de texto sobre un framebuffer lineal de
+- `fbcon/` (`harlan-fbcon`): consola de texto sobre un framebuffer lineal de
   32 bits (fuente 8×8 de `font8x8`, dibujada a 2×). Sin dependencias de
   arquitectura ni del firmware: solo recibe un `FramebufferInfo` de `hal`.
 

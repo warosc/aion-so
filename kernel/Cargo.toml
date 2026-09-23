@@ -1,12 +1,17 @@
 [package]
-name = "aion-kernel"
+name = "harlan-kernel"
 version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Long heap stress run at boot instead of the quick one (see memory::heap).
+heap-stress = []
+# Heap stress rounds forever instead of the shell (cargo xtask soak-test).
+soak = []
+
 [dependencies]
-aion-hal = { path = "../hal" }
-log = "0.4"
+harlan-hal = { path = "../hal" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-aion-arch-x86_64 = { path = "../arch/x86_64" }
+harlan-arch-x86_64 = { path = "../arch/x86_64" }

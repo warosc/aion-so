@@ -1,19 +1,20 @@
-use aion_hal::{Console, ConsoleKey, PowerControl};
+use harlan_hal::info;
+use harlan_hal::{Console, ConsoleKey, PowerControl};
 
 /// Logged once the shell starts polling for input. Grepped by
-/// `cargo xtask boot-test`. Distinct from the visible `AION> ` prompt: the
+/// `cargo xtask boot-test`. Distinct from the visible `Harlan> ` prompt: the
 /// prompt goes through the UEFI console device, this marker goes through
 /// the debugcon device — they are not the same channel, so the marker
 /// can't just be the literal prompt text.
-pub const SHELL_READY_MARKER: &str = "AION-PHASE1-SHELL-READY";
+pub const SHELL_READY_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
 
-const PROMPT: &str = "AION> ";
+const PROMPT: &str = crate::identity::SHELL_PROMPT;
 /// Fixed stack buffer: no heap exists yet (that's Fase 2), and a line this
 /// long is more than enough for the five known commands.
 const LINE_MAX: usize = 128;
 
 pub fn run_shell(console: &mut dyn Console, power: &dyn PowerControl) -> ! {
-    log::info!("{SHELL_READY_MARKER}");
+    info!("{SHELL_READY_MARKER}");
     let mut buf = [0u8; LINE_MAX];
     loop {
         console.write_str(PROMPT);
@@ -59,7 +60,12 @@ fn dispatch(console: &mut dyn Console, power: &dyn PowerControl, cmd: &str) {
     match cmd {
         "help" => console.write_str("help clear version reboot shutdown\n"),
         "clear" => console.clear(),
-        "version" => console.write_str(concat!("AION OS v", env!("CARGO_PKG_VERSION"), "\n")),
+        "version" => {
+            console.write_str(crate::identity::PRODUCT_NAME);
+            console.write_str(" ");
+            console.write_str(crate::identity::VERSION);
+            console.write_str("\n");
+        }
         "reboot" => power.reboot(),
         "shutdown" => power.shutdown(),
         "" => {}
@@ -74,8 +80,8 @@ fn dispatch(console: &mut dyn Console, power: &dyn PowerControl, cmd: &str) {
 fn idle_once() {
     #[cfg(target_arch = "x86_64")]
     {
-        use aion_hal::CpuControl;
-        aion_arch_x86_64::Cpu.halt_once();
+        use harlan_hal::CpuControl;
+        harlan_arch_x86_64::Cpu.halt_once();
     }
 }
 
@@ -151,7 +157,7 @@ mod tests {
     fn dispatch_version_reports_crate_version() {
         let mut console = FakeConsole::from_str("");
         dispatch(&mut console, &FakePower, "version");
-        assert_eq!(console.output, "AION OS v0.0.1\n");
+        assert_eq!(console.output, "HARLAN OS 0.0.1\n");
     }
 
     #[test]

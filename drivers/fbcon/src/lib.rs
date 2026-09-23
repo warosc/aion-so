@@ -8,12 +8,13 @@
 //!
 //! Colors are white on black. Both are byte-order symmetric as a 32-bit
 //! pixel (`0x00FFFFFF` / `0`), so RGB-versus-BGR framebuffers need no
-//! distinction here — see `aion_hal::framebuffer::FramebufferInfo`.
+//! distinction here — see `harlan_hal::framebuffer::FramebufferInfo`.
 
 #![cfg_attr(not(test), no_std)]
 
-use aion_hal::framebuffer::FramebufferInfo;
 use font8x8::legacy::BASIC_LEGACY;
+use harlan_hal::addr::VirtAddr;
+use harlan_hal::framebuffer::FramebufferInfo;
 
 const GLYPH_PIXELS: usize = 8;
 const SCALE: usize = 2;
@@ -50,6 +51,11 @@ impl<S: Surface> TextConsole<S> {
             col: 0,
             row: 0,
         }
+    }
+
+    /// The surface, to tell it something only its owner knows.
+    pub fn surface_mut(&mut self) -> &mut S {
+        &mut self.surface
     }
 
     pub fn write_str(&mut self, s: &str) {
@@ -155,7 +161,7 @@ impl FramebufferSurface {
             || height == 0
             || stride < width
             || needed_bytes > info.size_bytes
-            || !info.base_addr.is_multiple_of(size_of::<u32>() as u64)
+            || !info.base_addr.is_aligned_to(size_of::<u32>() as u64)
         {
             return None;
         }
@@ -164,14 +170,27 @@ impl FramebufferSurface {
         if cols == 0 || rows == 0 {
             return None;
         }
+        // The framebuffer is identity-mapped, so its physical address is
+        // also the address the CPU uses; the caller promises it is mapped.
         Some(Self {
-            base: info.base_addr as *mut u32,
+            base: VirtAddr::new(info.base_addr.as_u64()).as_ptr::<u32>(),
             width,
             height,
             stride,
             cols,
             rows,
         })
+    }
+
+    /// Draws into the same framebuffer through a new address.
+    ///
+    /// # Safety
+    ///
+    /// `base` must name the same framebuffer this surface was built for,
+    /// mapped for volatile reads and writes of the size `new` checked, and
+    /// stay valid for as long as this surface is used.
+    pub unsafe fn rebase(&mut self, base: VirtAddr) {
+        self.base = base.as_ptr::<u32>();
     }
 
     fn put_pixel(&mut self, x: usize, y: usize, color: u32) {
@@ -256,6 +275,7 @@ impl Surface for FramebufferSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harlan_hal::addr::PhysAddr;
 
     #[derive(Debug, PartialEq, Eq)]
     enum Op {
@@ -461,7 +481,7 @@ mod tests {
 
     fn info_for(buf: &mut [u32]) -> FramebufferInfo {
         FramebufferInfo {
-            base_addr: buf.as_mut_ptr() as u64,
+            base_addr: PhysAddr::new(buf.as_mut_ptr() as u64),
             width: W as u32,
             height: H as u32,
             stride: STRIDE as u32,

@@ -1,4 +1,4 @@
-# Roadmap de AION OS
+# Roadmap de HARLAN OS
 
 Cada fase termina únicamente cuando sus criterios pueden reproducirse desde un entorno limpio.
 
@@ -11,7 +11,7 @@ Cada fase termina únicamente cuando sus criterios pueden reproducirse desde un 
 
 **Salida:** un comando construye y arranca la imagen.
 
-## Fase 1 — AION v0.0.1: primer arranque
+## Fase 1 — HARLAN OS v0.0.1: primer arranque
 
 - Aplicación UEFI carga el kernel.
 - Framebuffer o consola funcional.
@@ -56,7 +56,7 @@ Cada fase termina únicamente cuando sus criterios pueden reproducirse desde un 
 - Inventario de hardware del equipo objetivo.
 - Drivers mínimos de entrada, pantalla, almacenamiento y red.
 
-**Salida:** AION arranca de forma repetible en el PC objetivo sin escribir en discos no seleccionados.
+**Salida:** HARLAN OS arranca de forma repetible en el PC objetivo sin escribir en discos no seleccionados.
 
 ## Fase 6 — Capacidades y agentes
 

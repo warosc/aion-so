@@ -1,9 +1,10 @@
 use core::panic::PanicInfo;
 
 #[cfg(target_arch = "x86_64")]
-use aion_hal::CpuControl;
+use harlan_hal::CpuControl;
+use harlan_hal::error;
 
-/// AION's own panic handler. Logs through the same `log`/debugcon pipeline
+/// HARLAN OS's own panic handler. Logs through the same `log`/debugcon pipeline
 /// everything else in this codebase already uses, so a panic is visible to
 /// both `cargo xtask run` (debugcon is echoed to stdio there) and
 /// `cargo xtask boot-test` (debugcon is captured to a file there). The
@@ -24,11 +25,11 @@ use aion_hal::CpuControl;
 /// - Never returns.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    log::error!("AION PANIC: {info}");
+    error!("HARLAN PANIC: {info}");
 
     #[cfg(target_arch = "x86_64")]
     {
-        aion_arch_x86_64::Cpu.halt_loop()
+        harlan_arch_x86_64::Cpu.halt_loop()
     }
 
     #[cfg(not(target_arch = "x86_64"))]

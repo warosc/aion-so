@@ -28,7 +28,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
-use aion_hal::{CpuControl, InterruptControl};
+use harlan_hal::{CpuControl, InterruptControl};
+use harlan_hal::{error, info, warn};
 
 /// Written only by the timer ISR (`VECTOR_TIMER` below); read by
 /// `ticks()`, `hal::TickCounter`'s sole consumer today.
@@ -240,7 +241,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
     let frame = unsafe { &*frame };
     match frame.vector as u8 {
         VECTOR_DIVIDE_ERROR => {
-            log::error!("AION: #DE divide error at rip={:#x}", frame.rip);
+            error!("HARLAN: #DE divide error at rip={:#x}", frame.rip);
             halt();
         }
         VECTOR_NMI => {
@@ -248,10 +249,10 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             // principle arrive even during Incremento 1's cli-before-lidt
             // window. Nothing in this codebase intentionally raises one;
             // logging and returning is the safe default.
-            log::warn!("AION: NMI received (non-fatal)");
+            warn!("HARLAN: NMI received (non-fatal)");
         }
         VECTOR_BREAKPOINT => {
-            log::info!("AION: breakpoint handler OK");
+            info!("HARLAN: breakpoint handler OK");
         }
         VECTOR_TIMER => {
             let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -263,7 +264,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
                 crate::pic::send_eoi();
             }
             if count.is_multiple_of(100) {
-                log::info!("AION: ticks={count}");
+                info!("HARLAN: ticks={count}");
             }
         }
         VECTOR_KEYBOARD => {
@@ -277,26 +278,23 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             }
         }
         VECTOR_GENERAL_PROTECTION => {
-            log::error!(
-                "AION: #GP error_code={:#x} at rip={:#x}",
-                frame.error_code,
-                frame.rip
+            error!(
+                "HARLAN: #GP error_code={:#x} at rip={:#x}",
+                frame.error_code, frame.rip
             );
             halt();
         }
         VECTOR_PAGE_FAULT => {
             let faulting_address = read_cr2();
-            log::error!(
-                "AION: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
-                faulting_address,
-                frame.error_code,
-                frame.rip
+            error!(
+                "HARLAN: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
+                faulting_address, frame.error_code, frame.rip
             );
             halt();
         }
         other => {
-            log::error!(
-                "AION: unhandled exception vector={other} at rip={:#x}",
+            error!(
+                "HARLAN: unhandled exception vector={other} at rip={:#x}",
                 frame.rip
             );
             halt();
@@ -346,7 +344,13 @@ unsafe extern "C" fn double_fault_stub() -> ! {
 }
 
 extern "C" fn double_fault_handler() {
-    log::error!("AION: #DF DOUBLE FAULT - halting");
+    // The address says which stack this ran on: the IST stack the kernel
+    // mapped with guard pages, or the static one used before that.
+    let here = 0u8;
+    error!(
+        "HARLAN: #DF DOUBLE FAULT on the stack at {:#x} - halting",
+        core::ptr::addr_of!(here) as u64
+    );
 }
 
 /// # Safety
@@ -371,7 +375,55 @@ pub unsafe fn init() {
     // function's own contract.
     unsafe {
         gdt::init();
+        install_gates();
+        load_idt();
+    }
 
+    // Self-test: prove the IDT is actually wired up before relying on it
+    // for anything else. `int3` is a trap (not a fault): RIP saved on the
+    // stack already points past this instruction, so execution resumes
+    // normally right after it with no adjustment needed.
+    unsafe {
+        core::arch::asm!("int3", options(nostack));
+    }
+}
+
+/// Loads the GDT, TSS and IDT again, reading the addresses of those
+/// tables as they are now.
+///
+/// They hold absolute addresses — the GDTR and IDTR point at the tables,
+/// the TSS descriptor carries its base — so a kernel that has moved (see
+/// docs/adr/0012-fase3-higher-half-kernel.md) keeps pointing at where it
+/// used to be until this runs. Touches no hardware: the PIC, the PIT and
+/// the i8042 keep the state they were left in.
+///
+/// # Safety
+///
+/// Interrupts must be disabled, the image's relocations must already be
+/// applied, and the caller must reinstall the double-fault stack
+/// afterwards (`set_double_fault_stack`), because loading the GDT resets
+/// IST1 to the one inside the image. Single core.
+pub unsafe fn reinstall_descriptors() {
+    // SAFETY: same writes as `init`, to the same `'static` tables, with
+    // interrupts disabled by this function's own contract.
+    unsafe {
+        gdt::init();
+        install_gates();
+        load_idt();
+        core::arch::asm!("int3", options(nostack));
+    }
+}
+
+/// Fills every vector this kernel answers. Separate from `init` so the
+/// same set can be installed again after the kernel moves.
+///
+/// # Safety
+///
+/// Interrupts must be disabled; single core.
+unsafe fn install_gates() {
+    // SAFETY: single-threaded, interrupts disabled, writing the `'static`
+    // IDT that only this module owns.
+    unsafe {
         // Install the catch-all first, so every slot has a valid, present
         // gate before anything else can possibly fire — including the
         // already-in-flight race described in the module doc comment.
@@ -421,26 +473,40 @@ pub unsafe fn init() {
             GATE_TYPE_INTERRUPT,
         );
 
-        #[repr(C, packed)]
-        struct DescriptorTablePointer {
-            limit: u16,
-            base: u64,
-        }
-        let idt_ptr = DescriptorTablePointer {
-            limit: (size_of::<Idt>() - 1) as u16,
-            base: core::ptr::addr_of!(IDT) as u64,
-        };
-        // SAFETY: `idt_ptr` points at a `'static` IDT fully populated
-        // above; `lidt` only loads the IDTR, it cannot itself fault.
-        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
+        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
+            timer_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
+        IDT.0[VECTOR_KEYBOARD as usize] = IdtEntry::new(
+            keyboard_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
     }
+}
 
-    // Self-test: prove the IDT is actually wired up before relying on it
-    // for anything else. `int3` is a trap (not a fault): RIP saved on the
-    // stack already points past this instruction, so execution resumes
-    // normally right after it with no adjustment needed.
+/// Points the IDTR at the table where it lives now.
+///
+/// # Safety
+///
+/// Every gate must be installed first; interrupts disabled.
+unsafe fn load_idt() {
+    #[repr(C, packed)]
+    struct DescriptorTablePointer {
+        limit: u16,
+        base: u64,
+    }
+    let idt_ptr = DescriptorTablePointer {
+        limit: (size_of::<Idt>() - 1) as u16,
+        base: core::ptr::addr_of!(IDT) as u64,
+    };
+    // SAFETY: `idt_ptr` points at a `'static` IDT fully populated by
+    // `install_gates`; `lidt` only loads the IDTR, it cannot itself fault.
     unsafe {
-        core::arch::asm!("int3", options(nostack));
+        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
     }
 }
 
@@ -456,17 +522,9 @@ pub unsafe fn init() {
 /// unmasked), with interrupts still disabled. Not safe to call more than
 /// once or concurrently — single-core kernel in Fase 2.
 pub unsafe fn init_timer() {
-    // SAFETY: writing one more entry into the same `'static` IDT already
-    // fully populated and loaded by `init()`, before interrupts are ever
-    // enabled — the same single-threaded-init reasoning `init()` itself
-    // documents.
+    // The vector itself was installed by `init()`; what is left is the
+    // hardware.
     unsafe {
-        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
-            timer_stub as *const () as u64,
-            gdt::KERNEL_CODE_SELECTOR,
-            0,
-            GATE_TYPE_INTERRUPT,
-        );
         // SAFETY: interrupts are still disabled here (nothing between
         // `init()` and this call re-enables them).
         crate::pic::remap();
@@ -494,18 +552,8 @@ pub unsafe fn init_timer() {
 /// interrupts are enabled — the i8042 setup polls the output buffer the
 /// IRQ1 handler would otherwise consume. Once only, single-core.
 pub unsafe fn init_keyboard() -> Result<(), crate::keyboard::InitError> {
-    // SAFETY: as in `init_timer`: one more entry in the same `'static`
-    // IDT, before interrupts are ever enabled. Installed before the
-    // controller is touched, so a handler exists before the hardware can
+    // The vector was installed by `init()`, before the hardware could
     // possibly raise the line.
-    unsafe {
-        IDT.0[VECTOR_KEYBOARD as usize] = IdtEntry::new(
-            keyboard_stub as *const () as u64,
-            gdt::KERNEL_CODE_SELECTOR,
-            0,
-            GATE_TYPE_INTERRUPT,
-        );
-    }
     // SAFETY: interrupts are disabled and IRQ1 is still masked (`remap`
     // masked everything and nothing has unmasked line 1 yet), which is
     // exactly `init_controller`'s contract.

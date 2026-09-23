@@ -1,15 +1,19 @@
 [package]
-name = "aion-boot"
+name = "harlan-boot"
 version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+heap-stress = ["harlan-kernel/heap-stress"]
+soak = ["harlan-kernel/soak"]
+
 [dependencies]
-log = "0.4"
-aion-kernel = { path = "../kernel" }
-uefi = { version = "0.40.0", features = ["logger", "log-debugcon"] }
-aion-hal = { path = "../hal" }
-aion-fbcon = { path = "../drivers/fbcon" }
+harlan-kernel = { path = "../kernel" }
+uefi = { version = "0.40.0" }
+uefi-raw = "0.16.0"
+harlan-hal = { path = "../hal" }
+harlan-fbcon = { path = "../drivers/fbcon" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-aion-arch-x86_64 = { path = "../arch/x86_64" }
+harlan-arch-x86_64 = { path = "../arch/x86_64" }

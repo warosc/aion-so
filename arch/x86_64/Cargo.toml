@@ -1,9 +1,8 @@
 [package]
-name = "aion-arch-x86_64"
+name = "harlan-arch-x86_64"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-aion-hal = { path = "../../hal" }
-log = "0.4"
+harlan-hal = { path = "../../hal" }

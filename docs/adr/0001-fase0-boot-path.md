@@ -1,5 +1,11 @@
 # ADR 0001: Boot path de Fase 0 — app UEFI propia con `uefi-rs`
 
+> **Nota (ADR 0003):** documento anterior a la migración de marca AION OS →
+> HARLAN OS. Se conserva sin reescribir porque registra lo que se decidió y
+> observó entonces. `AION` / `aion-*` / `aion_*` equivalen hoy a `HARLAN` /
+> `harlan-*` / `harlan_*`; tabla completa en
+> `docs/adr/0003-brand-migration-harlan.md`.
+
 ## Contexto
 
 Fase 0 (`ROADMAP.md`) exige que "un comando construya y arranque la

@@ -1,4 +1,4 @@
-use aion_hal::PowerControl;
+use harlan_hal::PowerControl;
 use uefi::Status;
 use uefi::runtime::{self, ResetType};
 

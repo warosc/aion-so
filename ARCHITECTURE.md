@@ -1,4 +1,4 @@
-# Arquitectura de AION OS
+# Arquitectura de HARLAN OS
 
 ## Regla fundamental
 
@@ -17,7 +17,7 @@ Capability Manager
     ↓
 System Services / IPC
     ↓
-AION Kernel
+Harlan Kernel
     ↓
 HAL + Drivers
     ↓
@@ -61,8 +61,8 @@ La primera plataforma soportada será `x86_64 + UEFI + QEMU`. El primer hardware
 
 Una tarea recibe permisos específicos y revocables, por ejemplo:
 
-- `fs.read:/projects/aion`
-- `fs.write:/projects/aion/output`
+- `fs.read:/projects/harlanos`
+- `fs.write:/projects/harlanos/output`
 - `network.connect:api.example.com:443`
 - `device.camera:use`
 
