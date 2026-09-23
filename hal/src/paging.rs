@@ -5,34 +5,47 @@
 use crate::addr::{PhysAddr, VirtAddr};
 use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame, PhysRange};
 
-/// A range that must stay executable in a map, and whether it must also
-/// stay writable.
+/// A range that has to stay mapped, and how.
 ///
-/// The kernel's own code does not: mapping it read-only is the other half
-/// of write xor execute. The firmware's runtime services code does —
-/// OVMF writes inside it, and `shutdown` faults with
-/// `#PF ... error_code=0x3` if that range is read-only (measured; see
-/// docs/adr/0011-fase2-write-xor-execute-inside-the-image.md).
+/// The kernel's own code is executable and never written: mapping it
+/// read-only is the other half of write xor execute. The firmware's
+/// runtime services code is executable **and** written — OVMF writes
+/// inside it, and `shutdown` faults with `#PF ... error_code=0x3` if that
+/// range is read-only (measured; see
+/// docs/adr/0011-fase2-write-xor-execute-inside-the-image.md). And what
+/// that code reads and writes is data: writable, never executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutableRange {
+pub struct MappedRange {
     pub range: PhysRange,
     pub writable: bool,
+    pub executable: bool,
 }
 
-impl ExecutableRange {
+impl MappedRange {
     /// Code the kernel controls: executable, never written.
-    pub const fn read_only(range: PhysRange) -> Self {
+    pub const fn read_only_code(range: PhysRange) -> Self {
         Self {
             range,
             writable: false,
+            executable: true,
         }
     }
 
     /// Code someone else controls and writes into.
-    pub const fn writable(range: PhysRange) -> Self {
+    pub const fn writable_code(range: PhysRange) -> Self {
         Self {
             range,
             writable: true,
+            executable: true,
+        }
+    }
+
+    /// What that code keeps between calls.
+    pub const fn data(range: PhysRange) -> Self {
+        Self {
+            range,
+            writable: true,
+            executable: false,
         }
     }
 }

@@ -16,14 +16,14 @@
 //!
 //! The walking logic (`PageTables`) is generic over how table memory is
 //! reached (`TableAccess`), so it is host-tested against simulated
-//! physical memory. Only `IdentityAccess` and the register accessors touch
+//! physical memory. Only `PhysAccess` and the register accessors touch
 //! the hardware.
 
 use core::arch::asm;
 
 use harlan_hal::addr::{PhysAddr, VirtAddr};
 use harlan_hal::frame::{FrameAllocator, PhysFrame};
-use harlan_hal::paging::{ExecutableRange, MapError, Page, PageFlags, PageMapper, UnmapError};
+use harlan_hal::paging::{MapError, MappedRange, Page, PageFlags, PageMapper, UnmapError};
 
 /// First address of kernel space: PML4 slot 256, the start of the
 /// canonical higher half. The bare number is what the walker below does
@@ -41,6 +41,12 @@ pub const KERNEL_HEAP_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + (1 << 
 /// so a stack that runs off its guard page can only ever land on an
 /// unmapped page (see docs/fase2-notes.md, Incremento 10).
 pub const KERNEL_STACKS_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 2 * (1 << 39));
+
+/// Where all of physical memory is readable and writable, so the kernel
+/// can reach a frame without the identity map of the lower half, which
+/// becomes user space: PML4 slot 260
+/// (docs/adr/0013-fase3-physical-window.md).
+pub const KERNEL_PHYSMAP_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 4 * (1 << 39));
 
 /// Where the kernel's own image is mapped so that it can stop running from
 /// wherever the firmware put it: PML4 slot 259
@@ -100,6 +106,10 @@ pub enum PagingError {
     /// A range that must stay executable falls outside the new map, which
     /// would leave the kernel without the code it is about to run.
     RequiredRangeOutsideIdentityMap,
+    /// The physical window has to start at a PML4 slot of kernel space.
+    WindowOutsideKernelSpace,
+    /// Something is already mapped where the physical window would go.
+    WindowSlotTaken,
 }
 
 /// What `rebuild_identity_map` built.
@@ -120,6 +130,13 @@ pub struct IdentityMapStats {
 
 /// How the walker reaches table memory, given a table's physical address.
 trait TableAccess {
+    /// What is added to a table's physical address to reach it. Zero for
+    /// anything that can read physical memory directly, which is what the
+    /// tests do.
+    fn window(&self) -> u64 {
+        0
+    }
+
     fn read(&self, table: u64, index: usize) -> u64;
     fn write(&mut self, table: u64, index: usize, value: u64);
     /// Drops any cached translation of `va`.
@@ -279,7 +296,7 @@ impl<A: TableAccess> PageTables<A> {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
-        executable: &[ExecutableRange],
+        executable: &[MappedRange],
     ) -> Result<IdentityMapStats, PagingError> {
         if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
             return Err(PagingError::BadIdentityLimit);
@@ -335,8 +352,10 @@ impl<A: TableAccess> PageTables<A> {
                         continue;
                     }
                     let runs_code = executable.iter().any(|code| {
-                        code.range
-                            .overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
+                        code.executable
+                            && code
+                                .range
+                                .overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
                     });
                     // A page that is code and nothing but code is never
                     // written, so it is mapped read-only: the other half of
@@ -382,6 +401,123 @@ impl<A: TableAccess> PageTables<A> {
         })
     }
 
+    /// Maps `[0, limit)` of physical memory at `base`, writable and
+    /// no-execute, in 2 MiB pages. Nothing is executed through this
+    /// window and nothing but the kernel can reach it.
+    fn map_physical_window(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        base: u64,
+        limit: u64,
+    ) -> Result<u64, PagingError> {
+        if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
+            return Err(PagingError::BadIdentityLimit);
+        }
+        if base < KERNEL_SPACE_BASE || !base.is_multiple_of(512 * GIB) {
+            return Err(PagingError::WindowOutsideKernelSpace);
+        }
+        // Asked before a single frame is spent, so a window that cannot
+        // be placed costs nothing.
+        let root_slot = table_indices(base)[0];
+        if self.access.read(self.root, root_slot) & PRESENT != 0 {
+            return Err(PagingError::WindowSlotTaken);
+        }
+        let to_paging = |err| match err {
+            MapError::OutOfFrames => PagingError::OutOfFrames,
+            _ => PagingError::TableFrameNotWritable,
+        };
+
+        // Built whole and linked at the end, like the identity map: the
+        // walker never sees a half-built window.
+        let pdpt = self.new_table(frames).map_err(to_paging)?;
+        let mut tables = 1;
+        for slot in 0..(limit / GIB) as usize {
+            let directory = self.new_table(frames).map_err(to_paging)?;
+            tables += 1;
+            for entry in 0..ENTRIES {
+                let physical = slot as u64 * GIB + entry as u64 * LARGE_PAGE;
+                self.access.write(
+                    directory,
+                    entry,
+                    physical | PRESENT | WRITABLE | HUGE | NO_EXECUTE,
+                );
+            }
+            self.access
+                .write(pdpt, slot, directory | PRESENT | WRITABLE);
+        }
+        self.access
+            .write(self.root, root_slot, pdpt | PRESENT | WRITABLE);
+        self.access.flush_all();
+        Ok(tables)
+    }
+
+    /// Leaves the lower half with `keep` mapped and nothing else.
+    ///
+    /// Everything the kernel needs is in kernel space by now; what is left
+    /// down here is code that belongs to somebody else — the firmware's
+    /// runtime services — and it has to stay reachable at the address it
+    /// was compiled for.
+    fn keep_only(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        keep: &[MappedRange],
+    ) -> Result<u64, PagingError> {
+        let to_paging = |err| match err {
+            MapError::OutOfFrames => PagingError::OutOfFrames,
+            _ => PagingError::TableFrameNotWritable,
+        };
+        if keep.iter().any(|code| {
+            code.range.len == 0
+                || code.range.start.as_u64() >= 512 * GIB
+                || code.range.end().as_u64() > 512 * GIB
+        }) {
+            return Err(PagingError::RequiredRangeOutsideIdentityMap);
+        }
+
+        // Built whole while the old map is still usable — every table
+        // frame has to be reachable to be zeroed — and linked at the end.
+        // The other way round, emptying the lower half first, takes away
+        // the very addresses the next table would be written through.
+        let pdpt = self.new_table(frames).map_err(to_paging)?;
+        let mut tables = 1;
+        for code in keep {
+            let first = code.range.start.as_u64() / PAGE * PAGE;
+            let last = (code.range.end().as_u64() - 1) / PAGE * PAGE;
+            for page in (first..=last).step_by(PAGE as usize) {
+                // Everything here is below 512 GiB, so the walk starts at
+                // the new PDPT, one level down from the root.
+                let indices = table_indices(page);
+                let mut table = pdpt;
+                for &index in &indices[1..3] {
+                    let entry = self.access.read(table, index);
+                    table = if entry & PRESENT == 0 {
+                        let new = self.new_table(frames).map_err(to_paging)?;
+                        tables += 1;
+                        self.access.write(table, index, new | PRESENT | WRITABLE);
+                        new
+                    } else {
+                        entry & ADDRESS_MASK
+                    };
+                }
+                let mut leaf = page | PRESENT;
+                if code.writable {
+                    leaf |= WRITABLE;
+                }
+                if !code.executable {
+                    leaf |= NO_EXECUTE;
+                }
+                self.access.write(table, indices[3], leaf);
+            }
+        }
+
+        self.access.write(self.root, 0, pdpt | PRESENT | WRITABLE);
+        for slot in 1..table_indices(KERNEL_SPACE_BASE)[0] {
+            self.access.write(self.root, slot, 0);
+        }
+        self.access.flush_all();
+        Ok(tables)
+    }
+
     /// A zeroed page table in a fresh frame. Tables are written through
     /// their physical address, so a frame that address does not reach
     /// writably is refused (and not returned to `frames`, which has no way
@@ -393,7 +529,9 @@ impl<A: TableAccess> PageTables<A> {
             .ok_or(MapError::OutOfFrames)?
             .start_address()
             .as_u64();
-        match self.translate(frame) {
+        // The table is written through the window, so that is the address
+        // that has to be mapped to it, and writable.
+        match self.translate(self.access.window() + frame) {
             Some(t) if t.phys == frame && t.writable => {}
             _ => return Err(MapError::TableFrameNotWritable),
         }
@@ -410,23 +548,43 @@ impl<A: TableAccess> PageTables<A> {
 /// the active root or new tables `new_table` verified identity-mapped and
 /// writable, with indices below 512, and only ever writes the kernel's own
 /// tables (the host tests check that no firmware table is written).
-struct IdentityAccess;
+struct PhysAccess {
+    /// A table at physical address `p` is reached at `base + p`. Zero
+    /// while the firmware's identity map is what the kernel runs under;
+    /// the physical window's base once the lower half is user space
+    /// (docs/adr/0013-fase3-physical-window.md).
+    base: u64,
+}
 
-impl TableAccess for IdentityAccess {
+impl PhysAccess {
+    const fn identity() -> Self {
+        Self { base: 0 }
+    }
+
+    fn entry(&self, table: u64, index: usize) -> *mut u64 {
+        ((self.base + table) as *mut u64).wrapping_add(index)
+    }
+}
+
+impl TableAccess for PhysAccess {
+    fn window(&self) -> u64 {
+        self.base
+    }
+
     fn read(&self, table: u64, index: usize) -> u64 {
-        // SAFETY: `table` is the physical address of a page table, valid as
-        // a virtual address under the identity map; `index < 512` keeps the
-        // 8-byte-aligned read inside that 4 KiB page. Volatile because the
-        // CPU's page walker also reads (and sets accessed bits in) this
-        // memory behind the compiler's back.
-        unsafe { core::ptr::read_volatile((table as *const u64).add(index)) }
+        // SAFETY: `base + table` is where this page table is readable —
+        // under the identity map, or through the kernel's window — and
+        // `index < 512` keeps the 8-byte-aligned read inside that 4 KiB
+        // page. Volatile because the CPU's page walker also reads (and
+        // sets accessed bits in) this memory behind the compiler's back.
+        unsafe { core::ptr::read_volatile(self.entry(table, index)) }
     }
 
     fn write(&mut self, table: u64, index: usize, value: u64) {
         // SAFETY: as for `read`, and `table` is one of the kernel's own
         // tables, mapped writable (see the type's documentation), which no
         // Rust reference points into.
-        unsafe { core::ptr::write_volatile((table as *mut u64).add(index), value) }
+        unsafe { core::ptr::write_volatile(self.entry(table, index), value) }
     }
 
     fn flush(&mut self, va: u64) {
@@ -449,7 +607,7 @@ impl TableAccess for IdentityAccess {
 /// The kernel's page tables, once it has taken over the root from the
 /// firmware.
 pub struct KernelPageTable {
-    tables: PageTables<IdentityAccess>,
+    tables: PageTables<PhysAccess>,
 }
 
 impl KernelPageTable {
@@ -470,7 +628,7 @@ impl KernelPageTable {
     pub unsafe fn active_identity_writable_run(frame: PhysFrame) -> Option<u64> {
         let tables = PageTables {
             root: read_cr3() & ADDRESS_MASK,
-            access: IdentityAccess,
+            access: PhysAccess::identity(),
         };
         let addr = frame.start_address().as_u64();
         match tables.translate(addr) {
@@ -506,7 +664,7 @@ impl KernelPageTable {
         let cr3 = read_cr3();
         let firmware = PageTables {
             root: cr3 & ADDRESS_MASK,
-            access: IdentityAccess,
+            access: PhysAccess::identity(),
         };
         // The walker reads tables through their physical addresses, so the
         // identity map must hold where it matters: the root table itself
@@ -520,7 +678,7 @@ impl KernelPageTable {
             }
         }
 
-        let tables = PageTables::adopt(IdentityAccess, firmware.root, frames)?;
+        let tables = PageTables::adopt(PhysAccess::identity(), firmware.root, frames)?;
         // SAFETY: the new root holds the same 512 entries as the active
         // one, so every translation (code, stack, data, the firmware's
         // runtime services) is unchanged across the switch; the old root is
@@ -557,9 +715,54 @@ impl KernelPageTable {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
-        executable: &[ExecutableRange],
+        executable: &[MappedRange],
     ) -> Result<IdentityMapStats, PagingError> {
         self.tables.rebuild_identity(frames, limit, executable)
+    }
+
+    /// Opens the window onto physical memory at `base`, covering
+    /// `[0, limit)`. Answers how many page tables it took.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be a free PML4 slot of kernel space, the kernel must
+    /// own its page tables (`take_over`), and nothing may already be
+    /// reaching physical memory through `base`.
+    pub unsafe fn map_physical_window(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        base: VirtAddr,
+        limit: u64,
+    ) -> Result<u64, PagingError> {
+        self.tables
+            .map_physical_window(frames, base.as_u64(), limit)
+    }
+
+    /// Reaches page tables through the window at `base` from now on,
+    /// instead of at their physical addresses.
+    ///
+    /// # Safety
+    ///
+    /// The window must already map every page table, and every frame that
+    /// may become one, writable at `base + physical address`.
+    pub unsafe fn use_physical_window(&mut self, base: VirtAddr) {
+        self.tables.access.base = base.as_u64();
+    }
+
+    /// Unmaps the lower half except `keep`, which stays where it is.
+    ///
+    /// # Safety
+    ///
+    /// Nothing of the kernel's may still live in the lower half: not its
+    /// code, not its stack, not the window it reaches frames through, not
+    /// the console's framebuffer. `keep` is what somebody else's code
+    /// needs, at the addresses it was compiled for.
+    pub unsafe fn keep_only_in_lower_half(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+        keep: &[MappedRange],
+    ) -> Result<u64, PagingError> {
+        self.tables.keep_only(frames, keep)
     }
 }
 
@@ -1005,7 +1208,7 @@ mod tests {
         ]);
         let mut tables = adopted(&mut frames);
         let stats = tables
-            .rebuild_identity(&mut frames, GIB, &[ExecutableRange::read_only(image)])
+            .rebuild_identity(&mut frames, GIB, &[MappedRange::read_only_code(image)])
             .unwrap();
         // PDPT, page directory, the first 2 MiB, and the 2 MiB with the image.
         assert_eq!((stats.tables, stats.executable_pages), (4, 2));
@@ -1092,7 +1295,7 @@ mod tests {
         let mut tables = adopted(&mut frames);
         let outside = PhysRange::new(PhysAddr::new(GIB - PAGE), 2 * PAGE);
         assert_eq!(
-            tables.rebuild_identity(&mut frames, GIB, &[ExecutableRange::read_only(outside)]),
+            tables.rebuild_identity(&mut frames, GIB, &[MappedRange::read_only_code(outside)]),
             Err(PagingError::RequiredRangeOutsideIdentityMap)
         );
         assert_eq!(tables.access.flushed_all, 0);
@@ -1114,8 +1317,8 @@ mod tests {
                 &mut frames,
                 GIB,
                 &[
-                    ExecutableRange::read_only(aligned),
-                    ExecutableRange::read_only(straddling),
+                    MappedRange::read_only_code(aligned),
+                    MappedRange::read_only_code(straddling),
                 ],
             )
             .unwrap();
@@ -1147,6 +1350,122 @@ mod tests {
     /// OVMF writes inside its own runtime services code, so a range the
     /// kernel does not control keeps its pages writable even though they
     /// run. Mapping them read-only faults on `shutdown` (measured).
+    /// The window covers every byte of `[0, limit)`, writable and never
+    /// executable, and lands only on its own PML4 slot.
+    #[test]
+    fn the_physical_window_reaches_all_of_memory_and_runs_none_of_it() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        let base = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        // One PDPT plus one page directory per GiB.
+        assert_eq!(
+            tables.map_physical_window(&mut frames, base, 2 * GIB),
+            Ok(3)
+        );
+        for physical in [0, PAGE, LARGE_PAGE, GIB, 2 * GIB - PAGE] {
+            let seen = tables
+                .translate(base + physical)
+                .unwrap_or_else(|| panic!("{physical:#x} is not in the window"));
+            assert_eq!((seen.phys, seen.writable), (physical, true));
+            let entry = leaf_entry(&tables, base + physical);
+            assert_ne!(entry & NO_EXECUTE, 0, "the window must never run code");
+            assert_ne!(entry & HUGE, 0, "2 MiB pages, not one table per 4 KiB");
+        }
+        // Nothing past the limit, and the kernel's other slots untouched.
+        assert_eq!(tables.translate(base + 2 * GIB), None);
+        assert_eq!(tables.translate(KERNEL_SPACE_BASE), None);
+    }
+
+    /// What the kernel does once it needs nothing down there: the lower
+    /// half keeps the firmware's code and loses everything else.
+    #[test]
+    fn keeping_only_the_firmware_empties_the_rest_of_the_lower_half() {
+        let mut frames = Frames(vec![
+            0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000, 0x40_5000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        // A range that straddles two pages, to check both are kept.
+        let firmware = PhysRange::new(PhysAddr::new(0x60_0FF0), 0x20);
+        // What that code keeps between calls: mapped too, and never
+        // executable.
+        let data = PhysRange::new(PhysAddr::new(0x70_0000), PAGE);
+        let kept = tables
+            .keep_only(
+                &mut frames,
+                &[
+                    MappedRange::writable_code(firmware),
+                    MappedRange::data(data),
+                ],
+            )
+            .expect("keeping the firmware");
+        // A PDPT, one page directory and one page table: 6 MiB and
+        // 7 MiB share the same 2 MiB slot.
+        assert_eq!(kept, 3);
+
+        for addr in [0x60_0000, 0x60_1000] {
+            let seen = tables
+                .translate(addr)
+                .unwrap_or_else(|| panic!("{addr:#x} must stay mapped"));
+            assert_eq!((seen.phys, seen.writable), (addr, true));
+            assert_eq!(
+                leaf_entry(&tables, addr) & NO_EXECUTE,
+                0,
+                "the firmware runs from here"
+            );
+        }
+        let entry = leaf_entry(&tables, data.start.as_u64());
+        assert_ne!(entry & PRESENT, 0, "the firmware's data stays mapped");
+        assert_ne!(entry & WRITABLE, 0, "and writable");
+        assert_ne!(entry & NO_EXECUTE, 0, "but nothing runs from it");
+
+        // Everything else in the lower half is gone, including what the
+        // firmware's own map had.
+        for addr in [0x0, PAGE, 0x10_0000, 0x60_2000, 4 * MIB, GIB] {
+            assert_eq!(tables.translate(addr), None, "{addr:#x} must be unmapped");
+        }
+    }
+
+    #[test]
+    fn keeping_a_range_that_is_not_in_the_lower_half_is_refused() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000]);
+        let mut tables = adopted(&mut frames);
+        let too_high = PhysRange::new(PhysAddr::new(512 * GIB), PAGE);
+        assert_eq!(
+            tables.keep_only(&mut frames, &[MappedRange::writable_code(too_high)]),
+            Err(PagingError::RequiredRangeOutsideIdentityMap)
+        );
+    }
+
+    #[test]
+    fn the_physical_window_refuses_a_place_that_is_not_its_own() {
+        let mut frames = Frames(vec![
+            0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000, 0x40_4000, 0x40_5000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        // In the lower half, which is user space.
+        assert_eq!(
+            tables.map_physical_window(&mut frames, 0x4000_0000, GIB),
+            Err(PagingError::WindowOutsideKernelSpace)
+        );
+        // Not at the start of a PML4 slot.
+        assert_eq!(
+            tables.map_physical_window(&mut frames, KERNEL_SPACE_BASE + GIB, GIB),
+            Err(PagingError::WindowOutsideKernelSpace)
+        );
+        // A limit that is not whole GiB.
+        assert_eq!(
+            tables.map_physical_window(&mut frames, KERNEL_SPACE_BASE, GIB + PAGE),
+            Err(PagingError::BadIdentityLimit)
+        );
+        // And the slot cannot be taken twice.
+        let base = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        assert_eq!(tables.map_physical_window(&mut frames, base, GIB), Ok(2));
+        assert_eq!(
+            tables.map_physical_window(&mut frames, base, GIB),
+            Err(PagingError::WindowSlotTaken)
+        );
+    }
+
     #[test]
     fn code_someone_else_writes_into_stays_writable() {
         let firmware = PhysRange::new(PhysAddr::new(0x40_0000), 2 * PAGE);
@@ -1155,7 +1474,7 @@ mod tests {
         ]);
         let mut tables = adopted(&mut frames);
         let stats = tables
-            .rebuild_identity(&mut frames, GIB, &[ExecutableRange::writable(firmware)])
+            .rebuild_identity(&mut frames, GIB, &[MappedRange::writable_code(firmware)])
             .unwrap();
         assert_eq!((stats.executable_pages, stats.read_only_pages), (2, 0));
         for addr in [firmware.start.as_u64(), firmware.end().as_u64() - PAGE] {

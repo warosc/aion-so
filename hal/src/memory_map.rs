@@ -21,6 +21,12 @@ pub enum MemoryRegionKind {
     /// the kernel still executes, so its pages must stay executable when
     /// the kernel builds its own page tables.
     RuntimeCode,
+    /// What that code reads and writes: the runtime services table, its
+    /// variables, whatever it keeps between calls. Not executable, and
+    /// never allocatable, but it has to stay mapped for `reboot` and
+    /// `shutdown` to work once the lower half is otherwise empty
+    /// (docs/adr/0013-fase3-physical-window.md).
+    RuntimeData,
     Reserved,
 }
 
@@ -113,6 +119,7 @@ mod raw_memory_type {
     pub const BOOT_SERVICES_CODE: u32 = 3;
     pub const BOOT_SERVICES_DATA: u32 = 4;
     pub const RUNTIME_SERVICES_CODE: u32 = 5;
+    pub const RUNTIME_SERVICES_DATA: u32 = 6;
     pub const CONVENTIONAL: u32 = 7;
 }
 
@@ -128,6 +135,7 @@ pub fn classify_memory_type(raw_ordinal: u32) -> MemoryRegionKind {
         CONVENTIONAL => MemoryRegionKind::Usable,
         BOOT_SERVICES_CODE | BOOT_SERVICES_DATA => MemoryRegionKind::BootServices,
         RUNTIME_SERVICES_CODE => MemoryRegionKind::RuntimeCode,
+        RUNTIME_SERVICES_DATA => MemoryRegionKind::RuntimeData,
         _ => MemoryRegionKind::Reserved,
     }
 }
@@ -156,14 +164,24 @@ mod tests {
         );
     }
 
+    /// The two halves of what the firmware keeps alive after the exit are
+    /// told apart: its code runs, its data does not, and both have to stay
+    /// mapped once the lower half is otherwise empty (ADR 0013).
     #[test]
-    fn runtime_services_code_is_its_own_kind() {
+    fn runtime_services_code_and_data_are_their_own_kinds() {
         assert_eq!(
             classify_memory_type(raw_memory_type::RUNTIME_SERVICES_CODE),
             MemoryRegionKind::RuntimeCode
         );
-        // Runtime services *data* is not executed: plain reserved memory.
-        assert_eq!(classify_memory_type(6), MemoryRegionKind::Reserved);
+        assert_eq!(
+            classify_memory_type(raw_memory_type::RUNTIME_SERVICES_DATA),
+            MemoryRegionKind::RuntimeData
+        );
+        assert_ne!(
+            classify_memory_type(raw_memory_type::RUNTIME_SERVICES_DATA),
+            MemoryRegionKind::Reserved,
+            "runtime data used to be lumped in with the rest and unmapped"
+        );
     }
 
     #[test]
