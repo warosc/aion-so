@@ -346,7 +346,13 @@ unsafe extern "C" fn double_fault_stub() -> ! {
 }
 
 extern "C" fn double_fault_handler() {
-    log::error!("HARLAN: #DF DOUBLE FAULT - halting");
+    // The address says which stack this ran on: the IST stack the kernel
+    // mapped with guard pages, or the static one used before that.
+    let here = 0u8;
+    log::error!(
+        "HARLAN: #DF DOUBLE FAULT on the stack at {:#x} - halting",
+        core::ptr::addr_of!(here) as u64
+    );
 }
 
 /// # Safety

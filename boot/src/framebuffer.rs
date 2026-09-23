@@ -4,6 +4,7 @@
 //! working, which is why the answer is captured as plain data
 //! (`FramebufferInfo`) beforehand.
 
+use harlan_hal::addr::PhysAddr;
 use harlan_hal::framebuffer::FramebufferInfo;
 use uefi::boot;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
@@ -47,7 +48,9 @@ pub fn query() -> Option<FramebufferInfo> {
     let stride = mode.stride();
     let mut frame_buffer = gop.frame_buffer();
     let info = FramebufferInfo {
-        base_addr: frame_buffer.as_mut_ptr() as u64,
+        // The GOP reports the framebuffer at its physical address,
+        // which the firmware also maps one-to-one.
+        base_addr: PhysAddr::new(frame_buffer.as_mut_ptr() as u64),
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         stride: u32::try_from(stride).ok()?,

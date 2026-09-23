@@ -66,6 +66,25 @@ qué memoria física pertenece al kernel y cambia la semántica de lo que
    nunca lee ni escribe su contenido. Quien los use es responsable de
    inicializarlos.
 
+## Actualización (Incremento 9): los frames se entregan a cero
+
+El punto 5 decía que los frames se entregan **sin** poner a cero y que
+inicializarlos era responsabilidad de quien los usara. Eso deja la puerta
+abierta a que un consumidor lo olvide (una tabla de páginas con entradas
+basura) y a filtrar a su siguiente dueño lo que el anterior dejó escrito.
+
+Desde el Incremento 9, `kernel::memory::zeroed_frames::ZeroedFrames`
+envuelve al asignador y pone a cero cada frame **antes** de entregarlo, así
+que todo el kernel los recibe limpios. El asignador de bitmap sigue siendo
+código puro y sin `unsafe`: todo el acceso a memoria de este camino vive en
+el envoltorio, que llega a los frames a través de `PhysWindow`, el único
+sitio que convierte una dirección física en un puntero. Hoy esa ventana es
+el mapa de identidad del firmware (base 0), que la toma de control de la
+paginación verifica antes de escribir nada; cuando la mitad baja pase a ser
+espacio de usuario, solo cambiará la base.
+
+El resto de la decisión no cambia.
+
 ## Alternativas consideradas
 
 - **Mantener `BootServices` como usable y excluir solo lo que se sabe

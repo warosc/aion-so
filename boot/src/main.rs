@@ -3,6 +3,7 @@
 
 mod console_hw;
 mod framebuffer;
+mod image;
 mod memory;
 mod panic;
 mod power;
@@ -21,6 +22,11 @@ fn efi_main() -> Status {
     // The GOP protocol is a Boot Services object: it can only be queried
     // now. What it describes (the framebuffer memory) outlives the exit.
     let framebuffer = framebuffer::query();
+    let framebuffer_range =
+        framebuffer.map(|info| harlan_hal::frame::PhysRange::new(info.base_addr, info.size_bytes));
+    // Also a Boot Services question: the kernel marks this range executable
+    // and everything else no-execute when it builds its own page tables.
+    let kernel_image = image::query_with_code();
 
     // SAFETY: this is the only call site, on a single linear,
     // non-reentrant path. No Boot-Services-backed resource is held past
@@ -51,14 +57,21 @@ fn efi_main() -> Status {
     }
 
     let memory_map = memory::build_memory_map(&uefi_memory_map);
-    let boot_info = harlan_kernel::BootInfo { memory_map };
+    let boot_info = harlan_kernel::BootInfo {
+        memory_map,
+        kernel_image: kernel_image.as_ref().map(|image| image.range),
+        kernel_code: kernel_image.as_ref().and_then(|image| image.code),
+        framebuffer: framebuffer_range,
+    };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
     // was current when it was queried, and nothing changes the display
     // mode after that (boot services are gone). Firmware's own console
     // stopped drawing at the exit, and this is the only writer from here
     // on. The memory stays mapped: UEFI's identity mapping is still what's
     // live (no page tables are touched by exiting boot services).
-    let mut console = unsafe { HardwareConsole::new(framebuffer) };
-    let power = UefiPower;
-    harlan_kernel::kmain(&boot_info, &mut console, &power)
+    let console = unsafe { HardwareConsole::new(framebuffer) };
+    // The kernel takes ownership of all three: it moves them into its own
+    // heap as soon as it has one, so that nothing of its own is left in the
+    // firmware's memory (docs/adr/0007-fase2-own-memory.md).
+    harlan_kernel::kmain(boot_info, console, UefiPower)
 }

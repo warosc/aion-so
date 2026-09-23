@@ -16,12 +16,19 @@ pub enum MemoryRegionKind {
     /// Incremento 5). Kept apart from `Usable` so it is not handed out
     /// before the kernel owns its own stack and page tables.
     BootServices,
+    /// Firmware code that keeps running after `ExitBootServices` (the UEFI
+    /// runtime services). Never allocatable, and the only firmware memory
+    /// the kernel still executes, so its pages must stay executable when
+    /// the kernel builds its own page tables.
+    RuntimeCode,
     Reserved,
 }
 
+use crate::addr::PhysAddr;
+
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryRegion {
-    pub start_phys_addr: u64,
+    pub start_phys_addr: PhysAddr,
     pub page_count: u64,
     pub kind: MemoryRegionKind,
 }
@@ -45,7 +52,7 @@ impl MemoryMap {
 
     pub const fn new() -> Self {
         const EMPTY: MemoryRegion = MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 0,
             kind: MemoryRegionKind::Reserved,
         };
@@ -105,6 +112,7 @@ impl Default for MemoryMap {
 mod raw_memory_type {
     pub const BOOT_SERVICES_CODE: u32 = 3;
     pub const BOOT_SERVICES_DATA: u32 = 4;
+    pub const RUNTIME_SERVICES_CODE: u32 = 5;
     pub const CONVENTIONAL: u32 = 7;
 }
 
@@ -119,6 +127,7 @@ pub fn classify_memory_type(raw_ordinal: u32) -> MemoryRegionKind {
     match raw_ordinal {
         CONVENTIONAL => MemoryRegionKind::Usable,
         BOOT_SERVICES_CODE | BOOT_SERVICES_DATA => MemoryRegionKind::BootServices,
+        RUNTIME_SERVICES_CODE => MemoryRegionKind::RuntimeCode,
         _ => MemoryRegionKind::Reserved,
     }
 }
@@ -148,6 +157,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_services_code_is_its_own_kind() {
+        assert_eq!(
+            classify_memory_type(raw_memory_type::RUNTIME_SERVICES_CODE),
+            MemoryRegionKind::RuntimeCode
+        );
+        // Runtime services *data* is not executed: plain reserved memory.
+        assert_eq!(classify_memory_type(6), MemoryRegionKind::Reserved);
+    }
+
+    #[test]
     fn loader_and_reserved_memory_is_never_usable() {
         // LOADER_CODE=1, LOADER_DATA=2, RESERVED=0
         assert_eq!(classify_memory_type(0), MemoryRegionKind::Reserved);
@@ -164,7 +183,7 @@ mod tests {
     fn push_reports_capacity_exhaustion_instead_of_panicking() {
         let mut map = MemoryMap::new();
         let region = MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 1,
             kind: MemoryRegionKind::Usable,
         };
@@ -179,17 +198,17 @@ mod tests {
     fn total_usable_pages_sums_only_usable_regions() {
         let mut map = MemoryMap::new();
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0,
+            start_phys_addr: PhysAddr::new(0),
             page_count: 10,
             kind: MemoryRegionKind::Usable,
         }));
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0x1000,
+            start_phys_addr: PhysAddr::new(0x1000),
             page_count: 5,
             kind: MemoryRegionKind::Reserved,
         }));
         assert!(map.push(MemoryRegion {
-            start_phys_addr: 0x2000,
+            start_phys_addr: PhysAddr::new(0x2000),
             page_count: 20,
             kind: MemoryRegionKind::Usable,
         }));
@@ -206,7 +225,7 @@ mod tests {
             (0xD000, 3, MemoryRegionKind::BootServices),
         ] {
             assert!(map.push(MemoryRegion {
-                start_phys_addr: start,
+                start_phys_addr: PhysAddr::new(start),
                 page_count: pages,
                 kind,
             }));
