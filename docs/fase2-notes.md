@@ -55,6 +55,72 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Revisión cruzada de Codex (incrementos 8-14)
+
+Codex revisó la pila completa y encontró ocho cosas. Ninguna se veía en QEMU;
+todas eran reales. Están aplicadas sobre la rama del Incremento 14, un commit
+por arreglo, con las correcciones que salieron al revisarlas de vuelta.
+
+### Lo que encontró
+
+1. **UB en el TSS** (Incremento 10): `set_double_fault_stack` escribía un
+   `u64` en el offset 36 del TSS con `write`. 36 no es múltiplo de 8, así que
+   era una escritura desalineada. Ahora `write_unaligned`, con una prueba que
+   fija el offset y que **no** está alineado para que nadie lo "arregle" al
+   revés.
+2. **La ventana física no estaba comprobada** (Incremento 9): `ZeroedFrames`
+   escribe cada marco por su dirección física dando por hecho que está
+   mapeada y escribible; eso se heredaba del mapa del firmware sin verificar.
+   Ahora se pregunta a las tablas vivas antes de escribir el primer marco.
+3. **Pilas a medio mapear** (Incremento 10): quedarse sin marcos a mitad de
+   una pila dejaba las páginas ya mapeadas y sus marcos asignados, y perder
+   la pila de double fault se llevaba entera la del kernel. Ahora se deshace
+   lo hecho.
+4. **Rangos ejecutables fuera del mapa** (Incrementos 11 y 12) y **el
+   framebuffer** (ídem): el mapa reconstruido podía dejar fuera código que el
+   kernel sigue ejecutando, o la pantalla. Ver ADR 0010.
+5. **Liberar sin nombrar el propósito** (Incremento 13): `deallocate` saltaba
+   la comprobación, así que un marco asignado como tabla de páginas podía
+   volver como si no tuviera propósito.
+6. **Sumar direcciones daba la vuelta en release** (Incremento 14): `Add`
+   usaba `+`, que entra en pánico en debug y envuelve en release.
+7. **El soak solo miraba totales** (Incremento 8): un huésped que corriera un
+   minuto y luego se quedara quieto pasaba. Ahora falla si el contador de
+   ticks o el de ciclos de heap llevan diez segundos sin moverse.
+8. **Mi documentación era optimista**: había escrito que `IrqLock` impediría
+   que un manejador asignara memoria. Solo detecta la reentrada; con el heap
+   libre la asignación se completaría. Corregido en `docs/memory-safety.md`.
+
+### Lo que salió al revisar su revisión
+
+- **Dos llamadores se quedaron atrás** con el cambio de `deallocate`: la
+  autoprueba del asignador afirmaba `Ok(())` —habría entrado en pánico en el
+  arranque en cuanto la tabla de propósitos estuviera activa— y `heap::init`
+  se comía el resultado con `let _ =`, que habría filtrado el marco en
+  silencio. Arreglados, y el camino sin propósito sale de `KernelFrames`: en
+  el kernel ya no existe, así que volver a introducirlo no compila.
+- **La comprobación de la ventana costaba ~2 s de arranque** (medido: 6,87 s
+  con ella, 4,84 s sin ella) porque caminaba las tablas una vez por marco, y
+  crecía con la RAM. Una página grande tiene una sola entrada, así que la
+  búsqueda ahora informa del tamaño de la página que la resolvió y la
+  comprobación salta a su final: la misma garantía para los 65 536 marcos con
+  ~128 recorridos, y 4,84 s de arranque.
+- **`BootInfo` ganaba un campo sin ADR**, y eso es el contrato de arranque.
+  Escrito como ADR 0010.
+
+### Verificación ejecutada
+
+- Host: 177 pruebas en verde (173 + 4 nuevas: dos de paginación —rangos
+  fuera del mapa y el tamaño de página que resolvió la búsqueda—, una de
+  suma de direcciones y una del soak).
+- Pruebas de mutación sobre lo nuevo: 6. Cinco detectadas a la primera;
+  la sexta —hacer pasar un soak cuyo contador de ticks se ha quedado
+  quieto— **sobrevivió**: la prueba de Codex cubría la rama del heap pero
+  no la de los ticks. Cerrado ese hueco, las 6 detectadas.
+- QEMU: `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` y
+  `reboot` intactos, y el desglose de marcos sin cambios (11 arranque, 10
+  tablas, 1024 heap, 20 pilas, 1065 en uso).
+
 ## Incremento 14 — Direcciones físicas y virtuales con tipos distintos (endurecimiento)
 
 El punto 6 de `docs/memory-safety.md`, y el cierre del programa de

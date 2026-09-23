@@ -11,8 +11,8 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
 | 5 | Validación centralizada de rangos | `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |
 | 6 | Separar físico y virtual con tipos | `hal::addr::PhysAddr`/`VirtAddr`, y sobre ellos `PhysFrame`, `PhysRange`, `Page`, `PageMapper::translate`, `Stack`, `KERNEL_*_START` | ✅ |
-| 7 | Frames a cero antes de reutilizarlos | `kernel::memory::zeroed_frames::ZeroedFrames` (todo el kernel los recibe así) | ✅ |
-| 8 | Liberación comprobada | `frame_allocator::deallocate` (`NotManaged`, `NotAllocated`), `FreeListHeap::deallocate` (doble liberación, memoria ajena) | ✅ |
+| 7 | Frames a cero antes de reutilizarlos | `kernel::memory::zeroed_frames::ZeroedFrames` (todo el kernel los recibe así); el arranque comprueba contra las tablas vivas que la ventana física alcanza cada marco antes de escribir uno | ✅ |
+| 8 | Liberación comprobada | `frame_allocator::deallocate_as` (`NotManaged`, `NotAllocated`, `WrongPurpose`; el kernel no tiene otra forma de devolver un marco), `FreeListHeap::deallocate` (doble liberación, memoria ajena) | ✅ |
 | 9 | Pruebas de propiedades contra un modelo | `frame_allocator` (10 000 operaciones), `FreeListHeap` (20 000), `heap::stress` (100 000 en host) | ✅ |
 | 10 | Estrés en QEMU, con distintas cantidades de RAM | `cargo xtask soak-test`, `boot-test --heap-stress --memory` | ✅ |
 | 11 | Concurrencia controlada y contextos documentados | `kernel::sync::IrqLock` (pánico ante reentrada) y la tabla de contextos de más abajo | ⚠️ un solo núcleo |
@@ -48,9 +48,12 @@ marcos ni al mapper—, y debe seguir cumpliéndose:
 `IrqLock` protege el heap: tomarlo desactiva las interrupciones, de modo que
 en un solo núcleo no hay contención posible salvo por reentrada, y la
 reentrada **entra en pánico en vez de girar** (un giro con las interrupciones
-desactivadas colgaría la máquina en silencio). Es decir: si algún día un
-manejador asignara memoria, no corrompería el heap —se detendría con un
-mensaje.
+desactivadas colgaría la máquina en silencio). El candado evita la
+corrupción si una interrupción alcanza el heap mientras ya está bloqueado,
+pero **no impone por sí solo** la regla "ningún manejador asigna": una
+asignación desde un manejador con el heap libre se completaría. Esa
+prohibición se sostiene hoy revisando los manejadores, y hay que conservarla
+a mano.
 
 Con varios núcleos (Fase 3 o más adelante) esto cambia: `IrqLock` tendrá que
 girar además de desactivar interrupciones, el asignador de marcos necesitará
@@ -73,12 +76,14 @@ desde un manejador.
 
 - **Pruebas de mutación**: en cada incremento de memoria se introducen
   bugs deliberados, uno a uno, y se exige que las pruebas los detecten. Han
-  sido 56 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
+  sido 62 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
   cero, guard pages, mapa de identidad, recuperación de memoria, permisos de
-  ejecución, propósito por marco y tipos de dirección), todas detectadas.
-  A partir del Incremento 14 se añade una comprobación que no necesita
-  pruebas: confundir una dirección física con una virtual ya no compila. Una de ellas destapó un hueco real de pruebas, que se cerró
-  antes de cerrar el incremento. Quedan registradas en
+  ejecución, propósito por marco, tipos de dirección y los arreglos de la
+  revisión de Codex), todas detectadas. Dos de ellas destaparon huecos
+  reales de pruebas —uno en `reclaim_boot_services`, otro en el soak—, que se
+  cerraron antes de cerrar su incremento. Desde el Incremento 14 hay además
+  una comprobación que no necesita pruebas: confundir una dirección física
+  con una virtual ya no compila. Quedan registradas en
   `docs/fase2-notes.md`.
 - **Pruebas negativas de extremo a extremo**: ejecutar desde un marco de
   datos (`#PF ... error_code=0x11`), una desreferencia de puntero nulo
@@ -86,4 +91,9 @@ desde un manejador.
   convierte en un double fault legible), un triple fault, una CPU sin NX,
   un mapa sin controlador de teclado.
 - **Soak**: 30 minutos con 68,6 millones de operaciones de heap
-  verificadas, sin corrupción, pánico ni reinicio.
+  verificadas, sin corrupción, pánico ni reinicio. Desde la revisión de Codex
+  también falla si el progreso se detiene en los últimos diez segundos, no
+  solo si el total se queda corto.
+- **Revisión cruzada**: cada incremento lo revisa el otro agente. La revisión
+  de la pila 8-14 encontró ocho defectos que las pruebas no veían, incluido un
+  UB de escritura desalineada en el TSS (ver `docs/fase2-notes.md`).
