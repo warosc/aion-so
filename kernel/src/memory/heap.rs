@@ -106,8 +106,11 @@ pub fn init<I: InterruptControl>(
         // it; the heap's range of kernel space is used by the heap alone.
         if let Err(err) = unsafe { mapper.map(page, frame, data, frames) } {
             log::warn!("HARLAN: heap: mapping stopped after {mapped} bytes: {err:?}");
-            // Never mapped: it goes straight back.
-            let _ = frames.deallocate(frame);
+            // Never mapped: it goes straight back. Saying so out loud,
+            // because a frame that cannot be returned is a leak.
+            if let Err(err) = frames.deallocate_as(frame, FramePurpose::Heap) {
+                log::error!("HARLAN: heap: the unused frame could not be returned: {err:?}");
+            }
             break;
         }
         mapped += PAGE_SIZE as usize;

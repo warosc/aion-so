@@ -148,8 +148,16 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: VirtAddr) {
     // SAFETY: `a` is ours until it is deallocated below, and the window
     // reaches it (its contract, checked by the paging take-over).
     unsafe { window.frame_ptr(a).write_bytes(0xA5, FRAME_SIZE as usize) };
-    assert_eq!(frames.deallocate(a), Ok(()));
-    assert_eq!(frames.deallocate(a), Err(DeallocError::NotAllocated));
+    assert_eq!(frames.deallocate_as(a, FramePurpose::Kernel), Ok(()));
+    // Which error depends on whether purposes are being recorded yet: the
+    // frame is no longer held, and it no longer has a purpose either.
+    assert!(
+        matches!(
+            frames.deallocate_as(a, FramePurpose::Kernel),
+            Err(DeallocError::NotAllocated | DeallocError::WrongPurpose { .. })
+        ),
+        "giving {a:?} back twice must fail"
+    );
     let reused = frames
         .allocate()
         .expect("the freed frame is available again");
@@ -160,8 +168,8 @@ pub fn self_test(frames: &mut KernelFrames<'_>, live_stack_addr: VirtAddr) {
         bytes.iter().all(|&byte| byte == 0),
         "frame {reused:?} was handed out holding old data"
     );
-    assert_eq!(frames.deallocate(reused), Ok(()));
-    assert_eq!(frames.deallocate(b), Ok(()));
+    assert_eq!(frames.deallocate_as(reused, FramePurpose::Kernel), Ok(()));
+    assert_eq!(frames.deallocate_as(b, FramePurpose::Kernel), Ok(()));
     assert_eq!(frames.free_frames(), before);
     log::info!("HARLAN: frame allocator self-test OK (frames arrive zeroed)");
 }
@@ -243,6 +251,6 @@ pub fn paging_self_test(
         unsafe { mapper.unmap(test_page) },
         Err(UnmapError::NotMapped)
     );
-    assert_eq!(frames.deallocate(frame), Ok(()));
+    assert_eq!(frames.deallocate_as(frame, FramePurpose::Kernel), Ok(()));
     log::info!("HARLAN: page mapper self-test OK");
 }

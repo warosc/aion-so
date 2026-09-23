@@ -140,10 +140,6 @@ impl<'a> KernelFrames<'a> {
         self.allocate_for(FramePurpose::Kernel)
     }
 
-    pub fn deallocate(&mut self, frame: PhysFrame) -> Result<(), DeallocError> {
-        self.inner.deallocate(frame)
-    }
-
     /// Gives a frame back, checking it is what the caller thinks it is.
     pub fn deallocate_as(
         &mut self,
