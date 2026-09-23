@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod identity;
+pub mod ipc;
 #[cfg(target_arch = "x86_64")]
 pub mod klog;
 mod memory;
