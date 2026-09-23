@@ -7,6 +7,59 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 20 — Los runtime services se mudan a la mitad alta
+
+`docs/adr/0016-fase3-set-virtual-address-map.md`. El cabo suelto que venía
+arrastrándose desde el Incremento 17 queda cerrado: **la mitad baja está
+completamente vacía**.
+
+### Qué hace
+
+- Una ventana para los runtime services en **PML4 261**: cada rango con
+  `EFI_MEMORY_RUNTIME` se mapea en `KERNEL_RUNTIME_START + su dirección
+  física`, con la caché que declaró y ejecutable solo si es código. Así,
+  rellenar el mapa que UEFI pide es una suma.
+- **La llamada la hace el cargador, la decisión la toma el kernel**:
+  `boot` conserva el mapa de `ExitBootServices` y expone una función;
+  `BootInfo` gana ese puntero. El kernel no aprende UEFI, el cargador no
+  decide el layout.
+- El orden que exige la especificación: mapear, llamar con los mapeos
+  viejos todavía presentes, y **solo entonces** vaciar.
+- Si el firmware se niega, no se vacía nada: se queda el mapa del
+  Incremento 19 y se registra.
+- `PageFlags` gana la política de caché, que hasta ahora solo conocían los
+  rangos que sobrevivían abajo.
+
+### Verificación ejecutada
+
+- Host: 216 pruebas en verde.
+- QEMU: `the firmware moved 6 descriptor(s) into kernel space at
+  0xffff828000000000; 1862 page(s) mapped` y después `the lower half is
+  empty: nothing of the firmware's is left there`.
+- **La prueba que decide**: `shutdown` apaga y `reboot` rearranca llamando
+  al firmware en sus direcciones nuevas. Si la mudanza estuviera mal, no
+  habría término medio.
+- **Prueba negativa**: leer `0xf5ed000`, donde vivía el código del
+  firmware, da `#PF accessing 0xf5ed000, error_code=0x0`.
+- `boot-test --repeat 10` 10/10, con 512 MiB 1/1, soak de 120 s PASS,
+  `fmt-lint` limpio.
+- Mutación: 5. Una detectada a la primera; **tres sobrevivieron** porque la
+  función que decide permisos y caché no tenía prueba en host. Escrita con
+  un mapper falso —y de paso cubre que un rango que no es del firmware no
+  se mueva—, las 5 detectadas.
+
+### Riesgos y límites
+
+- `SetVirtualAddressMap` se llama **una vez por arranque** y no tiene
+  vuelta atrás. Si un firmware la implementa a medias —relocaliza parte y
+  devuelve error— no hay recuperación; por eso no se vacía nada hasta que
+  devuelve éxito.
+- Probado con OVMF. Otro firmware puede negarse, y entonces el kernel se
+  queda con el mapa del Incremento 19: peor, pero vivo.
+- El plan B si esto resulta frágil en hardware real sigue escrito en el
+  ADR: un CR3 dedicado al firmware, o dejar de llamarlo y apagar por
+  puerto.
+
 ## Incremento 19 — El mapa del firmware, entero y con sus atributos
 
 `docs/adr/0015-fase3-runtime-memory-map.md`. Sale de la **revisión cruzada
