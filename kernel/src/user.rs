@@ -13,6 +13,7 @@
 //! (docs/adr/0019-fase3-ipc-v0.md). The message crosses from one address
 //! space to another because the kernel copies it, and by no other route.
 
+use harlan_arch_x86_64::interrupts::UserFault;
 use harlan_arch_x86_64::syscall::SyscallFrame;
 use harlan_hal::addr::VirtAddr;
 use harlan_hal::{error, info};
@@ -283,6 +284,140 @@ pub fn receiver_program() -> [u8; RECEIVER_LEN] {
 }
 
 // ---------------------------------------------------------------------
+// The programs that try what must not work
+// ---------------------------------------------------------------------
+//
+// Each one is its own process, because the first thing it tries is the
+// last thing it does: there is no way for a program to survive a fault
+// and go on to the next attempt (ADR 0020). What they demonstrate is not
+// that the attempt fails — a single `#PF` would show that — but that
+// everything else keeps running afterwards.
+
+/// Reads an address in the kernel's half:
+///
+/// ```text
+///  0: 48 b8 <8 bytes>       movabs rax, address
+/// 10: 48 8b 00              mov rax, [rax]
+/// 13: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The address is real kernel memory, mapped, with something in it. What
+/// stops the read is the one bit in the page tables that says the page is
+/// not the user's.
+pub const READS_KERNEL_LEN: usize = 15;
+
+pub fn reads_kernel_memory(address: u64) -> [u8; READS_KERNEL_LEN] {
+    let mut program = [0u8; READS_KERNEL_LEN];
+    program[0] = 0x48; // movabs rax, imm64
+    program[1] = 0xB8;
+    program[2..10].copy_from_slice(&address.to_le_bytes());
+    program[10] = 0x48; // mov rax, [rax]
+    program[11] = 0x8B;
+    program[12] = 0x00;
+    program[13] = 0x0F; // ud2
+    program[14] = 0x0B;
+    program
+}
+
+/// Writes to its own code page:
+///
+/// ```text
+///  0: bf 00 00 40 00        mov edi, 0x400000    ; where its code is
+///  5: c6 07 42              mov byte [rdi], 0x42
+///  8: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// Its code is mapped for ring 3 and not writable (ADR 0011, W^X). A
+/// program that could rewrite itself would make every check the kernel
+/// does on its code worthless.
+pub const WRITES_ITS_CODE_LEN: usize = 10;
+
+pub fn writes_its_own_code() -> [u8; WRITES_ITS_CODE_LEN] {
+    let mut program = [0u8; WRITES_ITS_CODE_LEN];
+    program[0] = 0xBF; // mov edi, imm32
+    program[1..5].copy_from_slice(&(PROGRAM_BASE.as_u64() as u32).to_le_bytes());
+    program[5] = 0xC6; // mov byte [rdi], imm8
+    program[6] = 0x07;
+    program[7] = 0x42;
+    program[8] = 0x0F; // ud2
+    program[9] = 0x0B;
+    program
+}
+
+/// Puts an instruction in its stack and jumps to it:
+///
+/// ```text
+///  0: bf 00 00 50 00        mov edi, 0x500000    ; its stack
+///  5: c6 07 c3              mov byte [rdi], 0xc3 ; a `ret`
+///  8: ff e7                 jmp rdi
+/// 10: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The write succeeds — it is its own stack. The jump does not: the page
+/// is not executable, which is the other half of W^X.
+pub const RUNS_ITS_STACK_LEN: usize = 12;
+
+pub fn runs_its_own_stack() -> [u8; RUNS_ITS_STACK_LEN] {
+    let mut program = [0u8; RUNS_ITS_STACK_LEN];
+    program[0] = 0xBF; // mov edi, imm32
+    program[1..5].copy_from_slice(&(STACK_BASE.as_u64() as u32).to_le_bytes());
+    program[5] = 0xC6; // mov byte [rdi], imm8
+    program[6] = 0x07;
+    program[7] = 0xC3; // `ret`, so that running it would at least be tidy
+    program[8] = 0xFF; // jmp rdi
+    program[9] = 0xE7;
+    program[10] = 0x0F; // ud2
+    program[11] = 0x0B;
+    program
+}
+
+/// Hands the kernel a pointer into the kernel and asks it to read it:
+///
+/// ```text
+///  0: b8 00 00 00 00        mov eax, 0           ; log
+///  5: 48 bf <8 bytes>       movabs rdi, address  ; the kernel's
+/// 15: be 08 00 00 00        mov esi, 8
+/// 20: 0f 05                 syscall              ; refused
+/// 22: 48 89 c7              mov rdi, rax         ; exit with what it got
+/// 25: 48 f7 df              neg rdi              ; as a number to read
+/// 28: b8 01 00 00 00        mov eax, 1
+/// 33: 0f 05                 syscall
+/// 35: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The one that does not fault. The kernel refuses the pointer and the
+/// process carries on, which is what a refusal should look like from the
+/// other side: an answer, not a crash. It exits with the error negated,
+/// so the code in the log reads as the number of the refusal.
+pub const LIES_LEN: usize = 37;
+
+pub fn lies_about_a_pointer(address: u64) -> [u8; LIES_LEN] {
+    let mut program = [0u8; LIES_LEN];
+    program[0] = 0xB8; // mov eax, imm32 (log)
+    program[1] = Call::Log as u8;
+    program[5] = 0x48; // movabs rdi, imm64
+    program[6] = 0xBF;
+    program[7..15].copy_from_slice(&address.to_le_bytes());
+    program[15] = 0xBE; // mov esi, imm32
+    program[16] = 8;
+    program[20] = 0x0F; // syscall
+    program[21] = 0x05;
+    program[22] = 0x48; // mov rdi, rax
+    program[23] = 0x89;
+    program[24] = 0xC7;
+    program[25] = 0x48; // neg rdi
+    program[26] = 0xF7;
+    program[27] = 0xDF;
+    program[28] = 0xB8; // mov eax, imm32 (exit)
+    program[29] = Call::Exit as u8;
+    program[33] = 0x0F; // syscall
+    program[34] = 0x05;
+    program[35] = 0x0F; // ud2
+    program[36] = 0x0B;
+    program
+}
+
+// ---------------------------------------------------------------------
 // The kernel's side of the boundary
 // ---------------------------------------------------------------------
 
@@ -454,8 +589,39 @@ fn serve(frame: &mut SyscallFrame, running: Running) {
     }
 }
 
+/// What the kernel does with a fault a process caused: says whose it was
+/// and what it did, and ends it. The machine carries on
+/// (docs/adr/0020-fase3-a-fault-belongs-to-the-process.md).
+///
+/// # Safety
+///
+/// Only from the interrupt path, with interrupts off, after a fault the
+/// CPU took while a process was running in ring 3.
+pub unsafe fn on_fault(fault: UserFault) -> ! {
+    // SAFETY: as this function's contract; `running` is who the CPU was
+    // running when the fault arrived.
+    let running = unsafe { scheduler::running() };
+    let Some(running) = running else {
+        // The CPU says ring 3 and the scheduler says nobody: one of the
+        // two is wrong, and neither is something to carry on over.
+        error!(
+            "HARLAN: {} came from ring 3 with no process running, at rip={:#x}",
+            fault.name, fault.rip
+        );
+        harlan_hal::CpuControl::halt_loop(&harlan_arch_x86_64::Cpu)
+    };
+    error!(
+        "HARLAN: the process in slot {} caused {} at rip={:#x} (error_code={:#x}, address={:#x}); it does not run again",
+        running.slot, fault.name, fault.rip, fault.error_code, fault.address
+    );
+    // SAFETY: as this function's contract, and this process is the one
+    // the scheduler has running.
+    unsafe { scheduler::fault_current() }
+}
+
 /// Runs `process` in ring 3, in its own address space. Never returns: it
-/// leaves through `exit`, which hands the CPU to whoever is next.
+/// leaves through `exit` or through a fault, and either way the CPU goes
+/// to whoever is next.
 ///
 /// # Safety
 ///
@@ -620,6 +786,68 @@ mod tests {
             );
         }
         assert_eq!((program[42], program[43]), (0x0F, 0x0B), "ud2");
+    }
+
+    /// The trespassers have to trespass: each one has to aim at the thing
+    /// it is named for, or the boot would prove nothing.
+    #[test]
+    fn the_trespassers_aim_where_they_claim() {
+        let kernel_address = 0xFFFF_8180_0000_1234u64;
+        let reader = reads_kernel_memory(kernel_address);
+        assert_eq!(&reader[0..2], &[0x48, 0xB8], "movabs rax, imm64");
+        assert_eq!(
+            u64::from_le_bytes(reader[2..10].try_into().unwrap()),
+            kernel_address
+        );
+        assert_eq!(&reader[10..13], &[0x48, 0x8B, 0x00], "mov rax, [rax]");
+        assert!(
+            kernel_address >= 0xFFFF_8000_0000_0000,
+            "the higher half, which is the kernel's"
+        );
+
+        let writer = writes_its_own_code();
+        assert_eq!(
+            four_bytes_at(&writer, 1) as u64,
+            PROGRAM_BASE.as_u64(),
+            "its own code page, which is read-only"
+        );
+        assert_eq!(&writer[5..8], &[0xC6, 0x07, 0x42], "mov byte [rdi], 0x42");
+
+        let jumper = runs_its_own_stack();
+        assert_eq!(
+            four_bytes_at(&jumper, 1) as u64,
+            STACK_BASE.as_u64(),
+            "its own stack, which is not executable"
+        );
+        assert_eq!(&jumper[5..8], &[0xC6, 0x07, 0xC3], "writes a `ret` there");
+        assert_eq!(&jumper[8..10], &[0xFF, 0xE7], "jmp rdi");
+
+        let liar = lies_about_a_pointer(kernel_address);
+        assert_eq!(liar[1], Call::Log as u8);
+        assert_eq!(
+            u64::from_le_bytes(liar[7..15].try_into().unwrap()),
+            kernel_address,
+            "the pointer it hands the kernel"
+        );
+        assert_eq!(four_bytes_at(&liar, 16), 8, "and how much of it");
+        assert_eq!(&liar[22..25], &[0x48, 0x89, 0xC7], "mov rdi, rax");
+        assert_eq!(&liar[25..28], &[0x48, 0xF7, 0xDF], "neg rdi");
+        assert_eq!(liar[29], Call::Exit as u8, "and it lives to exit");
+
+        // The three that fault end in `ud2`: if the CPU ever got there,
+        // the attempt had succeeded and the log would say so loudly.
+        for (program, name) in [
+            (&reader[..], "reader"),
+            (&writer[..], "writer"),
+            (&jumper[..], "jumper"),
+        ] {
+            let end = program.len();
+            assert_eq!(
+                (program[end - 2], program[end - 1]),
+                (0x0F, 0x0B),
+                "{name} ends in ud2"
+            );
+        }
     }
 
     fn frame_for(call: Call, rdi: u64, rsi: u64, rdx: u64) -> SyscallFrame {

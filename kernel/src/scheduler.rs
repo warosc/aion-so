@@ -21,10 +21,11 @@ use harlan_hal::{error, info};
 use crate::ipc::{self, Delivery, Mailbox, TakeError};
 use crate::process::Process;
 
-/// How many processes there can be at once. Four is what Fase 3 runs; the
-/// limit is here so that running out is an error and not a `Vec` growing
-/// inside an interrupt handler.
-pub const MAX_PROCESSES: usize = 8;
+/// How many processes there can be at once. Eight is what Fase 3 runs —
+/// four doing their work and four trying what must not work (ADR 0020) —
+/// and the limit is here so that running out is an error and not a `Vec`
+/// growing inside an interrupt handler.
+pub const MAX_PROCESSES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -394,12 +395,40 @@ pub unsafe fn switch_to_next() {
 /// # Safety
 ///
 /// As `switch_to_next`.
-pub unsafe fn exit_current(code: u64) {
+pub unsafe fn exit_current(code: u64) -> ! {
     // SAFETY: as this function's contract.
     let scheduler = unsafe { the_scheduler() };
     let current = scheduler.current;
-    scheduler.kill_current();
     info!("HARLAN: the process in slot {current} exited with {code}");
+    // SAFETY: as above.
+    unsafe { end_current(scheduler) }
+}
+
+/// Ends the running process because it faulted. The caller has already
+/// said what happened; this is what follows from it
+/// (docs/adr/0020-fase3-a-fault-belongs-to-the-process.md).
+///
+/// # Safety
+///
+/// From the interrupt path, with interrupts off, after a fault the CPU
+/// took while this process was running in ring 3.
+pub unsafe fn fault_current() -> ! {
+    // SAFETY: as this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    // SAFETY: as above.
+    unsafe { end_current(scheduler) }
+}
+
+/// The end itself: the slot is marked dead and the CPU goes to whoever is
+/// next, or back to the kernel when nobody is. Never comes back — nothing
+/// switches into a dead process.
+///
+/// # Safety
+///
+/// As `switch_to_next`.
+unsafe fn end_current(scheduler: &mut Scheduler) -> ! {
+    let current = scheduler.current;
+    scheduler.kill_current();
     match scheduler.next_after(current) {
         Some(next) if next != current => {
             // SAFETY: as in `switch_to_next`. This one never comes back:
@@ -411,6 +440,7 @@ pub unsafe fn exit_current(code: u64) {
             unsafe { leave_for_the_kernel(scheduler, current) };
         }
     }
+    unreachable!("a process that has ended is never switched into")
 }
 
 /// Hands the CPU back to the kernel's own flow, waiting inside

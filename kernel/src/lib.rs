@@ -812,20 +812,54 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // Four processes, each with a space of its own and a kernel stack
-        // of its own. Two say who they are and take turns (ADR 0017 and
-        // ADR 0018); the other two exchange a message, which is what
-        // Fase 3 set out to show (ADR 0019).
+        // Eight processes, each with a space of its own and a kernel
+        // stack of its own.
         //
-        // The receiver is spawned **before** the sender on purpose: round
-        // robin reaches it first, it finds an empty mailbox and parks, and
-        // the sender is what wakes it. The other order would never wait.
+        // Four do their work: two say who they are and take turns (ADR
+        // 0017 and ADR 0018), and two exchange a message, which is what
+        // Fase 3 set out to show (ADR 0019). The receiver is spawned
+        // **before** the sender on purpose: round robin reaches it first,
+        // it finds an empty mailbox and parks, and the sender is what
+        // wakes it. The other order would never wait.
+        //
+        // The other four try what must not work (ADR 0020). What they
+        // demonstrate is not that each attempt fails, but that the four
+        // above finish their work afterwards, on a machine that is still
+        // running.
         const RECEIVER_SLOT: u8 = 2;
+        // Kernel memory, named so that the trespassers can aim at it. The
+        // address is the kernel's own code: mapped, with something in it,
+        // and a fault away from ring 3.
+        let kernel_address = user::handle as *const () as u64;
+        match harlan_hal::paging::PageMapper::translate(
+            &context.mapper,
+            harlan_hal::addr::VirtAddr::new(kernel_address),
+        ) {
+            Some(frame) => info!(
+                "HARLAN: {kernel_address:#x} is kernel code, mapped at {frame}; two processes are about to try to reach it"
+            ),
+            None => error!(
+                "HARLAN: {kernel_address:#x} is not mapped, so trying to read it would prove nothing"
+            ),
+        }
         let talking_one = user::talker_program(b'1');
         let talking_two = user::talker_program(b'2');
         let receiving = user::receiver_program();
         let sending = user::sender_program(RECEIVER_SLOT);
-        let programs: [&[u8]; 4] = [&talking_one, &talking_two, &receiving, &sending];
+        let reading_the_kernel = user::reads_kernel_memory(kernel_address);
+        let writing_its_code = user::writes_its_own_code();
+        let running_its_stack = user::runs_its_own_stack();
+        let lying = user::lies_about_a_pointer(kernel_address);
+        let programs: [&[u8]; 8] = [
+            &talking_one,
+            &talking_two,
+            &receiving,
+            &sending,
+            &reading_the_kernel,
+            &writing_its_code,
+            &running_its_stack,
+            &lying,
+        ];
 
         let mut next_stack = syscall_stack.top();
         let mut started = 0;
@@ -883,6 +917,10 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         if started > 0 {
             // The timer gives the CPU away too, not just `yield`.
             harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+            // And a process that faults ends there, rather than taking the
+            // machine with it (ADR 0020). Until this is set, a fault in
+            // ring 3 stops the CPU like one in the kernel.
+            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
             // SAFETY: the kernel is in its own space, on its own stack,
             // and no process is running yet.
             unsafe { scheduler::run_until_empty(context.mapper.root()) };
