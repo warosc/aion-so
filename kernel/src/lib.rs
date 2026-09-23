@@ -6,6 +6,8 @@ pub mod identity;
 #[cfg(target_arch = "x86_64")]
 pub mod klog;
 mod memory;
+#[cfg(target_arch = "x86_64")]
+pub mod process;
 mod shell;
 mod sync;
 #[cfg(target_arch = "x86_64")]
@@ -807,28 +809,45 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // SAFETY: the lower half is the kernel's since `keep_only`, and
-        // nothing else uses the program's addresses.
-        match unsafe { user::load(&mut context.mapper, &mut context.frames) } {
-            Ok(program) => {
-                info!(
-                    "HARLAN: the program is {} byte(s) at {:#x}, its stack at {:#x}",
-                    user::PROGRAM.len(),
-                    user::PROGRAM_BASE,
-                    user::STACK_BASE
-                );
-                // SAFETY: `init` ran above, `load` mapped the pages, and
-                // `into_the_shell` is a function of this kernel's, safe to
-                // run on the syscall stack.
+        // Two processes, each with a space of its own, to show that the
+        // same address is different memory in each (ADR 0017). Only one
+        // runs: there is no scheduler yet.
+        // SAFETY: the kernel owns its tables and reaches frames through
+        // its own window; nothing else uses what these take.
+        let spawned = unsafe {
+            let first = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
+            let second = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
+            first.and_then(|first| second.map(|second| (first, second)))
+        };
+        match spawned {
+            Ok((first, second)) => {
+                let entry = first.entry();
+                match (first.space.translate(entry), second.space.translate(entry)) {
+                    (Some(one), Some(other)) if one != other => info!(
+                        "HARLAN: {entry:#x} is {one} in one process and {other} in the other: different memory, same address"
+                    ),
+                    (one, other) => error!(
+                        "HARLAN: the two processes do not have separate memory at {entry:#x} ({one:?}, {other:?})"
+                    ),
+                }
+                // The second one has nowhere to run yet; its space stays
+                // built, which is what the comparison above needed.
+                let first: &'static process::Process =
+                    alloc::boxed::Box::leak(alloc::boxed::Box::new(first));
+                let _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(second));
+                // SAFETY: `init` ran above, `spawn` built the space and
+                // mapped its memory, and `into_the_shell` is a function of
+                // this kernel's, safe to run on the syscall stack once the
+                // kernel's own space is back.
                 unsafe {
                     user::enter(
-                        program,
+                        first,
                         into_the_shell::<C, P>,
                         (context as *mut KernelContext<C, P>).cast(),
                     )
                 }
             }
-            Err(err) => error!("HARLAN: the program could not be loaded ({err:?})"),
+            Err(err) => error!("HARLAN: no process could be started ({err:?})"),
         }
     }
 
@@ -843,11 +862,17 @@ extern "C" fn into_the_shell<C: Console + 'static, P: PowerControl + 'static>(
 ) -> ! {
     use harlan_hal::InterruptControl;
 
+    // SAFETY: the same context `run` was given; nothing else refers to it.
+    let context = unsafe { &mut *context.cast::<KernelContext<C, P>>() };
+    // Out of the process's space and back into the kernel's own, so that
+    // nothing of a program that has exited is mapped any more.
+    // SAFETY: this code, its stack and its heap are in the higher half,
+    // which every space shares, and nothing here points into the lower
+    // half of the space being left.
+    unsafe { context.mapper.activate() };
     // A syscall runs with interrupts off (`FMASK`), and the shell needs
     // the keyboard.
     harlan_arch_x86_64::Cpu.enable();
-    // SAFETY: the same context `run` was given; nothing else refers to it.
-    let context = unsafe { &mut *context.cast::<KernelContext<C, P>>() };
     let console = &mut *context.console;
     banner(console);
     shell::run_shell(console, context.power)

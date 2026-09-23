@@ -7,6 +7,63 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 21 — El proceso como objeto
+
+`docs/adr/0017-fase3-process-address-space.md`. Hasta ahora el programa
+corría dentro de las tablas del kernel, separado por un bit por página. Eso
+lo mantiene fuera del kernel y no dice nada de un segundo programa.
+
+### Qué hace
+
+- **Un PML4 por proceso**: marco propio, mitad baja vacía y las entradas de
+  la mitad alta **copiadas del kernel**. Copiar la entrada, no el subárbol:
+  los dos roots apuntan a las mismas tablas, así que lo que el kernel mapee
+  después está en todos los espacios sin sincronizar nada.
+- **Cambiar de espacio es escribir CR3**, y funciona porque el kernel corre
+  en la mitad alta, que es idéntica en todos.
+- **`Process`**: su espacio, sus rangos, su entrada y su pila. Lo que el
+  manejador de syscalls valida deja de ser una global y pasa a ser la
+  memoria del proceso que llamó.
+- El arranque crea **dos** procesos, con el mismo programa y las mismas
+  direcciones, y al salir el primero el kernel vuelve a su propio espacio.
+
+### La demostración
+
+Dos cosas, y la segunda es la que convence:
+
+1. El kernel comprueba en las tablas que la misma dirección da marcos
+   distintos: `0x400000 is 0x581000 in one process and 0x587000 in the
+   other: different memory, same address`.
+2. **Prueba negativa de extremo a extremo**: con una sonda temporal se
+   sobrescribió el mensaje del **segundo** proceso en su propio marco. El
+   primero, corriendo en **la misma dirección virtual**, siguió imprimiendo
+   el suyo: `from ring 3: HARLAN: hello from ring 3`. Si compartieran
+   memoria habría dicho el del segundo.
+
+### Verificación ejecutada
+
+- Host: 219 pruebas en verde.
+- QEMU: los dos espacios se crean (`0x580000` y `0x586000`), uno corre,
+  sale con 7, y el kernel vuelve a su espacio y llega al shell.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` apaga,
+  `reboot` rearranca, `fmt-lint` limpio.
+- Mutación: 4, las 4 detectadas —incluidas "un espacio nuevo hereda también
+  la mitad baja" y "un puntero de ring 3 se toma por bueno".
+
+### Riesgos y límites
+
+- **No hay planificador**: el kernel arranca uno, el proceso sale, el
+  kernel sigue. El segundo espacio se crea para demostrar el aislamiento y
+  nunca corre. Guardar y restaurar el estado de un proceso interrumpido es
+  el Incremento 22.
+- La pila de syscalls sigue siendo única: vale con un proceso y con
+  syscalls que no se interrumpen.
+- Los procesos comparten las tablas de la mitad alta del kernel. Lo que
+  sostiene el aislamiento es que el mapper **rechaza** mezclar páginas de
+  usuario y de kernel (Incremento 18); si eso se rompiera, se rompería para
+  todos a la vez.
+- Un proceso que sale no devuelve sus marcos: no hay destrucción todavía.
+
 ## Incremento 20 — Los runtime services se mudan a la mitad alta
 
 `docs/adr/0016-fase3-set-virtual-address-map.md`. El cabo suelto que venía

@@ -10,13 +10,10 @@
 //! the next increments; this one is about the boundary.
 
 use harlan_arch_x86_64::syscall::SyscallFrame;
-use harlan_hal::addr::{PhysAddr, VirtAddr};
-use harlan_hal::frame::PhysRange;
-use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
+use harlan_hal::addr::VirtAddr;
 use harlan_hal::{error, info};
 
-use crate::memory::frame_allocator::FramePurpose;
-use crate::memory::zeroed_frames::KernelFrames;
+use crate::process::Process;
 
 /// Where the program is mapped. Low, but clear of the first megabyte and
 /// of anything the firmware kept.
@@ -92,106 +89,10 @@ const MESSAGE: &str = "HARLAN: hello from ring 3\n";
 const MESSAGE_LEN: u8 = MESSAGE.len() as u8;
 const MESSAGE_AT: u8 = 33;
 
-/// Where the program's memory is, so the kernel can tell whether a
-/// pointer it was handed belongs to it.
-#[derive(Debug, Clone, Copy)]
-pub struct Program {
-    pub code: PhysRange,
-    pub stack: PhysRange,
-}
-
-impl Program {
-    /// Whether `[ptr, ptr + len)` is memory this program owns.
-    ///
-    /// Everything that arrives in a register from ring 3 goes through
-    /// here before the kernel reads a byte of it.
-    pub fn owns(&self, ptr: u64, len: u64) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let Some(end) = ptr.checked_add(len) else {
-            return false;
-        };
-        let inside = |range: &PhysRange| {
-            let start = range.start.as_u64();
-            ptr >= start && end <= range.end().as_u64()
-        };
-        inside(&self.code) || inside(&self.stack)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartError {
-    /// No frame for the program's code or its stack.
-    OutOfFrames,
-    /// The pages it needs are taken, or the mapper refused them.
-    Mapping(harlan_hal::paging::MapError),
-}
-
-/// Copies the program into fresh frames and maps them for ring 3: the
-/// code executable and read-only, the stack writable and no-execute.
-///
-/// # Safety
-///
-/// The lower half must be the kernel's to map into — after
-/// `keep_only_in_lower_half`, not before — and nothing else may be using
-/// these addresses.
-pub unsafe fn load(
-    mapper: &mut dyn PageMapper,
-    frames: &mut KernelFrames<'_>,
-) -> Result<Program, StartError> {
-    let code_frame = frames
-        .allocate_for(FramePurpose::Kernel)
-        .ok_or(StartError::OutOfFrames)?;
-    let stack_frame = frames
-        .allocate_for(FramePurpose::Stack)
-        .ok_or(StartError::OutOfFrames)?;
-
-    // The program goes in through the kernel's window, not through the
-    // mapping the program will use: that one is read-only.
-    let window = frames.window();
-    // SAFETY: the frame is fresh from the allocator, so nothing else uses
-    // it, and the window reaches it (its own contract).
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            PROGRAM.as_ptr(),
-            window.frame_ptr(code_frame),
-            PROGRAM.len(),
-        )
-    };
-
-    // SAFETY: both frames are fresh, these addresses are user space and
-    // used by nothing else (the caller's contract).
-    unsafe {
-        mapper.map(
-            Page::containing_address(PROGRAM_BASE),
-            code_frame,
-            PageFlags::user(false, true),
-            frames,
-        )?;
-        mapper.map(
-            Page::containing_address(STACK_BASE),
-            stack_frame,
-            PageFlags::user(true, false),
-            frames,
-        )?;
-    }
-    Ok(Program {
-        code: PhysRange::new(PhysAddr::new(PROGRAM_BASE.as_u64()), PAGE_SIZE),
-        stack: PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
-    })
-}
-
-impl From<harlan_hal::paging::MapError> for StartError {
-    fn from(err: harlan_hal::paging::MapError) -> Self {
-        StartError::Mapping(err)
-    }
-}
-
-/// The program's memory, for the handler to check pointers against, and
-/// where to continue once it exits. Written before ring 3 is entered and
-/// read only from the syscall handler.
-static mut CURRENT: Option<Program> = None;
+/// The process that is running, for the handler to check its pointers
+/// against, and where to continue once it exits. Written before ring 3 is
+/// entered and read only from the syscall handler.
+static mut CURRENT: Option<&'static Process> = None;
 static mut ON_EXIT: Option<(extern "C" fn(*mut u8) -> !, *mut u8)> = None;
 
 /// Handles one syscall. Runs on the kernel's syscall stack with
@@ -199,9 +100,9 @@ static mut ON_EXIT: Option<(extern "C" fn(*mut u8) -> !, *mut u8)> = None;
 pub fn handle(frame: &mut SyscallFrame) {
     // SAFETY: single core, and this is only reachable from the syscall
     // stub, which cannot run before `enter` set these.
-    let program = unsafe { CURRENT };
-    let Some(program) = program else {
-        error!("HARLAN: a syscall arrived with no program running");
+    let running = unsafe { CURRENT };
+    let Some(running) = running else {
+        error!("HARLAN: a syscall arrived with no process running");
         frame.rax = ERR_UNKNOWN_CALL as u64;
         return;
     };
@@ -209,14 +110,14 @@ pub fn handle(frame: &mut SyscallFrame) {
     match Call::from(frame.rax) {
         Some(Call::Log) => {
             let (ptr, len) = (frame.rdi, frame.rsi);
-            if !program.owns(ptr, len) || len > 4096 {
-                error!("HARLAN: syscall log({ptr:#x}, {len}) is not the program's memory");
+            if !running.owns(ptr, len) || len > 4096 {
+                error!("HARLAN: syscall log({ptr:#x}, {len}) is not this process's memory");
                 frame.rax = ERR_BAD_ARGUMENT as u64;
                 return;
             }
             // SAFETY: the range was just checked to be inside the pages
-            // this program was given, which are mapped and stay mapped
-            // while it runs.
+            // this process was given, which are mapped in the space that
+            // is active and stay mapped while it runs.
             let bytes = unsafe {
                 core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
             };
@@ -232,7 +133,7 @@ pub fn handle(frame: &mut SyscallFrame) {
             }
         }
         Some(Call::Exit) => {
-            info!("HARLAN: the program exited with {}", frame.rdi);
+            info!("HARLAN: the process exited with {}", frame.rdi);
             // SAFETY: as above; set before ring 3 was entered.
             let resume = unsafe { ON_EXIT };
             let Some((resume, argument)) = resume else {
@@ -249,41 +150,45 @@ pub fn handle(frame: &mut SyscallFrame) {
     }
 }
 
-/// Runs `program` in ring 3. Never returns: the program leaves through
-/// `exit`, which continues the kernel at `resume`.
+/// Runs `process` in ring 3, in its own address space. Never returns: it
+/// leaves through `exit`, which continues the kernel at `resume`.
 ///
 /// # Safety
 ///
-/// `syscall::init` must have run with a stack of the kernel's own, the
-/// program's pages must be mapped as `load` left them, and `resume` must
-/// be safe to call on that syscall stack.
-pub unsafe fn enter(program: Program, resume: extern "C" fn(*mut u8) -> !, argument: *mut u8) -> ! {
+/// `syscall::init` must have run with a stack of the kernel's own,
+/// `process` must be one `spawn` built, and `resume` must be safe to call
+/// on that syscall stack, in the kernel's own space.
+pub unsafe fn enter(
+    process: &'static Process,
+    resume: extern "C" fn(*mut u8) -> !,
+    argument: *mut u8,
+) -> ! {
     // SAFETY: single core, before any user code exists.
     unsafe {
-        CURRENT = Some(program);
+        CURRENT = Some(process);
         ON_EXIT = Some((resume, argument));
     }
     harlan_arch_x86_64::syscall::set_handler(handle);
     info!(
-        "HARLAN: entering ring 3 at {:#x} with a stack at {:#x}",
-        PROGRAM_BASE, STACK_TOP
+        "HARLAN: entering ring 3 at {:#x} with a stack at {:#x}, in the space at {:#x}",
+        process.entry(),
+        process.stack_top(),
+        process.space.root()
     );
-    // SAFETY: the pages are mapped for ring 3 by `load`, the stack top is
-    // page-aligned, and the syscall path is set up (the caller's
-    // contract).
-    unsafe { harlan_arch_x86_64::user::enter(PROGRAM_BASE.as_u64(), STACK_TOP.as_u64()) }
+    // SAFETY: the kernel runs in the higher half, which this space shares,
+    // and holds no pointer into the lower half of the one it is leaving.
+    unsafe { process.activate() };
+    // SAFETY: the pages are mapped for ring 3 in the space just made
+    // active, the stack top is page-aligned, and the syscall path is set
+    // up (the caller's contract).
+    unsafe {
+        harlan_arch_x86_64::user::enter(process.entry().as_u64(), process.stack_top().as_u64())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn program_at(base: u64) -> Program {
-        Program {
-            code: PhysRange::new(PhysAddr::new(base), PAGE_SIZE),
-            stack: PhysRange::new(PhysAddr::new(base + 0x10_0000), PAGE_SIZE),
-        }
-    }
 
     /// The hand-assembled bytes have to mean what the comment says: the
     /// `lea` has to land on the message and the length has to match it.
@@ -307,23 +212,6 @@ mod tests {
         assert_eq!(PROGRAM[1], Call::Log as u8);
     }
 
-    /// Everything that arrives from ring 3 is checked against what the
-    /// program was given, and nothing else.
-    #[test]
-    fn a_pointer_is_only_good_if_it_is_the_program_s_own() {
-        let program = program_at(0x40_0000);
-        assert!(program.owns(0x40_0000, 1));
-        assert!(program.owns(0x40_0000, PAGE_SIZE));
-        assert!(program.owns(0x50_0000, PAGE_SIZE));
-
-        assert!(!program.owns(0x40_0000, PAGE_SIZE + 1), "past the page");
-        assert!(!program.owns(0x3F_FFFF, 2), "starts below it");
-        assert!(!program.owns(0x40_0000, 0), "nothing at all");
-        assert!(!program.owns(u64::MAX, 1), "would wrap");
-        assert!(!program.owns(0xFFFF_8000_0000_0000, 8), "the kernel's");
-        assert!(!program.owns(0x45_0000, 8), "the gap between the two");
-    }
-
     fn frame_for(call: Call, ptr: u64, len: u64) -> SyscallFrame {
         SyscallFrame {
             rax: call as u64,
@@ -338,49 +226,15 @@ mod tests {
         }
     }
 
-    /// The handler reads what the program points at only after checking
-    /// the pointer is the program's. The bad pointer here is one that
-    /// would kill the test process if it were followed.
+    /// With no process running, a syscall is refused rather than
+    /// answered with something that reads as success.
     #[test]
-    fn log_reads_the_program_s_memory_and_refuses_anything_else() {
-        let text = b"hello from a test
-";
-        let program = Program {
-            code: PhysRange::new(PhysAddr::new(text.as_ptr() as u64), text.len() as u64),
-            stack: PhysRange::new(PhysAddr::new(0), 0),
-        };
+    fn a_syscall_with_no_process_running_is_refused() {
         // SAFETY: single-threaded test; nothing else reads this.
-        unsafe { CURRENT = Some(program) };
-
-        let mut good = frame_for(Call::Log, text.as_ptr() as u64, text.len() as u64);
-        handle(&mut good);
-        assert_eq!(good.rax, text.len() as u64);
-
-        for (ptr, len) in [
-            (0x1u64, 8u64),                // nowhere near the program
-            (text.as_ptr() as u64, 4096),  // starts right, runs past
-            (text.as_ptr() as u64 - 1, 2), // starts just before
-            (u64::MAX, 8),                 // would wrap
-            (text.as_ptr() as u64, 0),     // nothing at all
-        ] {
-            let mut bad = frame_for(Call::Log, ptr, len);
-            handle(&mut bad);
-            assert_eq!(
-                bad.rax as i64, ERR_BAD_ARGUMENT,
-                "log({ptr:#x}, {len}) must be refused without being read"
-            );
-        }
-
-        let mut unknown = frame_for(Call::Log, 0, 0);
-        unknown.rax = 99;
-        handle(&mut unknown);
-        assert_eq!(unknown.rax as i64, ERR_UNKNOWN_CALL);
-
-        // SAFETY: as above.
         unsafe { CURRENT = None };
-        let mut orphan = frame_for(Call::Log, text.as_ptr() as u64, text.len() as u64);
-        handle(&mut orphan);
-        assert_eq!(orphan.rax as i64, ERR_UNKNOWN_CALL, "no program is running");
+        let mut frame = frame_for(Call::Log, 0x1000, 8);
+        handle(&mut frame);
+        assert_eq!(frame.rax as i64, ERR_UNKNOWN_CALL);
     }
 
     #[test]

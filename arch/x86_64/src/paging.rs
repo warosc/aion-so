@@ -574,6 +574,26 @@ impl<A: TableAccess> PageTables<A> {
         Ok(tables)
     }
 
+    /// A new tree of tables for a process: an empty lower half and this
+    /// one's higher half, shared by reference.
+    fn new_process_space(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<PageTables<A>, MapError>
+    where
+        A: Clone,
+    {
+        let root = self.new_table(frames)?;
+        for slot in table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES {
+            let entry = self.access.read(self.root, slot);
+            self.access.write(root, slot, entry);
+        }
+        Ok(PageTables {
+            root,
+            access: self.access.clone(),
+        })
+    }
+
     /// A zeroed page table in a fresh frame. Tables are written through
     /// their physical address, so a frame that address does not reach
     /// writably is refused (and not returned to `frames`, which has no way
@@ -604,6 +624,7 @@ impl<A: TableAccess> PageTables<A> {
 /// the active root or new tables `new_table` verified identity-mapped and
 /// writable, with indices below 512, and only ever writes the kernel's own
 /// tables (the host tests check that no firmware table is written).
+#[derive(Clone)]
 struct PhysAccess {
     /// A table at physical address `p` is reached at `base + p`. Zero
     /// while the firmware's identity map is what the kernel runs under;
@@ -657,6 +678,63 @@ impl TableAccess for PhysAccess {
         unsafe {
             asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags));
         }
+    }
+}
+
+/// A process's page tables: the kernel's higher half, shared, and a
+/// lower half of its own.
+///
+/// The kernel's entries are **copied, not rebuilt**: both roots point at
+/// the same tables, so anything the kernel maps afterwards is visible from
+/// every process and its memory stays its own
+/// (docs/adr/0017-fase3-process-address-space.md).
+pub struct AddressSpace {
+    tables: PageTables<PhysAccess>,
+}
+
+impl AddressSpace {
+    /// Maps one page of this process's memory.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must be free for this process to own, and `page` must be in
+    /// the lower half and unused in this space. `flags.user` decides
+    /// whether ring 3 can reach it, and `map` refuses the mismatch.
+    pub unsafe fn map(
+        &mut self,
+        page: Page,
+        frame: PhysFrame,
+        flags: PageFlags,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<(), MapError> {
+        self.tables
+            .map(page.start_address().as_u64(), frame, flags, frames)
+    }
+
+    /// What `addr` resolves to in this space, if anything.
+    pub fn translate(&self, addr: VirtAddr) -> Option<PhysAddr> {
+        self.tables
+            .translate(addr.as_u64())
+            .map(|t| PhysAddr::new(t.phys))
+    }
+
+    /// The physical address of this space's root, which is what CR3 holds.
+    pub fn root(&self) -> u64 {
+        self.tables.root
+    }
+
+    /// Makes this the space the CPU walks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be running in the higher half, which every space
+    /// shares, and must not be using anything of the lower half of the
+    /// space it is leaving. The stack, the heap and the kernel's image all
+    /// qualify; a pointer into a process's memory does not.
+    pub unsafe fn activate(&self) {
+        // SAFETY: loading CR3 with the root of a table tree that contains
+        // this very code in its higher half.
+        unsafe { write_cr3(self.tables.root) };
     }
 }
 
@@ -746,6 +824,40 @@ impl KernelPageTable {
     /// Physical address of the kernel's root table (PML4).
     pub fn root(&self) -> u64 {
         self.tables.root
+    }
+
+    /// A space for a process: an empty lower half, and the kernel's higher
+    /// half shared with this one.
+    ///
+    /// # Safety
+    ///
+    /// The kernel must own its tables and reach frames through its own
+    /// window, and `frames` must hand out memory nobody else has.
+    pub unsafe fn new_address_space(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<AddressSpace, PagingError> {
+        // The higher half by reference: the same tables, so what the
+        // kernel maps later is there without anyone copying anything.
+        let tables = self
+            .tables
+            .new_process_space(frames)
+            .map_err(|err| match err {
+                MapError::OutOfFrames => PagingError::OutOfFrames,
+                _ => PagingError::TableFrameNotWritable,
+            })?;
+        Ok(AddressSpace { tables })
+    }
+
+    /// Goes back to the kernel's own space.
+    ///
+    /// # Safety
+    ///
+    /// As `AddressSpace::activate`.
+    pub unsafe fn activate(&self) {
+        // SAFETY: the kernel's own root, which every process's space
+        // shares the higher half of.
+        unsafe { write_cr3(self.tables.root) };
     }
 
     /// Replaces the firmware's identity map with one built from the
@@ -894,7 +1006,7 @@ mod tests {
     /// Simulated physical memory holding page tables. Reading a frame that
     /// holds no table fails the test (the walker must never read
     /// non-table memory), and so does writing a firmware table.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeMemory {
         /// What the walker adds to a table's physical address, as the
         /// kernel's window does once the lower half is gone.
@@ -1641,6 +1753,78 @@ mod tests {
             )
             .expect("mapping a page of the kernel's");
         assert_eq!(leaf_entry(&tables, page(0)) & USER, 0);
+    }
+
+    /// Two spaces, the same address, different memory — and the kernel's
+    /// half shared: both roots point at the *same* tables, which is what
+    /// makes anything it maps later visible from every process.
+    ///
+    /// The fake memory is copied when a space is made, so sharing is
+    /// asserted the way the hardware sees it: identical entries, naming
+    /// the same tables.
+    #[test]
+    fn two_spaces_give_the_same_address_different_memory() {
+        let mut frames = Frames((0..24).map(|n| 0x40_0000 + n * 0x1000).collect());
+        let mut kernel = adopted(&mut frames);
+        let window = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        kernel
+            .map_physical_window(&mut frames, window, GIB)
+            .expect("the window");
+        kernel.access.window = window;
+        kernel.keep_only(&mut frames, &[]).expect("emptying it");
+        kernel
+            .map(
+                page(0),
+                frame(0x50_0000),
+                PageFlags::kernel(true, false),
+                &mut frames,
+            )
+            .expect("a page of the kernel's");
+
+        let mut first = kernel.new_process_space(&mut frames).expect("first space");
+        let mut second = kernel.new_process_space(&mut frames).expect("second space");
+        assert_ne!(first.root, second.root, "each space has its own root");
+
+        // Every kernel slot names the same table in all three roots.
+        for slot in table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES {
+            let mine = kernel.access.read(kernel.root, slot);
+            assert_eq!(first.access.read(first.root, slot), mine, "slot {slot}");
+            assert_eq!(second.access.read(second.root, slot), mine, "slot {slot}");
+        }
+        // And nothing of the lower half survives into a new space.
+        for slot in 0..table_indices(KERNEL_SPACE_BASE)[0] {
+            assert_eq!(first.access.read(first.root, slot), 0, "slot {slot}");
+        }
+
+        // The same address in both, backed by different frames.
+        let shared_address = 0x0000_0000_2000_0000;
+        first
+            .map(
+                shared_address,
+                frame(0x60_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .expect("the first process's page");
+        second
+            .map(
+                shared_address,
+                frame(0x70_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .expect("the second process's page");
+        assert_eq!(first.translate(shared_address).unwrap().phys, 0x60_0000);
+        assert_eq!(second.translate(shared_address).unwrap().phys, 0x70_0000);
+
+        // Neither was given anything else down there.
+        assert_eq!(first.translate(0x2100_0000), None);
+        assert_eq!(second.translate(0x2100_0000), None);
+
+        // The kernel's memory is reachable, and the same, from both.
+        for space in [&first, &second] {
+            assert_eq!(space.translate(page(0)).map(|t| t.phys), Some(0x50_0000));
+        }
     }
 
     #[test]
