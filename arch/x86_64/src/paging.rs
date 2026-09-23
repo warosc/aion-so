@@ -42,6 +42,11 @@ pub const KERNEL_HEAP_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + (1 << 
 /// unmapped page (see docs/fase2-notes.md, Incremento 10).
 pub const KERNEL_STACKS_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 2 * (1 << 39));
 
+/// Where the kernel's own image is mapped so that it can stop running from
+/// wherever the firmware put it: PML4 slot 259
+/// (docs/adr/0012-fase3-higher-half-kernel.md).
+pub const KERNEL_IMAGE_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 3 * (1 << 39));
+
 const ENTRIES: usize = 512;
 const PAGE: u64 = 4096;
 const LARGE_PAGE: u64 = 2 * 1024 * 1024;

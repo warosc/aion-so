@@ -329,15 +329,116 @@ extern "C" fn kernel_main_on_stack(context: *mut u8) -> ! {
 
 #[cfg(target_arch = "x86_64")]
 fn kernel_main(context: &mut KernelContext) -> ! {
-    use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
-
     // Which stack this is running on, so every boot log says whether the
     // switch to the guarded stack happened.
     let here = 0u8;
     log::info!(
-        "HARLAN: kernel running on the stack at {:#x}",
+        "HARLAN: kernel running on the stack at {:#x}, code at {:#x}",
+        core::ptr::addr_of!(here) as u64,
+        kernel_main as *const () as u64
+    );
+
+    // Out of the address the firmware chose and into kernel space, so the
+    // lower half can become user space (ADR 0012). Only the image's own
+    // mapping moves: the stack and the heap are already up here.
+    if let Some(image) = context.kernel_image {
+        use harlan_hal::InterruptControl;
+        let cpu = harlan_arch_x86_64::Cpu;
+        // The descriptor tables name the old addresses until the far side
+        // reinstalls them, so nothing may be delivered in between.
+        cpu.disable();
+        // SAFETY: the alias slot (PML4 259) is used by nothing else; the
+        // image is where this kernel runs from and is still writable at
+        // its own address (the identity map is rebuilt later); interrupts
+        // are off until the far side has reinstalled the tables.
+        let plan = unsafe {
+            memory::higher_half::prepare(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_arch_x86_64::paging::KERNEL_IMAGE_START,
+                image,
+                context.kernel_code,
+            )
+        };
+        match plan {
+            Ok(plan) => match memory::higher_half::moved(
+                continue_in_kernel_space as *const () as u64,
+                image,
+                &plan,
+            ) {
+                Some(target) => {
+                    // SAFETY: `target` is this very function's twin in the
+                    // alias, which is mapped executable and holds the same
+                    // code; the signature is the one declared below, and
+                    // it never returns. `context` and `plan` live on the
+                    // kernel stack and heap, both of which stay where they
+                    // are.
+                    let entry: extern "C" fn(
+                        *mut KernelContext,
+                        *const memory::higher_half::Move,
+                    ) -> ! = unsafe { core::mem::transmute(target.as_ptr::<()>()) };
+                    entry(context as *mut KernelContext, &plan)
+                }
+                None => log::error!(
+                    "HARLAN: the kernel's own code is not inside the image the firmware reported; staying where it is"
+                ),
+            },
+            Err(err) => log::error!(
+                "HARLAN: the kernel could not move into kernel space ({err:?}); it keeps running from where the firmware loaded it"
+            ),
+        }
+        cpu.enable();
+    } else {
+        log::error!("HARLAN: no image range known; the kernel keeps running where it was loaded");
+    }
+
+    run(context)
+}
+
+/// The kernel, now reached through its kernel-space alias.
+///
+/// Called exactly once, by `kernel_main`, through a pointer into the alias
+/// and with interrupts disabled.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn continue_in_kernel_space(
+    context: *mut KernelContext,
+    plan: *const memory::higher_half::Move,
+) -> ! {
+    use harlan_hal::InterruptControl;
+
+    // SAFETY: both point at what `kernel_main` handed over — the leaked
+    // context on the heap and its own stack slot — and neither moved.
+    let (context, plan) = unsafe { (&mut *context, *plan) };
+
+    // The tables still name the addresses the kernel used to have.
+    // SAFETY: interrupts are disabled, the relocations are applied, and
+    // the double-fault stack is reinstalled right below.
+    unsafe { harlan_arch_x86_64::interrupts::reinstall_descriptors() };
+    if let Some((_, double_fault)) = context.kernel_stacks {
+        // SAFETY: the same stack as in `kmain`: mapped, guarded, used by
+        // nothing else, and this is not a double fault.
+        unsafe { harlan_arch_x86_64::set_double_fault_stack(double_fault.top()) };
+    }
+    harlan_arch_x86_64::Cpu.enable();
+
+    let here = 0u8;
+    log::info!(
+        "HARLAN: kernel moved into kernel space: code at {:#x} (was {:#x}), {} page(s) mapped, {} read-only, {} address(es) relocated; stack at {:#x}",
+        continue_in_kernel_space as *const () as u64,
+        (continue_in_kernel_space as *const () as u64).wrapping_sub(plan.delta),
+        plan.pages,
+        plan.read_only,
+        plan.relocations,
         core::ptr::addr_of!(here) as u64
     );
+    run(context)
+}
+
+/// The long-running kernel: its own identity map, the firmware's memory
+/// back in the pool, and the shell.
+#[cfg(target_arch = "x86_64")]
+fn run(context: &mut KernelContext) -> ! {
+    use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
 
     // What still runs through the identity map: the kernel's own code and
     // the firmware's runtime services code (`reboot` and `shutdown` call
