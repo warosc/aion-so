@@ -22,8 +22,8 @@
 use core::arch::asm;
 
 use harlan_hal::addr::{PhysAddr, VirtAddr};
-use harlan_hal::frame::{FrameAllocator, PhysFrame, PhysRange};
-use harlan_hal::paging::{MapError, Page, PageFlags, PageMapper, UnmapError};
+use harlan_hal::frame::{FrameAllocator, PhysFrame};
+use harlan_hal::paging::{ExecutableRange, MapError, Page, PageFlags, PageMapper, UnmapError};
 
 /// First address of kernel space: PML4 slot 256, the start of the
 /// canonical higher half. The bare number is what the walker below does
@@ -107,6 +107,10 @@ pub struct IdentityMapStats {
     /// 4 KiB pages left executable; everything else in the map is
     /// no-execute.
     pub executable_pages: u64,
+    /// Of those, the ones that hold nothing but code and are therefore
+    /// mapped read-only. A page that mixes code and data cannot be, so
+    /// the two numbers differ if any section is not page-aligned.
+    pub read_only_pages: u64,
 }
 
 /// How the walker reaches table memory, given a table's physical address.
@@ -270,14 +274,14 @@ impl<A: TableAccess> PageTables<A> {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
-        executable: &[PhysRange],
+        executable: &[ExecutableRange],
     ) -> Result<IdentityMapStats, PagingError> {
         if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
             return Err(PagingError::BadIdentityLimit);
         }
         // Marking a range executable it cannot reach would build a map
         // without the code the caller says it still runs.
-        if executable.iter().any(|range| {
+        if executable.iter().map(|code| code.range).any(|range| {
             range.len == 0
                 || range.start.as_u64() >= limit
                 || range.start.checked_add(range.len).is_none()
@@ -294,7 +298,7 @@ impl<A: TableAccess> PageTables<A> {
         // end, so the map in use never loses a translation it is running
         // on.
         let pdpt = self.new_table(frames).map_err(to_paging)?;
-        let (mut tables, mut executable_pages) = (1, 0);
+        let (mut tables, mut executable_pages, mut read_only_pages) = (1, 0, 0);
         for slot in 0..(limit / GIB) as usize {
             let directory = self.new_table(frames).map_err(to_paging)?;
             tables += 1;
@@ -304,8 +308,9 @@ impl<A: TableAccess> PageTables<A> {
                 // The first 2 MiB (the null page has to be left out) and
                 // anything holding code need 4 KiB granularity.
                 let fine_grained = base == 0
-                    || executable.iter().any(|range| {
-                        range.overlaps(PhysAddr::new(base), PhysAddr::new(base + LARGE_PAGE))
+                    || executable.iter().any(|code| {
+                        code.range
+                            .overlaps(PhysAddr::new(base), PhysAddr::new(base + LARGE_PAGE))
                     });
                 if !fine_grained {
                     self.access.write(
@@ -324,15 +329,32 @@ impl<A: TableAccess> PageTables<A> {
                     if page == 0 {
                         continue;
                     }
-                    let runs_code = executable.iter().any(|range| {
-                        range.overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
+                    let runs_code = executable.iter().any(|code| {
+                        code.range
+                            .overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
+                    });
+                    // A page that is code and nothing but code is never
+                    // written, so it is mapped read-only: the other half of
+                    // write xor execute. One that only overlaps a code
+                    // range holds data too and stays writable.
+                    let only_code = executable.iter().any(|code| {
+                        code.range.contains(PhysAddr::new(page))
+                            && code.range.end().as_u64() >= page + PAGE
+                    }) && !executable.iter().any(|code| {
+                        code.writable
+                            && code
+                                .range
+                                .overlaps(PhysAddr::new(page), PhysAddr::new(page + PAGE))
                     });
                     executable_pages += u64::from(runs_code);
-                    let flags = if runs_code {
-                        PRESENT | WRITABLE
-                    } else {
-                        PRESENT | WRITABLE | NO_EXECUTE
-                    };
+                    read_only_pages += u64::from(only_code);
+                    let mut flags = PRESENT;
+                    if !only_code {
+                        flags |= WRITABLE;
+                    }
+                    if !runs_code {
+                        flags |= NO_EXECUTE;
+                    }
                     self.access.write(table, index, page | flags);
                 }
                 self.access
@@ -351,6 +373,7 @@ impl<A: TableAccess> PageTables<A> {
             tables,
             limit,
             executable_pages,
+            read_only_pages,
         })
     }
 
@@ -529,7 +552,7 @@ impl KernelPageTable {
         &mut self,
         frames: &mut dyn FrameAllocator,
         limit: u64,
-        executable: &[PhysRange],
+        executable: &[ExecutableRange],
     ) -> Result<IdentityMapStats, PagingError> {
         self.tables.rebuild_identity(frames, limit, executable)
     }
@@ -596,6 +619,7 @@ unsafe fn write_cr3(value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harlan_hal::frame::PhysRange;
     use std::collections::{BTreeMap, BTreeSet};
 
     /// What a frame holds before the kernel writes it: present-looking
@@ -689,6 +713,19 @@ mod tests {
 
     fn frame(addr: u64) -> PhysFrame {
         PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap()
+    }
+
+    /// The entry that maps `addr`, whatever level resolves it.
+    fn leaf_entry(tables: &PageTables<FakeMemory>, addr: u64) -> u64 {
+        let mut table = tables.root;
+        for (level, index) in table_indices(addr).into_iter().enumerate() {
+            let entry = tables.access.read(table, index);
+            if level == 3 || entry & HUGE != 0 {
+                return entry;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        unreachable!()
     }
 
     #[test]
@@ -932,6 +969,7 @@ mod tests {
                 tables: 3,
                 limit: GIB,
                 executable_pages: 0,
+                read_only_pages: 0,
             }
         );
 
@@ -962,7 +1000,7 @@ mod tests {
         ]);
         let mut tables = adopted(&mut frames);
         let stats = tables
-            .rebuild_identity(&mut frames, GIB, core::slice::from_ref(&image))
+            .rebuild_identity(&mut frames, GIB, &[ExecutableRange::read_only(image)])
             .unwrap();
         // PDPT, page directory, the first 2 MiB, and the 2 MiB with the image.
         assert_eq!((stats.tables, stats.executable_pages), (4, 2));
@@ -1049,10 +1087,77 @@ mod tests {
         let mut tables = adopted(&mut frames);
         let outside = PhysRange::new(PhysAddr::new(GIB - PAGE), 2 * PAGE);
         assert_eq!(
-            tables.rebuild_identity(&mut frames, GIB, &[outside]),
+            tables.rebuild_identity(&mut frames, GIB, &[ExecutableRange::read_only(outside)]),
             Err(PagingError::RequiredRangeOutsideIdentityMap)
         );
         assert_eq!(tables.access.flushed_all, 0);
+    }
+
+    /// Write xor execute: a page that holds nothing but code is mapped
+    /// executable and read-only; one that mixes code and data has to stay
+    /// writable, and then it is not read-only even though it runs.
+    #[test]
+    fn pages_that_are_only_code_are_mapped_read_only() {
+        let aligned = PhysRange::new(PhysAddr::new(0x40_0000), 2 * PAGE);
+        let straddling = PhysRange::new(PhysAddr::new(0x60_0800), PAGE);
+        let mut frames = Frames(vec![
+            0x80_0000, 0x80_1000, 0x80_2000, 0x80_3000, 0x80_4000, 0x80_5000, 0x80_6000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        let stats = tables
+            .rebuild_identity(
+                &mut frames,
+                GIB,
+                &[
+                    ExecutableRange::read_only(aligned),
+                    ExecutableRange::read_only(straddling),
+                ],
+            )
+            .unwrap();
+        // Two whole pages of code, plus the two the straddling range
+        // touches.
+        assert_eq!((stats.executable_pages, stats.read_only_pages), (4, 2));
+
+        let leaf = |addr: u64| leaf_entry(&tables, addr);
+        for addr in [aligned.start.as_u64(), aligned.start.as_u64() + PAGE] {
+            let entry = leaf(addr);
+            assert_eq!(entry & NO_EXECUTE, 0, "{addr:#x} must run");
+            assert_eq!(entry & WRITABLE, 0, "{addr:#x} must not be writable");
+        }
+        for addr in [straddling.start.as_u64(), straddling.end().as_u64() - 1] {
+            let entry = leaf(addr);
+            assert_eq!(entry & NO_EXECUTE, 0, "{addr:#x} must run");
+            assert_ne!(
+                entry & WRITABLE,
+                0,
+                "{addr:#x} shares its page with data and must stay writable"
+            );
+        }
+        // Plain data is writable and no-execute, as before.
+        let data = leaf(0x10_0000);
+        assert_ne!(data & WRITABLE, 0);
+        assert_ne!(data & NO_EXECUTE, 0);
+    }
+
+    /// OVMF writes inside its own runtime services code, so a range the
+    /// kernel does not control keeps its pages writable even though they
+    /// run. Mapping them read-only faults on `shutdown` (measured).
+    #[test]
+    fn code_someone_else_writes_into_stays_writable() {
+        let firmware = PhysRange::new(PhysAddr::new(0x40_0000), 2 * PAGE);
+        let mut frames = Frames(vec![
+            0x80_0000, 0x80_1000, 0x80_2000, 0x80_3000, 0x80_4000, 0x80_5000,
+        ]);
+        let mut tables = adopted(&mut frames);
+        let stats = tables
+            .rebuild_identity(&mut frames, GIB, &[ExecutableRange::writable(firmware)])
+            .unwrap();
+        assert_eq!((stats.executable_pages, stats.read_only_pages), (2, 0));
+        for addr in [firmware.start.as_u64(), firmware.end().as_u64() - PAGE] {
+            let entry = leaf_entry(&tables, addr);
+            assert_eq!(entry & NO_EXECUTE, 0, "{addr:#x} must run");
+            assert_ne!(entry & WRITABLE, 0, "{addr:#x} must stay writable");
+        }
     }
 
     #[test]

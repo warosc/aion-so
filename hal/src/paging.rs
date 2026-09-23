@@ -3,7 +3,39 @@
 //! consumes it without knowing the page-table format.
 
 use crate::addr::{PhysAddr, VirtAddr};
-use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame};
+use crate::frame::{FRAME_SIZE, FrameAllocator, PhysFrame, PhysRange};
+
+/// A range that must stay executable in a map, and whether it must also
+/// stay writable.
+///
+/// The kernel's own code does not: mapping it read-only is the other half
+/// of write xor execute. The firmware's runtime services code does —
+/// OVMF writes inside it, and `shutdown` faults with
+/// `#PF ... error_code=0x3` if that range is read-only (measured; see
+/// docs/adr/0011-fase2-write-xor-execute-inside-the-image.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutableRange {
+    pub range: PhysRange,
+    pub writable: bool,
+}
+
+impl ExecutableRange {
+    /// Code the kernel controls: executable, never written.
+    pub const fn read_only(range: PhysRange) -> Self {
+        Self {
+            range,
+            writable: false,
+        }
+    }
+
+    /// Code someone else controls and writes into.
+    pub const fn writable(range: PhysRange) -> Self {
+        Self {
+            range,
+            writable: true,
+        }
+    }
+}
 
 pub const PAGE_SIZE: u64 = FRAME_SIZE;
 

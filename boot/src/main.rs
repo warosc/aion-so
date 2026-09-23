@@ -26,7 +26,7 @@ fn efi_main() -> Status {
         framebuffer.map(|info| harlan_hal::frame::PhysRange::new(info.base_addr, info.size_bytes));
     // Also a Boot Services question: the kernel marks this range executable
     // and everything else no-execute when it builds its own page tables.
-    let kernel_image = image::query();
+    let kernel_image = image::query_with_code();
 
     // SAFETY: this is the only call site, on a single linear,
     // non-reentrant path. No Boot-Services-backed resource is held past
@@ -59,7 +59,8 @@ fn efi_main() -> Status {
     let memory_map = memory::build_memory_map(&uefi_memory_map);
     let boot_info = harlan_kernel::BootInfo {
         memory_map,
-        kernel_image,
+        kernel_image: kernel_image.as_ref().map(|image| image.range),
+        kernel_code: kernel_image.as_ref().and_then(|image| image.code),
         framebuffer: framebuffer_range,
     };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that

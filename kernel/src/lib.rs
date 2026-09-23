@@ -10,6 +10,7 @@ mod sync;
 use harlan_hal::addr::PhysAddr;
 use harlan_hal::frame::{FRAME_SIZE, PhysFrame, PhysRange};
 use harlan_hal::memory_map::{MemoryMap, MemoryRegionKind};
+use harlan_hal::paging::ExecutableRange;
 use harlan_hal::{Console, PowerControl};
 use memory::frame_allocator::BitmapFrameAllocator;
 
@@ -33,6 +34,12 @@ pub struct BootInfo {
     /// keeps these pages executable and marks the rest of the identity map
     /// no-execute (docs/adr/0008-fase2-write-xor-execute.md).
     pub kernel_image: Option<PhysRange>,
+    /// Which parts of that image are code. Everything else in it is data:
+    /// no-execute, while the code itself becomes read-only
+    /// (docs/adr/0011-fase2-write-xor-execute-inside-the-image.md). `None`
+    /// if the headers could not be read, and then the whole image stays
+    /// executable as it did before.
+    pub kernel_code: Option<harlan_hal::pe::CodeRanges>,
     /// Where the framebuffer the hardware console writes to lives. The
     /// kernel refuses to rebuild the identity map if that would leave this
     /// range unmapped, because the next character would fault.
@@ -266,6 +273,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             frames: heap_frames,
             map: heap_map,
             kernel_image: boot_info.kernel_image,
+            kernel_code: boot_info.kernel_code,
             framebuffer: boot_info.framebuffer,
             heap_range,
             kernel_stacks,
@@ -301,6 +309,7 @@ struct KernelContext {
     frames: memory::zeroed_frames::KernelFrames<'static>,
     map: &'static MemoryMap,
     kernel_image: Option<PhysRange>,
+    kernel_code: Option<harlan_hal::pe::CodeRanges>,
     framebuffer: Option<PhysRange>,
     /// Where the heap is and how big, to label its frames.
     heap_range: Option<(harlan_hal::addr::VirtAddr, u64)>,
@@ -330,11 +339,26 @@ fn kernel_main(context: &mut KernelContext) -> ! {
         core::ptr::addr_of!(here) as u64
     );
 
-    // What still runs through the identity map: the kernel's own image and
+    // What still runs through the identity map: the kernel's own code and
     // the firmware's runtime services code (`reboot` and `shutdown` call
-    // into it). Everything else in the map becomes no-execute.
+    // into it). Everything else in the map becomes no-execute, and these
+    // ranges become read-only (ADR 0011).
     let mut executable = alloc::vec::Vec::new();
-    executable.extend(context.kernel_image);
+    match context.kernel_code {
+        Some(code) => {
+            executable.extend(code.iter().map(ExecutableRange::read_only));
+            log::info!(
+                "HARLAN: kernel code = {} section(s), {} KiB of the {} KiB image",
+                code.len(),
+                code.total_bytes() / 1024,
+                context.kernel_image.map_or(0, |image| image.len) / 1024
+            );
+        }
+        // The headers could not be read: the whole image stays
+        // executable, and writable, which is what the kernel did before
+        // ADR 0011. Its data lives in there too.
+        None => executable.extend(context.kernel_image.map(ExecutableRange::writable)),
+    }
     let mut ranges_sound = true;
     for region in context
         .map
@@ -344,7 +368,13 @@ fn kernel_main(context: &mut KernelContext) -> ! {
         // Firmware data: a `page_count` that overflows means the map
         // cannot be trusted to say what has to stay executable.
         match region.page_count.checked_mul(FRAME_SIZE) {
-            Some(len) => executable.push(PhysRange::new(region.start_phys_addr, len)),
+            // Writable: OVMF writes inside its own runtime code, and
+            // `shutdown` faults with `#PF error_code=0x3` if this range is
+            // read-only (measured; ADR 0011).
+            Some(len) => executable.push(ExecutableRange::writable(PhysRange::new(
+                region.start_phys_addr,
+                len,
+            ))),
             None => {
                 ranges_sound = false;
                 log::error!(
@@ -398,11 +428,12 @@ fn kernel_main(context: &mut KernelContext) -> ! {
         } {
             Ok(stats) => {
                 log::info!(
-                    "HARLAN: identity map rebuilt from {} table(s) of the kernel's own, covering {} GiB, null page unmapped, {} page(s) executable of {} range(s), everything else no-execute",
+                    "HARLAN: identity map rebuilt from {} table(s) of the kernel's own, covering {} GiB, null page unmapped, {} page(s) executable of {} range(s) ({} of them read-only), everything else no-execute and writable",
                     stats.tables,
                     stats.limit / (1024 * 1024 * 1024),
                     stats.executable_pages,
-                    executable.len()
+                    executable.len(),
+                    stats.read_only_pages
                 );
                 true
             }
