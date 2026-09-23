@@ -33,6 +33,10 @@ pub struct BootInfo {
     /// keeps these pages executable and marks the rest of the identity map
     /// no-execute (docs/adr/0008-fase2-write-xor-execute.md).
     pub kernel_image: Option<PhysRange>,
+    /// Where the framebuffer the hardware console writes to lives. The
+    /// kernel refuses to rebuild the identity map if that would leave this
+    /// range unmapped, because the next character would fault.
+    pub framebuffer: Option<PhysRange>,
 }
 
 /// The kernel takes ownership of everything `boot` hands over (see
@@ -262,6 +266,7 @@ pub fn kmain<C: Console + 'static, P: PowerControl + 'static>(
             frames: heap_frames,
             map: heap_map,
             kernel_image: boot_info.kernel_image,
+            framebuffer: boot_info.framebuffer,
             heap_range,
             kernel_stacks,
             mapper,
@@ -296,6 +301,7 @@ struct KernelContext {
     frames: memory::zeroed_frames::KernelFrames<'static>,
     map: &'static MemoryMap,
     kernel_image: Option<PhysRange>,
+    framebuffer: Option<PhysRange>,
     /// Where the heap is and how big, to label its frames.
     heap_range: Option<(harlan_hal::addr::VirtAddr, u64)>,
     kernel_stacks: Option<(memory::stacks::Stack, memory::stacks::Stack)>,
@@ -329,13 +335,26 @@ fn kernel_main(context: &mut KernelContext) -> ! {
     // into it). Everything else in the map becomes no-execute.
     let mut executable = alloc::vec::Vec::new();
     executable.extend(context.kernel_image);
-    executable.extend(
-        context
-            .map
-            .iter()
-            .filter(|region| region.kind == MemoryRegionKind::RuntimeCode)
-            .map(|region| PhysRange::new(region.start_phys_addr, region.page_count * FRAME_SIZE)),
-    );
+    let mut ranges_sound = true;
+    for region in context
+        .map
+        .iter()
+        .filter(|region| region.kind == MemoryRegionKind::RuntimeCode)
+    {
+        // Firmware data: a `page_count` that overflows means the map
+        // cannot be trusted to say what has to stay executable.
+        match region.page_count.checked_mul(FRAME_SIZE) {
+            Some(len) => executable.push(PhysRange::new(region.start_phys_addr, len)),
+            None => {
+                ranges_sound = false;
+                log::error!(
+                    "HARLAN: the RuntimeCode region at {} claims {} pages, which overflows",
+                    region.start_phys_addr,
+                    region.page_count
+                );
+            }
+        }
+    }
     if executable.is_empty() {
         log::warn!(
             "HARLAN: no executable range known; the identity map would fault on its own code"
@@ -353,7 +372,23 @@ fn kernel_main(context: &mut KernelContext) -> ! {
     // (the kernel image and the firmware's runtime services); nothing
     // depends on the null page; single core, and no interrupt handler
     // touches page tables.
-    let own_tables = !executable.is_empty()
+    // The console still writes to the framebuffer through this map, and
+    // the rebuild only covers what fits under the limit.
+    let framebuffer_mapped = context.framebuffer.is_none_or(|range| {
+        range.len > 0
+            && range.start.checked_add(range.len).is_some()
+            && range.end().as_u64() <= DEFAULT_IDENTITY_LIMIT
+    });
+    if !framebuffer_mapped {
+        log::error!(
+            "HARLAN: the framebuffer at {:?} would fall outside the {} GiB identity map; the firmware's tables stay in use",
+            context.framebuffer,
+            DEFAULT_IDENTITY_LIMIT / (1024 * 1024 * 1024)
+        );
+    }
+    let own_tables = ranges_sound
+        && framebuffer_mapped
+        && !executable.is_empty()
         && match unsafe {
             context.mapper.rebuild_identity_map(
                 &mut context.frames,

@@ -92,6 +92,9 @@ pub enum PagingError {
     TableFrameNotWritable,
     /// The identity limit must be a whole number of GiB, at most 512.
     BadIdentityLimit,
+    /// A range that must stay executable falls outside the new map, which
+    /// would leave the kernel without the code it is about to run.
+    RequiredRangeOutsideIdentityMap,
 }
 
 /// What `rebuild_identity_map` built.
@@ -271,6 +274,16 @@ impl<A: TableAccess> PageTables<A> {
     ) -> Result<IdentityMapStats, PagingError> {
         if limit == 0 || !limit.is_multiple_of(GIB) || limit > 512 * GIB {
             return Err(PagingError::BadIdentityLimit);
+        }
+        // Marking a range executable it cannot reach would build a map
+        // without the code the caller says it still runs.
+        if executable.iter().any(|range| {
+            range.len == 0
+                || range.start.as_u64() >= limit
+                || range.start.checked_add(range.len).is_none()
+                || range.end().as_u64() > limit
+        }) {
+            return Err(PagingError::RequiredRangeOutsideIdentityMap);
         }
         let to_paging = |err| match err {
             MapError::OutOfFrames => PagingError::OutOfFrames,
@@ -1027,6 +1040,18 @@ mod tests {
         );
         assert_eq!(tables.access.tables[&tables.root][0], before);
         assert_eq!(tables.translate(0x5_4321).unwrap().phys, 0x5_4321);
+        assert_eq!(tables.access.flushed_all, 0);
+    }
+
+    #[test]
+    fn executable_ranges_must_fit_entirely_inside_the_new_map() {
+        let mut frames = Frames(vec![0x40_0000, 0x40_1000, 0x40_2000, 0x40_3000]);
+        let mut tables = adopted(&mut frames);
+        let outside = PhysRange::new(PhysAddr::new(GIB - PAGE), 2 * PAGE);
+        assert_eq!(
+            tables.rebuild_identity(&mut frames, GIB, &[outside]),
+            Err(PagingError::RequiredRangeOutsideIdentityMap)
+        );
         assert_eq!(tables.access.flushed_all, 0);
     }
 

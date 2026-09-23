@@ -22,6 +22,8 @@ fn efi_main() -> Status {
     // The GOP protocol is a Boot Services object: it can only be queried
     // now. What it describes (the framebuffer memory) outlives the exit.
     let framebuffer = framebuffer::query();
+    let framebuffer_range =
+        framebuffer.map(|info| harlan_hal::frame::PhysRange::new(info.base_addr, info.size_bytes));
     // Also a Boot Services question: the kernel marks this range executable
     // and everything else no-execute when it builds its own page tables.
     let kernel_image = image::query();
@@ -58,6 +60,7 @@ fn efi_main() -> Status {
     let boot_info = harlan_kernel::BootInfo {
         memory_map,
         kernel_image,
+        framebuffer: framebuffer_range,
     };
     // SAFETY: `framebuffer` came from the firmware's GOP for the mode that
     // was current when it was queried, and nothing changes the display
