@@ -377,7 +377,55 @@ pub unsafe fn init() {
     // function's own contract.
     unsafe {
         gdt::init();
+        install_gates();
+        load_idt();
+    }
 
+    // Self-test: prove the IDT is actually wired up before relying on it
+    // for anything else. `int3` is a trap (not a fault): RIP saved on the
+    // stack already points past this instruction, so execution resumes
+    // normally right after it with no adjustment needed.
+    unsafe {
+        core::arch::asm!("int3", options(nostack));
+    }
+}
+
+/// Loads the GDT, TSS and IDT again, reading the addresses of those
+/// tables as they are now.
+///
+/// They hold absolute addresses — the GDTR and IDTR point at the tables,
+/// the TSS descriptor carries its base — so a kernel that has moved (see
+/// docs/adr/0012-fase3-higher-half-kernel.md) keeps pointing at where it
+/// used to be until this runs. Touches no hardware: the PIC, the PIT and
+/// the i8042 keep the state they were left in.
+///
+/// # Safety
+///
+/// Interrupts must be disabled, the image's relocations must already be
+/// applied, and the caller must reinstall the double-fault stack
+/// afterwards (`set_double_fault_stack`), because loading the GDT resets
+/// IST1 to the one inside the image. Single core.
+pub unsafe fn reinstall_descriptors() {
+    // SAFETY: same writes as `init`, to the same `'static` tables, with
+    // interrupts disabled by this function's own contract.
+    unsafe {
+        gdt::init();
+        install_gates();
+        load_idt();
+        core::arch::asm!("int3", options(nostack));
+    }
+}
+
+/// Fills every vector this kernel answers. Separate from `init` so the
+/// same set can be installed again after the kernel moves.
+///
+/// # Safety
+///
+/// Interrupts must be disabled; single core.
+unsafe fn install_gates() {
+    // SAFETY: single-threaded, interrupts disabled, writing the `'static`
+    // IDT that only this module owns.
+    unsafe {
         // Install the catch-all first, so every slot has a valid, present
         // gate before anything else can possibly fire — including the
         // already-in-flight race described in the module doc comment.
@@ -427,26 +475,40 @@ pub unsafe fn init() {
             GATE_TYPE_INTERRUPT,
         );
 
-        #[repr(C, packed)]
-        struct DescriptorTablePointer {
-            limit: u16,
-            base: u64,
-        }
-        let idt_ptr = DescriptorTablePointer {
-            limit: (size_of::<Idt>() - 1) as u16,
-            base: core::ptr::addr_of!(IDT) as u64,
-        };
-        // SAFETY: `idt_ptr` points at a `'static` IDT fully populated
-        // above; `lidt` only loads the IDTR, it cannot itself fault.
-        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
+        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
+            timer_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
+        IDT.0[VECTOR_KEYBOARD as usize] = IdtEntry::new(
+            keyboard_stub as *const () as u64,
+            gdt::KERNEL_CODE_SELECTOR,
+            0,
+            GATE_TYPE_INTERRUPT,
+        );
     }
+}
 
-    // Self-test: prove the IDT is actually wired up before relying on it
-    // for anything else. `int3` is a trap (not a fault): RIP saved on the
-    // stack already points past this instruction, so execution resumes
-    // normally right after it with no adjustment needed.
+/// Points the IDTR at the table where it lives now.
+///
+/// # Safety
+///
+/// Every gate must be installed first; interrupts disabled.
+unsafe fn load_idt() {
+    #[repr(C, packed)]
+    struct DescriptorTablePointer {
+        limit: u16,
+        base: u64,
+    }
+    let idt_ptr = DescriptorTablePointer {
+        limit: (size_of::<Idt>() - 1) as u16,
+        base: core::ptr::addr_of!(IDT) as u64,
+    };
+    // SAFETY: `idt_ptr` points at a `'static` IDT fully populated by
+    // `install_gates`; `lidt` only loads the IDTR, it cannot itself fault.
     unsafe {
-        core::arch::asm!("int3", options(nostack));
+        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
     }
 }
 
@@ -462,17 +524,9 @@ pub unsafe fn init() {
 /// unmasked), with interrupts still disabled. Not safe to call more than
 /// once or concurrently — single-core kernel in Fase 2.
 pub unsafe fn init_timer() {
-    // SAFETY: writing one more entry into the same `'static` IDT already
-    // fully populated and loaded by `init()`, before interrupts are ever
-    // enabled — the same single-threaded-init reasoning `init()` itself
-    // documents.
+    // The vector itself was installed by `init()`; what is left is the
+    // hardware.
     unsafe {
-        IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
-            timer_stub as *const () as u64,
-            gdt::KERNEL_CODE_SELECTOR,
-            0,
-            GATE_TYPE_INTERRUPT,
-        );
         // SAFETY: interrupts are still disabled here (nothing between
         // `init()` and this call re-enables them).
         crate::pic::remap();
@@ -500,18 +554,8 @@ pub unsafe fn init_timer() {
 /// interrupts are enabled — the i8042 setup polls the output buffer the
 /// IRQ1 handler would otherwise consume. Once only, single-core.
 pub unsafe fn init_keyboard() -> Result<(), crate::keyboard::InitError> {
-    // SAFETY: as in `init_timer`: one more entry in the same `'static`
-    // IDT, before interrupts are ever enabled. Installed before the
-    // controller is touched, so a handler exists before the hardware can
+    // The vector was installed by `init()`, before the hardware could
     // possibly raise the line.
-    unsafe {
-        IDT.0[VECTOR_KEYBOARD as usize] = IdtEntry::new(
-            keyboard_stub as *const () as u64,
-            gdt::KERNEL_CODE_SELECTOR,
-            0,
-            GATE_TYPE_INTERRUPT,
-        );
-    }
     // SAFETY: interrupts are disabled and IRQ1 is still masked (`remap`
     // masked everything and nothing has unmasked line 1 yet), which is
     // exactly `init_controller`'s contract.
