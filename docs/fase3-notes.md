@@ -7,6 +7,78 @@ Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
 
+## Incremento 22 — El scheduler: dos procesos turnándose
+
+`docs/adr/0018-fase3-context-switch.md`. Ya hay dos procesos con espacio
+propio, y ahora existen a la vez y se pasan la CPU.
+
+### Qué hace
+
+- **El estado de un proceso vive en su propia pila de kernel**, que es
+  donde ya lo dejaban el trampolín de la IDT y el stub de `syscall`. Cada
+  proceso tiene una, con guard pages.
+- **`switch`**: diez instrucciones que apilan los registros que la ABI
+  obliga a conservar, guardan `rsp` en el que sale, cargan el del que
+  entra, escriben su CR3 y vuelven. Quien vuelve es el otro proceso.
+- **Un proceso nuevo tiene la pila preparada** para que ese primer retorno
+  caiga en un trampolín que entra en ring 3: no hay dos caminos, arrancar
+  y reanudar, solo uno.
+- **Round robin**, con dos formas de ceder: el temporizador y la syscall
+  `yield`. La segunda hace la prueba determinista.
+- **`TSS.rsp0` y la pila que usa `syscall` se actualizan en cada cambio**,
+  porque son del proceso que entra.
+- **Un proceso que sale devuelve su memoria de usuario y su pila de
+  kernel**: 12 marcos de los dos, medido. Sus tablas, no —queda dicho.
+
+### Lo que la máquina enseñó, y es lo mejor del incremento
+
+**`GS` no sobrevive a un cambio de contexto.** El stub de `syscall` usaba
+`swapgs` y `KERNEL_GS_BASE` para encontrar la pila del kernel, como hace un
+kernel multinúcleo. En cuanto los procesos pudieron turnarse, eso se rompió:
+un proceso entra al kernel por syscall —que hace `swapgs`— y **sale por el
+`iretq` del temporizador, que no lo deshace**. El siguiente `swapgs` deja
+`GS` con el valor del usuario, y el stub escribe a través de él:
+`#PF accessing 0x8, error_code=0x2`.
+
+Con un solo núcleo, `GS` no aportaba nada: la dirección se lee de un
+estático, RIP-relativo, y el puntero de pila del usuario se guarda **en la
+pila del propio proceso**, no en un global —porque un global lo sobrescribe
+quien corra mientras ese proceso está aparcado a mitad de syscall—.
+Recuperar `swapgs` significa enseñarle al camino de interrupción a hacerlo
+también, y eso va con el resto del trabajo multinúcleo.
+
+Y una segunda, pequeña: la primera corrida imprimió **una línea de registro
+partida en dos**, porque la preempción cayó en medio. El sumidero escribe
+byte a byte por un puerto, así que ahora una línea sale entera con las
+interrupciones desactivadas.
+
+### Verificación ejecutada
+
+- Host: 220 pruebas en verde.
+- QEMU, la alternancia completa: proceso 1 habla y cede → entra el 2 y
+  habla → vuelve el 1, habla otra vez y sale con 7 → sigue el 2 y sale →
+  `every process has exited; the kernel has the CPU back` → `12 frame(s)
+  back from the processes that exited` → shell.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` apaga,
+  `reboot` rearranca, `fmt-lint` limpio.
+- Mutación: 7. Dos detectadas a la primera; **cinco sobrevivieron** porque
+  el orden del turno, la guarda del tick y el marco que prepara la pila no
+  tenían prueba en host. Escritas —incluida una que lee el marco slot a
+  slot—, las 7 detectadas. Una de esas pruebas era además tautológica: ataba
+  el tamaño del marco a su propia constante; ahora lo ata a la posición del
+  último registro.
+
+### Riesgos y límites
+
+- **Una syscall ya no puede dar por hecho que vuelve al mismo proceso.** Si
+  cede, vuelve más tarde y en otra pila.
+- Las tablas de un proceso muerto no se recuperan: cinco marcos por
+  proceso. El mapper todavía no sabe qué tablas son de quién.
+- Sin prioridades y sin dormir: un proceso que no hace nada sigue
+  gastando su turno.
+- `swapgs` volverá con SMP, y entonces el camino de interrupción tendrá que
+  cambiar también.
+
 ## Incremento 21 — El proceso como objeto
 
 `docs/adr/0017-fase3-process-address-space.md`. Hasta ahora el programa

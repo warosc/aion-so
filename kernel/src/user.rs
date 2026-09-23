@@ -27,6 +27,10 @@ pub const STACK_TOP: VirtAddr = VirtAddr::new(0x0050_1000);
 pub enum Call {
     Log = 0,
     Exit = 1,
+    /// Gives the CPU to whoever is next, and comes back later. The
+    /// timer does this too; this is the cooperative way, and it is what
+    /// makes the test deterministic (ADR 0018).
+    Yield = 2,
 }
 
 impl Call {
@@ -34,6 +38,7 @@ impl Call {
         match number {
             0 => Some(Call::Log),
             1 => Some(Call::Exit),
+            2 => Some(Call::Yield),
             _ => None,
         }
     }
@@ -47,53 +52,81 @@ pub const ERR_BAD_ARGUMENT: i64 = -2;
 /// The program, assembled by hand:
 ///
 /// ```text
-///  0: b8 00 00 00 00     mov eax, 0          ; log
-///  5: 48 8d 3d 15 00 00 00  lea rdi, [rip+21] ; the message
-/// 12: be 1a 00 00 00     mov esi, 26         ; its length
-/// 17: 0f 05              syscall
-/// 19: b8 01 00 00 00     mov eax, 1          ; exit
-/// 24: bf 07 00 00 00     mov edi, 7          ; with 7
-/// 29: 0f 05              syscall
-/// 31: 0f 0b              ud2                 ; never reached
-/// 33: "HARLAN: hello from ring 3\n"
+///  0: b8 00 00 00 00        mov eax, 0           ; log
+///  5: 48 8d 3d 2f 00 00 00  lea rdi, [rip+47]    ; the message
+/// 12: be 1a 00 00 00        mov esi, 26          ; its length
+/// 17: 0f 05                 syscall
+/// 19: b8 02 00 00 00        mov eax, 2           ; yield
+/// 24: 0f 05                 syscall
+/// 26: b8 00 00 00 00        mov eax, 0           ; log, again
+/// 31: 48 8d 3d 15 00 00 00  lea rdi, [rip+21]
+/// 38: be 1a 00 00 00        mov esi, 26
+/// 43: 0f 05                 syscall
+/// 45: b8 01 00 00 00        mov eax, 1           ; exit
+/// 50: bf 07 00 00 00        mov edi, 7           ; with 7
+/// 55: 0f 05                 syscall
+/// 57: 0f 0b                 ud2                  ; never reached
+/// 59: "HARLAN: process _ speaking\n"
 /// ```
-pub static PROGRAM: [u8; 59] = {
-    let mut program = [0u8; 59];
-    program[0] = 0xB8; // mov eax, imm32
+///
+/// The underscore is the badge: `program_for` writes a digit there, so
+/// that two processes running the same code can be told apart in the log.
+pub const PROGRAM_LEN: usize = MESSAGE_AT as usize + MESSAGE.len();
+
+/// Where in the message the badge goes.
+const BADGE_AT: usize = MESSAGE_AT as usize + 16;
+
+const MESSAGE: &str = "HARLAN: process _ speaking\n";
+const MESSAGE_LEN: u8 = MESSAGE.len() as u8;
+const MESSAGE_AT: u8 = 59;
+
+/// The program, with `badge` written into its message.
+pub fn program_for(badge: u8) -> [u8; PROGRAM_LEN] {
+    let mut program = [0u8; PROGRAM_LEN];
+    program[0] = 0xB8; // mov eax, imm32 (log)
     program[5] = 0x48; // lea rdi, [rip+disp32]
     program[6] = 0x8D;
     program[7] = 0x3D;
-    program[8] = MESSAGE_AT - 12; // from the end of this instruction
+    program[8] = MESSAGE_AT - 12;
     program[12] = 0xBE; // mov esi, imm32
     program[13] = MESSAGE_LEN;
     program[17] = 0x0F; // syscall
     program[18] = 0x05;
-    program[19] = 0xB8; // mov eax, imm32
-    program[20] = 1;
-    program[24] = 0xBF; // mov edi, imm32
-    program[25] = 7;
-    program[29] = 0x0F; // syscall
-    program[30] = 0x05;
-    program[31] = 0x0F; // ud2
-    program[32] = 0x0B;
+    program[19] = 0xB8; // mov eax, imm32 (yield)
+    program[20] = Call::Yield as u8;
+    program[24] = 0x0F; // syscall
+    program[25] = 0x05;
+    program[26] = 0xB8; // mov eax, imm32 (log)
+    program[31] = 0x48; // lea rdi, [rip+disp32]
+    program[32] = 0x8D;
+    program[33] = 0x3D;
+    program[34] = MESSAGE_AT - 38;
+    program[38] = 0xBE; // mov esi, imm32
+    program[39] = MESSAGE_LEN;
+    program[43] = 0x0F; // syscall
+    program[44] = 0x05;
+    program[45] = 0xB8; // mov eax, imm32 (exit)
+    program[46] = Call::Exit as u8;
+    program[50] = 0xBF; // mov edi, imm32
+    program[51] = 7;
+    program[55] = 0x0F; // syscall
+    program[56] = 0x05;
+    program[57] = 0x0F; // ud2
+    program[58] = 0x0B;
     let message = MESSAGE.as_bytes();
     let mut index = 0;
     while index < message.len() {
         program[MESSAGE_AT as usize + index] = message[index];
         index += 1;
     }
+    program[BADGE_AT] = badge;
     program
-};
-
-const MESSAGE: &str = "HARLAN: hello from ring 3\n";
-const MESSAGE_LEN: u8 = MESSAGE.len() as u8;
-const MESSAGE_AT: u8 = 33;
+}
 
 /// The process that is running, for the handler to check its pointers
 /// against, and where to continue once it exits. Written before ring 3 is
 /// entered and read only from the syscall handler.
 static mut CURRENT: Option<&'static Process> = None;
-static mut ON_EXIT: Option<(extern "C" fn(*mut u8) -> !, *mut u8)> = None;
 
 /// Handles one syscall. Runs on the kernel's syscall stack with
 /// interrupts disabled (`FMASK`).
@@ -133,15 +166,17 @@ pub fn handle(frame: &mut SyscallFrame) {
             }
         }
         Some(Call::Exit) => {
-            info!("HARLAN: the process exited with {}", frame.rdi);
-            // SAFETY: as above; set before ring 3 was entered.
-            let resume = unsafe { ON_EXIT };
-            let Some((resume, argument)) = resume else {
-                panic!("a program exited with nowhere for the kernel to go back to");
-            };
-            // The kernel goes on here, on the syscall stack, which is one
-            // of its own with guard pages around it.
-            resume(argument)
+            // Never comes back: the scheduler gives the CPU to whoever is
+            // next, or to the kernel if nobody is.
+            // SAFETY: this runs in the syscall handler, with interrupts
+            // off, while this process is the one running.
+            unsafe { crate::scheduler::exit_current(frame.rdi) };
+        }
+        Some(Call::Yield) => {
+            // SAFETY: as above. Comes back when this process's turn
+            // comes round again.
+            unsafe { crate::scheduler::switch_to_next() };
+            frame.rax = 0;
         }
         None => {
             error!("HARLAN: unknown syscall {}", frame.rax);
@@ -158,16 +193,9 @@ pub fn handle(frame: &mut SyscallFrame) {
 /// `syscall::init` must have run with a stack of the kernel's own,
 /// `process` must be one `spawn` built, and `resume` must be safe to call
 /// on that syscall stack, in the kernel's own space.
-pub unsafe fn enter(
-    process: &'static Process,
-    resume: extern "C" fn(*mut u8) -> !,
-    argument: *mut u8,
-) -> ! {
-    // SAFETY: single core, before any user code exists.
-    unsafe {
-        CURRENT = Some(process);
-        ON_EXIT = Some((resume, argument));
-    }
+pub unsafe fn enter(process: &'static Process) -> ! {
+    // SAFETY: single core, and no user code is running right now.
+    unsafe { CURRENT = Some(process) };
     harlan_arch_x86_64::syscall::set_handler(handle);
     info!(
         "HARLAN: entering ring 3 at {:#x} with a stack at {:#x}, in the space at {:#x}",
@@ -190,26 +218,58 @@ pub unsafe fn enter(
 mod tests {
     use super::*;
 
-    /// The hand-assembled bytes have to mean what the comment says: the
-    /// `lea` has to land on the message and the length has to match it.
+    /// The hand-assembled bytes have to mean what the comment says: both
+    /// `lea`s have to land on the message, the lengths have to match it,
+    /// and the badge has to be where the kernel writes it.
     #[test]
     fn the_program_points_at_its_own_message() {
-        let displacement = i32::from_le_bytes([PROGRAM[8], PROGRAM[9], PROGRAM[10], PROGRAM[11]]);
-        // `lea rdi, [rip + disp]`, and rip is the end of that instruction.
-        let target = 12 + displacement;
-        assert_eq!(target as usize, MESSAGE_AT as usize);
-        let length = u32::from_le_bytes([PROGRAM[13], PROGRAM[14], PROGRAM[15], PROGRAM[16]]);
-        assert_eq!(length as usize, MESSAGE.len());
+        let program = program_for(b'7');
+        let target_of = |at: usize, end: usize| {
+            let displacement = i32::from_le_bytes([
+                program[at],
+                program[at + 1],
+                program[at + 2],
+                program[at + 3],
+            ]);
+            // `lea rdi, [rip + disp]`, and rip is past the instruction.
+            (end as i32 + displacement) as usize
+        };
+        assert_eq!(target_of(8, 12), MESSAGE_AT as usize, "the first log");
+        assert_eq!(target_of(34, 38), MESSAGE_AT as usize, "the second");
+        for at in [13, 39] {
+            let length = u32::from_le_bytes([
+                program[at],
+                program[at + 1],
+                program[at + 2],
+                program[at + 3],
+            ]);
+            assert_eq!(length as usize, MESSAGE.len());
+        }
+
+        // The three syscalls, in the order the comment claims, and the
+        // trap after them.
+        assert_eq!(program[1], Call::Log as u8);
+        assert_eq!(program[20], Call::Yield as u8);
+        assert_eq!(program[27], Call::Log as u8);
+        assert_eq!(program[46], Call::Exit as u8);
+        for at in [17, 24, 43, 55] {
+            assert_eq!(
+                (program[at], program[at + 1]),
+                (0x0F, 0x05),
+                "syscall at {at}"
+            );
+        }
+        assert_eq!((program[57], program[58]), (0x0F, 0x0B), "ud2");
+
+        // The badge is inside the message, and nothing else moved.
+        assert_eq!(program[BADGE_AT], b'7');
+        let message = core::str::from_utf8(&program[MESSAGE_AT as usize..]).unwrap();
         assert_eq!(
-            &PROGRAM[MESSAGE_AT as usize..MESSAGE_AT as usize + MESSAGE.len()],
-            MESSAGE.as_bytes()
+            message,
+            "HARLAN: process 7 speaking
+"
         );
-        // Both syscalls are there, and the trap after them.
-        assert_eq!((PROGRAM[17], PROGRAM[18]), (0x0F, 0x05));
-        assert_eq!((PROGRAM[29], PROGRAM[30]), (0x0F, 0x05));
-        assert_eq!((PROGRAM[31], PROGRAM[32]), (0x0F, 0x0B));
-        assert_eq!(PROGRAM[20], Call::Exit as u8);
-        assert_eq!(PROGRAM[1], Call::Log as u8);
+        assert_ne!(program_for(b'1')[BADGE_AT], program_for(b'2')[BADGE_AT]);
     }
 
     fn frame_for(call: Call, ptr: u64, len: u64) -> SyscallFrame {
@@ -241,7 +301,8 @@ mod tests {
     fn only_the_calls_of_this_abi_exist() {
         assert_eq!(Call::from(0), Some(Call::Log));
         assert_eq!(Call::from(1), Some(Call::Exit));
-        assert_eq!(Call::from(2), None);
+        assert_eq!(Call::from(2), Some(Call::Yield));
+        assert_eq!(Call::from(3), None);
         assert_eq!(Call::from(u64::MAX), None);
     }
 }

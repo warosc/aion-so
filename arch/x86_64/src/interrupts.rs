@@ -35,6 +35,17 @@ use harlan_hal::{error, info, warn};
 /// `ticks()`, `hal::TickCounter`'s sole consumer today.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// What the timer calls after counting, if anything. A function pointer,
+/// so that the kernel can set it — and set it again after moving its
+/// image (docs/adr/0018-fase3-context-switch.md).
+static TICK_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Calls `handler` on every tick, from inside the interrupt handler, with
+/// interrupts off.
+pub fn set_tick_handler(handler: unsafe fn()) {
+    TICK_HANDLER.store(handler as usize, Ordering::Release);
+}
+
 /// Current tick count, as observed so far. `Relaxed` is sufficient: this
 /// is a monotonic counter with no other data it needs to synchronize
 /// with, single-writer (the ISR), any-reader.
@@ -265,6 +276,16 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             }
             if count.is_multiple_of(100) {
                 info!("HARLAN: ticks={count}");
+            }
+            let handler = TICK_HANDLER.load(Ordering::Acquire);
+            if handler != 0 {
+                // SAFETY: only `set_tick_handler` writes there, and what
+                // it writes is an `unsafe fn()`. Interrupts are off
+                // inside this handler, which is what the handler is
+                // written for.
+                let handler: unsafe fn() = unsafe { core::mem::transmute(handler) };
+                // SAFETY: as above.
+                unsafe { handler() };
             }
         }
         VECTOR_KEYBOARD => {

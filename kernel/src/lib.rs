@@ -8,6 +8,8 @@ pub mod klog;
 mod memory;
 #[cfg(target_arch = "x86_64")]
 pub mod process;
+#[cfg(target_arch = "x86_64")]
+pub mod scheduler;
 mod shell;
 mod sync;
 #[cfg(target_arch = "x86_64")]
@@ -809,45 +811,80 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // Two processes, each with a space of its own, to show that the
-        // same address is different memory in each (ADR 0017). Only one
-        // runs: there is no scheduler yet.
-        // SAFETY: the kernel owns its tables and reaches frames through
-        // its own window; nothing else uses what these take.
-        let spawned = unsafe {
-            let first = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
-            let second = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
-            first.and_then(|first| second.map(|second| (first, second)))
-        };
-        match spawned {
-            Ok((first, second)) => {
-                let entry = first.entry();
-                match (first.space.translate(entry), second.space.translate(entry)) {
-                    (Some(one), Some(other)) if one != other => info!(
-                        "HARLAN: {entry:#x} is {one} in one process and {other} in the other: different memory, same address"
-                    ),
-                    (one, other) => error!(
-                        "HARLAN: the two processes do not have separate memory at {entry:#x} ({one:?}, {other:?})"
-                    ),
+        // Two processes, each with a space of its own and a kernel stack
+        // of its own, taking turns (ADR 0017 and ADR 0018).
+        let mut next_stack = syscall_stack.top();
+        let mut started = 0;
+        let mut first_entry = None;
+        for which in 0..2 {
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let Ok(stack) = stack else {
+                error!("HARLAN: no kernel stack for process {which}");
+                break;
+            };
+            next_stack = stack.top();
+            // SAFETY: the kernel owns its tables and reaches frames
+            // through its own window; nothing else uses what this takes.
+            let spawned = unsafe {
+                process::spawn(
+                    &mut context.mapper,
+                    &mut context.frames,
+                    &user::program_for(b'1' + which as u8),
+                    stack,
+                )
+            };
+            match spawned {
+                Ok(process) => {
+                    let entry = process.entry();
+                    let here = process.space.translate(entry);
+                    match (first_entry, here) {
+                        (None, _) => first_entry = here,
+                        (Some(before), Some(now)) if before != now => info!(
+                            "HARLAN: {entry:#x} is {before} in one process and {now} in the other: different memory, same address"
+                        ),
+                        (before, now) => error!(
+                            "HARLAN: the processes do not have separate memory at {entry:#x} ({before:?}, {now:?})"
+                        ),
+                    }
+                    let process = alloc::boxed::Box::leak(alloc::boxed::Box::new(process));
+                    // SAFETY: `spawn` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(process) } {
+                        Some(slot) => {
+                            info!("HARLAN: process {which} runs in slot {slot}");
+                            started += 1;
+                        }
+                        None => error!("HARLAN: no room in the scheduler for process {which}"),
+                    }
                 }
-                // The second one has nowhere to run yet; its space stays
-                // built, which is what the comparison above needed.
-                let first: &'static process::Process =
-                    alloc::boxed::Box::leak(alloc::boxed::Box::new(first));
-                let _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(second));
-                // SAFETY: `init` ran above, `spawn` built the space and
-                // mapped its memory, and `into_the_shell` is a function of
-                // this kernel's, safe to run on the syscall stack once the
-                // kernel's own space is back.
-                unsafe {
-                    user::enter(
-                        first,
-                        into_the_shell::<C, P>,
-                        (context as *mut KernelContext<C, P>).cast(),
-                    )
-                }
+                Err(err) => error!("HARLAN: process {which} could not be started ({err:?})"),
             }
-            Err(err) => error!("HARLAN: no process could be started ({err:?})"),
+        }
+
+        if started > 0 {
+            // The timer gives the CPU away too, not just `yield`.
+            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+            // SAFETY: the kernel is in its own space, on its own stack,
+            // and no process is running yet.
+            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+            // With the CPU back, what the dead were using can go.
+            let mut returned = 0;
+            // SAFETY: nothing is running on them.
+            for dead in unsafe { scheduler::dead_processes() } {
+                // SAFETY: the process is gone and nothing is on its
+                // stack: this runs on the kernel's own.
+                returned +=
+                    unsafe { process::destroy(&mut context.mapper, &mut context.frames, dead) };
+            }
+            info!(
+                "HARLAN: {returned} frame(s) back from the processes that exited; {} free",
+                context.frames.free_frames()
+            );
         }
     }
 
