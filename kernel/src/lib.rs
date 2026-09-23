@@ -861,6 +861,11 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             &lying,
         ];
 
+        // What the allocator has before any process exists. Everything
+        // taken from here on belongs to a process, and once they are all
+        // gone the number has to come back
+        // (docs/adr/0021-fase3-reclaiming-a-dead-space.md).
+        let free_before_any_process = context.frames.free_frames();
         let mut next_stack = syscall_stack.top();
         let mut started = 0;
         let mut first_entry = None;
@@ -933,10 +938,20 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                 returned +=
                     unsafe { process::destroy(&mut context.mapper, &mut context.frames, dead) };
             }
-            info!(
-                "HARLAN: {returned} frame(s) back from the processes that exited; {} free",
-                context.frames.free_frames()
-            );
+            let free_now = context.frames.free_frames();
+            match free_now.cmp(&free_before_any_process) {
+                core::cmp::Ordering::Equal => info!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
+                ),
+                core::cmp::Ordering::Less => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, but {} are still held; {free_now} free",
+                    free_before_any_process - free_now
+                ),
+                core::cmp::Ordering::Greater => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, which is {} more than they ever took; {free_now} free",
+                    free_now - free_before_any_process
+                ),
+            }
         }
     }
 

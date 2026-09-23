@@ -473,25 +473,26 @@ pub unsafe fn on_tick() {
     }
 }
 
-/// The processes that have exited, so that the kernel can give their
-/// memory back once it has the CPU.
+/// The processes that have ended, so that the kernel can give back what
+/// they were using once it has the CPU. Handed out mutably because giving
+/// a space's page tables back walks and clears them.
 ///
 /// # Safety
 ///
 /// No process may be running.
-pub unsafe fn dead_processes() -> impl Iterator<Item = &'static Process> {
+pub unsafe fn dead_processes() -> impl Iterator<Item = &'static mut Process> {
     // SAFETY: as this function's contract.
     let scheduler = unsafe { the_scheduler() };
     scheduler
         .slots
-        .iter()
+        .iter_mut()
         .flatten()
         .filter(|slot| slot.state == State::Dead)
         .map(|slot| {
-            let process: *const Process = slot.process;
-            // SAFETY: the process is dead, so nothing runs on it and
-            // nothing else holds it.
-            unsafe { &*process }
+            let process: *mut Process = slot.process;
+            // SAFETY: the process is dead, so nothing runs on it, and each
+            // slot holds a different one, so no two of these alias.
+            unsafe { &mut *process }
         })
 }
 

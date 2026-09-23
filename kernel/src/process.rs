@@ -175,22 +175,24 @@ pub unsafe fn spawn(
     })
 }
 
-/// Gives back what a process that has exited was using: its memory and
-/// its kernel stack.
+/// Gives back everything a process that has ended was using: its memory,
+/// its kernel stack, and the page tables of its own half
+/// (docs/adr/0021-fase3-reclaiming-a-dead-space.md).
 ///
-/// Its page tables are **not** given back: the mapper does not yet know
-/// which tables belong to which space, so five frames per dead process
-/// stay held. Named here rather than forgotten
-/// (docs/adr/0018-fase3-context-switch.md).
+/// The three are told apart by what they were labelled when they were
+/// handed out, so a leaf frame can never be given back as a page table or
+/// the other way round. That check is the whole of the safety argument
+/// for walking a dead space's tables.
 ///
 /// # Safety
 ///
-/// The process must not be running, and nothing may still be using its
-/// memory or its kernel stack — including the stack this is called on.
+/// The process must not be running, its space must not be the one the CPU
+/// is walking, and nothing may still be using its memory or its kernel
+/// stack — including the stack this is called on.
 pub unsafe fn destroy(
     mapper: &mut dyn harlan_hal::paging::PageMapper,
     frames: &mut KernelFrames<'_>,
-    process: &Process,
+    process: &mut Process,
 ) -> u64 {
     let mut returned = 0;
     for (frame, purpose) in [
@@ -204,6 +206,15 @@ pub unsafe fn destroy(
     // SAFETY: the process is not running and nothing points into its
     // kernel stack any more (the caller's contract).
     returned += unsafe { stacks::unmap(mapper, frames, process.kernel_stack) };
+    // SAFETY: the space is not active and nothing uses it again (the
+    // caller's contract). Every frame offered is refused unless it was
+    // labelled a page table, so the process's own memory — already given
+    // back above — cannot go round twice.
+    returned += unsafe {
+        process
+            .space
+            .destroy(&mut |frame| frames.deallocate_as(frame, FramePurpose::PageTable).is_ok())
+    };
     returned
 }
 
