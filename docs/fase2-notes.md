@@ -55,6 +55,61 @@ alta, y heap con `alloc`. Decisiones registradas en los ADR 0002, 0004,
   con teclados USB (Fase 5). El modo soak sustituye a la shell, así que no
   ejercita el teclado.
 
+## Incremento 15 — W^X dentro de la imagen del kernel (endurecimiento)
+
+El último punto abierto de `docs/memory-safety.md`: la imagen del kernel
+entera era escribible y ejecutable. La decisión está en
+`docs/adr/0011-fase2-write-xor-execute-inside-the-image.md`.
+
+### Qué hace
+
+- `hal::pe`: análisis de la tabla de secciones de un PE32+ ya cargado.
+  Código puro —sin `alloc`, sin arquitectura, sin firmware— que comprueba
+  cada desplazamiento contra el tamaño de la imagen antes de leerlo, de modo
+  que una cabecera corrupta es un error y nunca una lectura fuera de rango.
+- `boot` se lo aplica a sí mismo y pasa las secciones ejecutables en
+  `BootInfo::kernel_code`. Si no puede leerlas, la imagen entera queda como
+  antes y lo dice.
+- El mapa de identidad marca no ejecutable todo lo que no sea código, y
+  **de solo lectura** las páginas que solo contienen código.
+- `hal::paging::ExecutableRange` distingue el código que el kernel controla
+  del que no: el del firmware **tiene** que seguir escribible.
+
+### Lo que la máquina enseñó
+
+Marcar de solo lectura también el código de los runtime services parecía lo
+correcto y **falla**: `shutdown` muere con
+`#PF accessing 0xf6e6104, error_code=0x3, rip=0xf6e5388`. OVMF escribe dentro
+de su propio código. Es el mismo patrón que en el Incremento 12, cuando
+marcarlo no ejecutable rompió `reboot`: el firmware no se comporta como
+código ajeno bien educado, y hay que medirlo en vez de suponerlo.
+
+### Verificación ejecutada
+
+- Host: 187 pruebas en verde (177 + 9 del analizador PE + 1 de W^X).
+- Prueba negativa: escribir en el código del propio kernel produce
+  `#PF accessing <kernel_main>, error_code=0x3` (sonda temporal, retirada).
+  Antes la escritura se completaba en silencio.
+- Pruebas de mutación: 7. Seis detectadas a la primera; la séptima —mapear
+  de solo lectura código que otro escribe— **sobrevivió** y destapó que la
+  condición tenía una comprobación redundante. Simplificada, las 7
+  detectadas.
+- QEMU: `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` apaga
+  y `reboot` rearranca (lo que prueba que el código del firmware sigue
+  escribible).
+- En QEMU: 228 KiB de código de 320 KiB de imagen; 314 páginas ejecutables,
+  57 de ellas de solo lectura; ~23 páginas de datos de la imagen pasan a no
+  ejecutables.
+
+### Riesgos y límites
+
+- `.rdata` sigue siendo escribible: separarlo exige leer los permisos de
+  cada sección y no cambia la propiedad W^X.
+- Un kernel que quiera parchear su propio código tendrá que mapear esa
+  página a propósito. Es lo que se buscaba.
+- El código del firmware sigue siendo escribible y ejecutable; eso no lo
+  arregla nadie desde aquí.
+
 ## Revisión cruzada de Codex (incrementos 8-14)
 
 Codex revisó la pila completa y encontró ocho cosas. Ninguna se veía en QEMU;

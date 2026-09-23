@@ -5,7 +5,7 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 
 | # | Medida | Dónde | Estado |
 | --- | --- | --- | --- |
-| 1 | Rust seguro por defecto; `unsafe` pequeño, localizado y con invariantes escritas | todo el árbol; `kernel` casi no tiene `unsafe` fuera de `memory` | ✅ |
+| 1 | Rust seguro por defecto; `unsafe` pequeño, localizado y con invariantes escritas | todo el árbol; `kernel` casi no tiene `unsafe` fuera de `memory`; el análisis del PE (`hal::pe`) es seguro entero | ✅ |
 | 2 | Propiedad explícita de cada frame, con transiciones válidas | `frame_allocator`: libre / retenido / en uso con `FramePurpose` (boot, tablas, heap, pilas, kernel); `deallocate_as` falla si no coincide | ✅ |
 | 3 | Retención conservadora ante mapas dudosos | `frame_allocator` (lo reservado gana los solapes, redondeo hacia fuera, aritmética saturada, página 0); ADR 0004 y 0007 | ✅ |
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
@@ -62,32 +62,39 @@ desde un manejador.
 
 ## Lo que falta, por orden
 
-1. **W^X dentro de la imagen del kernel**: la mitad baja ya es no ejecutable
-   salvo el código (ADR 0008), pero la imagen misma sigue siendo escribible
-   y ejecutable entera. Separar sus secciones exige interpretar el PE.
-2. **Varios núcleos** (punto 11): mientras haya uno solo, `IrqLock` basta;
+1. **Varios núcleos** (punto 11): mientras haya uno solo, `IrqLock` basta;
    ver la sección anterior para lo que habrá que cambiar.
-3. **Validación de rangos** (punto 5): la validación existe en cada frontera
+2. **Validación de rangos** (punto 5): la validación existe en cada frontera
    (`from_start_address`, `PhysWindow::frame_ptr`, `hole_ptr`, `manages`),
    pero no en un único sitio; queda como estaba hasta que haya user space y
    un punto natural donde centralizarla.
+3. **Permisos por sección dentro de la imagen**: desde el ADR 0011 el código
+   del kernel es de solo lectura y el resto de la imagen no es ejecutable,
+   pero `.rdata` sigue siendo escribible. Separarlo exige leer los permisos
+   de cada sección y no cambia la propiedad W^X.
+
+El código de los runtime services del firmware queda fuera de todo esto: es
+ejecutable y escribible porque OVMF escribe dentro de él (ADR 0011). No se
+puede arreglar desde aquí.
 
 ## Cómo se comprueba que esto funciona de verdad
 
 - **Pruebas de mutación**: en cada incremento de memoria se introducen
   bugs deliberados, uno a uno, y se exige que las pruebas los detecten. Han
-  sido 62 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
+  sido 69 hasta ahora (asignador de frames, mapper, heap, candado, marcos a
   cero, guard pages, mapa de identidad, recuperación de memoria, permisos de
-  ejecución, propósito por marco, tipos de dirección y los arreglos de la
-  revisión de Codex), todas detectadas. Dos de ellas destaparon huecos
-  reales de pruebas —uno en `reclaim_boot_services`, otro en el soak—, que se
-  cerraron antes de cerrar su incremento. Desde el Incremento 14 hay además
+  ejecución, propósito por marco, tipos de dirección, los arreglos de la
+  revisión de Codex y W^X dentro de la imagen), todas detectadas. Dos de ellas destaparon huecos
+  reales de pruebas —uno en `reclaim_boot_services`, otro en el soak— y una
+  tercera destapó una condición redundante; se arreglaron antes de cerrar su
+  incremento. Desde el Incremento 14 hay además
   una comprobación que no necesita pruebas: confundir una dirección física
   con una virtual ya no compila. Quedan registradas en
   `docs/fase2-notes.md`.
 - **Pruebas negativas de extremo a extremo**: ejecutar desde un marco de
   datos (`#PF ... error_code=0x11`), una desreferencia de puntero nulo
-  (`#PF accessing 0x0`), un desbordamiento de pila (que la guard page
+  (`#PF accessing 0x0`), escribir en el código del propio kernel
+  (`#PF ... error_code=0x3`), un desbordamiento de pila (que la guard page
   convierte en un double fault legible), un triple fault, una CPU sin NX,
   un mapa sin controlador de teclado.
 - **Soak**: 30 minutos con 68,6 millones de operaciones de heap
