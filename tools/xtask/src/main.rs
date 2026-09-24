@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -404,15 +404,20 @@ const DISK_BYTES: u64 = 8 * 1024 * 1024;
 /// What the first sector holds, so that a driver reading it can say
 /// whether it read the right thing rather than "something".
 const DISK_SIGNATURE: &[u8] = b"HARLAN-DISK-0\n";
+/// And a second marker, further in. Sector 0 alone cannot tell a driver
+/// that asks for sector 0 from one whose sector number never reaches the
+/// device: both give the same bytes. This one can.
+const DISK_FAR_SECTOR: u64 = 8;
+const DISK_FAR_SIGNATURE: &[u8] = b"HARLAN-SECTOR-8\n";
 
 /// The disk QEMU attaches: raw, and mostly zeroes until Fase 4 puts a
-/// filesystem on it. The signature in sector 0 is what makes a read
-/// verifiable — a driver that reads it can say whether it read the *right*
-/// thing rather than "something".
+/// filesystem on it. The two markers are what make a read verifiable — a
+/// driver that reads them can say whether it read the *right* thing rather
+/// than "something", and whether it read the right *place*.
 ///
 /// The file is created and sized only when it is missing or the wrong
 /// size, so whatever a later increment writes to the rest of it survives.
-/// The first sector is written every time, because a run that corrupted it
+/// The markers are written every time, because a run that corrupted one
 /// would otherwise leave every run after it quietly checking against
 /// rubbish.
 fn prepare_disk(root: &Path) -> Result<PathBuf> {
@@ -432,11 +437,19 @@ fn prepare_disk(root: &Path) -> Result<PathBuf> {
     // at this image recognises the shape even though nothing boots from it.
     sector[510] = 0x55;
     sector[511] = 0xAA;
-    fs::OpenOptions::new()
+    let mut far = [0u8; 512];
+    far[..DISK_FAR_SIGNATURE.len()].copy_from_slice(DISK_FAR_SIGNATURE);
+    let mut disk = fs::OpenOptions::new()
         .write(true)
         .open(&path)
-        .context("failed to open the disk image to write its first sector")?
-        .write_all(&sector)
+        .context("failed to open the disk image to write its markers")?;
+    disk.seek(SeekFrom::Start(DISK_FAR_SECTOR * 512))
+        .context("failed to seek to the far sector")?;
+    disk.write_all(&far)
+        .context("failed to write the far marker")?;
+    disk.rewind()
+        .context("failed to seek back to the first sector")?;
+    disk.write_all(&sector)
         .context("failed to write the disk signature")?;
     Ok(path)
 }
