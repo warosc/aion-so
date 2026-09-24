@@ -6,7 +6,7 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 | # | Medida | Dónde | Estado |
 | --- | --- | --- | --- |
 | 1 | Rust seguro por defecto; `unsafe` pequeño, localizado y con invariantes escritas | todo el árbol; `kernel` casi no tiene `unsafe` fuera de `memory`; el análisis del PE (`hal::pe`) es seguro entero | ✅ |
-| 2 | Propiedad explícita de cada frame, con transiciones válidas | `frame_allocator`: libre / retenido / en uso con `FramePurpose` (boot, tablas, heap, pilas, kernel); `deallocate_as` falla si no coincide | ✅ |
+| 2 | Propiedad explícita de cada frame, con transiciones válidas | `frame_allocator`: libre / retenido / en uso con `FramePurpose` (boot, tablas, heap, pilas, kernel, **memoria de dispositivo**); `deallocate_as` falla si no coincide. El propósito `Dma` es el que impide que un marco que el hardware puede escribir acabe siendo una tabla o una pila (ADR 0024) | ✅ |
 | 3 | Retención conservadora ante mapas dudosos | `frame_allocator` (lo reservado gana los solapes, redondeo hacia fuera, aritmética saturada, página 0); ADR 0004 y 0007 | ✅ |
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
 | 5 | Validación centralizada de rangos | lo que llega de ring 3 pasa por un solo sitio: `process::owned_by`, detrás de `scheduler::Running::owns` (`log`, `send` y el rango que `recv` **escribe**); dentro del kernel sigue por frontera: `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |

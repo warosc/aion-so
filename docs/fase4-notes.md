@@ -8,6 +8,97 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 28 — Un sector, leído de verdad
+
+`docs/adr/0024-fase4-dma-and-the-queue.md`. El disco estaba negociado y sin
+nada por donde pedirle. Una petición de virtio no se escribe en un
+registro: se deja en memoria que el dispositivo lee **por sí mismo**, y el
+registro solo sirve para avisar de que hay algo nuevo.
+
+Eso invierte quién manda sobre la memoria. Hasta ahora toda la del kernel
+la leía y escribía el kernel. Aquí el kernel le da una dirección física a
+un dispositivo y el dispositivo escribe ahí: sin pasar por las tablas de
+páginas, sin comprobación de límites, y sin nada que lo detenga si la
+dirección está mal.
+
+### Qué hace
+
+- **Los marcos de DMA salen del asignador con un propósito propio**
+  (`FramePurpose::Dma`). Es la propiedad por marco del ADR 0004 aplicada a
+  lo más peligroso que hay: un marco que el hardware puede escribir no
+  debe poder acabar siendo una tabla de páginas o una pila.
+- **Dos vistas de la misma memoria, deliberadamente**: al dispositivo se le
+  dan direcciones **físicas**, porque no camina tablas; el kernel la lee en
+  `ventana + dirección física`.
+- **Cola partida de cuatro descriptores.** El dispositivo ofrece 256 y una
+  petición usa tres —cabecera, datos, estado—; cuatro es la potencia de dos
+  más pequeña que sirve, y todo cabe en un marco. Se **vuelve a leer** el
+  registro del tamaño después de escribirlo, porque un dispositivo que lo
+  ignorara dejaría al kernel con anillos de otra forma que la que el
+  dispositivo cree.
+- **Los índices son ventanas, no contadores**: crecen para siempre y dan la
+  vuelta a los 16 bits, y la entrada es `idx % tamaño`. Tratarlos como
+  contadores funciona durante las primeras 65 536 peticiones.
+- **Tres descriptores porque los permisos son tres**: la cabecera la lee el
+  dispositivo, los datos y el byte de estado los escribe. Un dispositivo
+  que pudiera escribir la cabecera podría cambiar lo que se le pidió.
+- **El byte de estado se precarga a `0xFF`**, un valor que el dispositivo
+  nunca escribe, para que "funcionó" no pueda leerse de memoria que ya
+  estaba a cero.
+- **Se sondea con límite.** Un dispositivo que no contesta es una línea en
+  el registro, no un arranque que se queda ahí.
+- **El orden de las escrituras es parte del protocolo**: el descriptor
+  antes de su índice en el anillo, el índice antes del aviso, con barreras
+  entre los pasos, porque el dispositivo puede estar mirando.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+  sector 0 of the disk reads "HARLAN-DISK-0", which is what is there
+  sector 8 of the disk reads "HARLAN-SECTOR-8", which is what is there
+  ```
+
+  **Dos sectores, no uno.** Leer solo el 0 no distingue un driver que pide
+  el sector 0 de uno cuyo número de sector nunca llega al dispositivo: los
+  dos dan los mismos bytes. `xtask` escribe un segundo marcador en el
+  sector 8 y el kernel comprueba los dos contra lo que debería haber.
+  (Esto lo descubrí porque la primera versión del cambio en `xtask` falló
+  en silencio: el sector 8 leyó ceros, que ya probaba que el número
+  llegaba, pero la comprobación era accidental en vez de positiva.)
+- **Prueba negativa**: pidiendo el sector 100 000 de un disco de 16 384,
+  `sector 100000 could not be read (Failed { status: 1 })` —error de E/S—
+  y el arranque llega al shell. El byte de estado se lee de verdad: el
+  dispositivo lo escribió sobre el `0xFF` precargado.
+- Host: 285 pruebas (275 + 10: el trazado de la cola y lo que no cabe, un
+  descriptor campo por campo, publicar y recoger contra un anillo en
+  memoria ordinaria donde la prueba hace el papel del dispositivo, el
+  timbre y su multiplicador, y la cabecera de una petición).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 23, las 23 detectadas. Dos hicieron falta arreglos de verdad:
+  una comprobación del trazado que otra tapaba —la del anillo usado solo
+  se puede disparar con un marco más pequeño que el que el trazado supone—
+  y otra, la del anillo disponible, que **no se puede disparar nunca** con
+  estos desplazamientos. Esa segunda dejó de ser una rama en tiempo de
+  ejecución y pasó a ser una aserción del compilador: es un hecho sobre
+  tres constantes, así que si una se mueve, el build se para en vez de
+  solapar dos anillos en silencio.
+
+### Riesgos y límites
+
+- **Sin IOMMU.** Lo que se le diga al dispositivo, lo escribe. No hay
+  segunda comprobación ni forma de limitarlo desde aquí. La corrección
+  descansa entera en que las direcciones vienen del asignador y se traducen
+  en un solo sitio. Es la propiedad más frágil del subsistema y no hay
+  `unsafe` que la marque: desde el punto de vista de Rust el kernel solo
+  escribió un número en un registro.
+- **Sin interrupciones**: se sondea. Hace falta MSI-X o INTx, y eso es un
+  incremento propio.
+- **Una petición a la vez**, y cuatro descriptores. Los dos números están
+  en un sitio y los dos habrá que subirlos.
+- Nada escribe en el disco todavía. `TYPE_OUT` existe y no se usa.
+
 ## Incremento 27 — Los registros del disco, y qué virtio hablamos
 
 `docs/adr/0023-fase4-device-registers.md`. El disco está encontrado
