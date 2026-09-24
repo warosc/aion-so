@@ -60,6 +60,19 @@ pub const KERNEL_RUNTIME_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 5 *
 /// (docs/adr/0012-fase3-higher-half-kernel.md).
 pub const KERNEL_IMAGE_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 3 * (1 << 39));
 
+/// Where the registers of a device are mapped: PML4 slot 262. A device
+/// register at physical `p` is reached at `KERNEL_DEVICES_START + p`, the
+/// same one addition as the physical window and the runtime services.
+///
+/// It is a region of its own because of how it has to be mapped, not
+/// because of where it points: **uncacheable**, and never executable. A
+/// register read from a cache is a register that was not read, and one
+/// written late is an order the device has not received. The physical
+/// window next door describes RAM and is cacheable, and mixing the two
+/// policies in one region would be a map that says one thing and means
+/// two (docs/adr/0023-fase4-device-registers.md).
+pub const KERNEL_DEVICES_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 6 * (1 << 39));
+
 const ENTRIES: usize = 512;
 const PAGE: u64 = 4096;
 const LARGE_PAGE: u64 = 2 * 1024 * 1024;

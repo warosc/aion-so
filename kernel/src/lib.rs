@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+pub mod devices;
 pub mod identity;
 pub mod ipc;
 #[cfg(target_arch = "x86_64")]
@@ -827,16 +829,57 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         .iter()
         .find(|f| f.header.vendor == VIRTIO_VENDOR && f.header.class == MASS_STORAGE)
     {
-        Some(disk) => info!(
-            "HARLAN: a virtio disk at pci {:02x}:{:02x}.{} ({:04x}:{:04x}), first BAR {:#x}",
-            disk.at.bus,
-            disk.at.device,
-            disk.at.function,
-            disk.header.vendor,
-            disk.header.device,
-            disk.header.bars[0]
-        ),
+        Some(disk) => {
+            info!(
+                "HARLAN: a virtio disk at pci {:02x}:{:02x}.{} ({:04x}:{:04x})",
+                disk.at.bus,
+                disk.at.device,
+                disk.at.function,
+                disk.header.vendor,
+                disk.header.device
+            );
+            // Its registers, as the firmware left them. A 64-bit BAR takes
+            // two of the six entries, so the walk steps over the half it
+            // has already read rather than reading it as a BAR of its own.
+            let mut index = 0;
+            while index < 6 {
+                match harlan_hal::pci::decode_bar(&disk.header.bars, index) {
+                    Some(bar) => {
+                        info!("HARLAN:   bar {index}: {bar}");
+                        index += bar.entries();
+                    }
+                    None => index += 1,
+                }
+            }
+        }
         None => warn!("HARLAN: no virtio storage on the bus"),
+    }
+
+    // And the disk, if the kernel owns its tables: its registers have to
+    // be mapped, which is only the kernel's to do once the firmware's
+    // identity map is gone (docs/adr/0023-fase4-device-registers.md).
+    if own_tables {
+        // SAFETY: the kernel owns its tables and reaches frames through
+        // its own window, the scan above is of this machine's bus, and
+        // nothing else drives this device.
+        match unsafe {
+            devices::virtio_blk::start(&mut context.mapper, &mut context.frames, &devices)
+        } {
+            Ok(disk) => info!(
+                "HARLAN: the disk at pci {:02x}:{:02x}.{} is negotiated: registers from bar {} at {:#x}, offers {:#x}, agreed {:#x}, {} queue(s), queue 0 holds {} descriptor(s) and is notified at {}",
+                disk.at.bus,
+                disk.at.device,
+                disk.at.function,
+                disk.bar,
+                disk.registers,
+                disk.offered,
+                disk.accepted,
+                disk.queues,
+                disk.queue_size,
+                disk.notify_offset
+            ),
+            Err(err) => error!("HARLAN: the disk could not be started ({err:?})"),
+        }
     }
 
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
