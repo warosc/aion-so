@@ -793,6 +793,52 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         );
     }
 
+    // What is on the bus. Reading only: no BAR is written, no device is
+    // configured (docs/adr/0022-fase4-pci-enumeration.md).
+    // SAFETY: one core, and nothing else in this kernel uses the two
+    // configuration ports.
+    let devices = unsafe { harlan_arch_x86_64::pci::scan() };
+    for found in devices.iter() {
+        info!(
+            "HARLAN: pci {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}.{:02x})",
+            found.at.bus,
+            found.at.device,
+            found.at.function,
+            found.header.vendor,
+            found.header.device,
+            found.header.class_name(),
+            found.header.class,
+            found.header.subclass
+        );
+    }
+    if devices.lost() > 0 {
+        warn!(
+            "HARLAN: {} more function(s) on the bus than the kernel keeps ({})",
+            devices.lost(),
+            harlan_arch_x86_64::pci::KEPT_AT_MOST
+        );
+    }
+    // The one Fase 4 is going to learn to talk to. Named by vendor, not
+    // by class: the machine also has an emulated IDE controller, and
+    // "the first storage device" would be whichever the scan met first.
+    const VIRTIO_VENDOR: u16 = 0x1AF4;
+    const MASS_STORAGE: u8 = 0x01;
+    match devices
+        .iter()
+        .find(|f| f.header.vendor == VIRTIO_VENDOR && f.header.class == MASS_STORAGE)
+    {
+        Some(disk) => info!(
+            "HARLAN: a virtio disk at pci {:02x}:{:02x}.{} ({:04x}:{:04x}), first BAR {:#x}",
+            disk.at.bus,
+            disk.at.device,
+            disk.at.function,
+            disk.header.vendor,
+            disk.header.device,
+            disk.header.bars[0]
+        ),
+        None => warn!("HARLAN: no virtio storage on the bus"),
+    }
+
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
     // heap stress rounds until QEMU is stopped.
     if cfg!(feature = "soak") {
