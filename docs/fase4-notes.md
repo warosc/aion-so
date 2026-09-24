@@ -8,6 +8,95 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 27 — Los registros del disco, y qué virtio hablamos
+
+`docs/adr/0023-fase4-device-registers.md`. El disco está encontrado
+(Incremento 26). Para hablar con él faltaban dos cosas: **alcanzar sus
+registros**, que están en direcciones físicas que no son RAM, y **decidir
+qué versión del protocolo hablar**, porque el dispositivo que QEMU
+presentaba habla dos.
+
+### Qué hace
+
+- **Virtio 1.0 y solo ese.** Legacy guarda sus registros detrás de puertos
+  de E/S y sus direcciones de cola en 32 bits; está obsoleto desde 2014 y
+  habría que tirarlo entero. Es el mismo razonamiento que llevó a
+  `syscall` en vez de `int 0x80`: lo que se va a sustituir no se escribe.
+- **El dispositivo se configura moderno-solo** (`disable-legacy=on`), así
+  que pasa a anunciarse como `1af4:1042` y pierde su BAR de puertos. No es
+  cosmético: mientras el camino legacy exista, un driver con un error puede
+  funcionar por él y la prueba no diría nada.
+- **Las capacidades PCI se recorren** desde el puntero de `0x34` —solo si
+  el registro de estado dice que hay lista— y las de virtio dan un BAR, un
+  desplazamiento y un tamaño. Una lista que se apunta a sí misma se
+  abandona tras 48 entradas en vez de colgar el arranque.
+- **Un BAR se decodifica, no se adivina**: memoria o puertos según el bit
+  0, y de 64 bits cuando el tipo lo dice —y entonces ocupa **dos** de las
+  seis entradas, así que la siguiente no es un BAR sino su mitad alta—.
+- **Los registros tienen su propia región**, la séptima del espacio del
+  kernel (PML4 262), mapeada **no cacheable** y no ejecutable. Un registro
+  leído de una caché es un registro que no se leyó. La ventana física de al
+  lado describe RAM y es cacheable; mezclar las dos políticas en una región
+  sería un mapa que dice una cosa y significa dos.
+- **Solo se mapea lo que una capacidad describe**, redondeado a páginas.
+- **El saludo, en el orden que manda la especificación**: reinicio,
+  `ACKNOWLEDGE`, `DRIVER`, leer lo ofrecido, escribir lo aceptado —con
+  `VERSION_1` obligatoriamente—, `FEATURES_OK`, y **volver a leer el
+  estado**, porque el dispositivo retira ese bit cuando no acepta lo
+  elegido. Un driver que sigue adelante sin comprobarlo acaba hablándole a
+  algo que dejó de escuchar. Si algo falla, el kernel escribe `FAILED` y lo
+  dice, en vez de dejar el dispositivo a medio negociar.
+- **Se para en `FEATURES_OK`**: negociado y sin colas. `DRIVER_OK` es lo
+  que dice que un driver está listo para enviar peticiones, y todavía no
+  hay por dónde enviarlas.
+
+### Verificación ejecutada
+
+- QEMU, la cadena entera de la capacidad al registro:
+
+  ```
+  a virtio disk at pci 00:03.0 (1af4:1042)
+    bar 1: memory at 0x81010000
+    bar 4: memory at 0xc000000000, 64-bit, prefetchable
+  the disk at pci 00:03.0 is negotiated: registers from bar 4 at
+  0xffff83c000000000, offers 0x10130006e54, agreed 0x100000000,
+  1 queue(s), queue 0 holds 256 descriptor(s) and is notified at 0
+  ```
+
+  El dispositivo ya es `1af4:1042` y **no tiene BAR de puertos**, que es la
+  prueba de que legacy está de verdad apagado. El BAR 4 es de 64 bits, así
+  que ese camino del decodificador lo recorre la máquina de verdad. La
+  dirección mapeada es `KERNEL_DEVICES_START + 0xc000000000`. Y lo leído
+  son valores reales: bit 32 puesto en lo ofrecido (`VERSION_1`) y
+  `0x100000000` exactamente en lo aceptado.
+- **Prueba negativa**: quitando `disable-legacy=on`, el dispositivo vuelve
+  a ser `1af4:1001`, aparece `bar 0: ports at 0xc000`, y el driver dice
+  `the disk could not be started (Transitional)` **y el arranque llega al
+  shell**. Un driver que se niega no es un kernel que se cae.
+- Host: 275 pruebas (258 + 17: decodificación de BAR incluida la de 64
+  bits y la de puertos, el recorrido de capacidades con una lista que
+  contiene capacidades ajenas y otra que se apunta a sí misma, el
+  enmascarado de los bits reservados del puntero, y cada registro de la
+  configuración común contra un dispositivo hecho de memoria ordinaria).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 24, las 24 detectadas. Una sobrevivió primero —quitar el
+  enmascarado de los dos bits reservados del puntero de capacidad— porque
+  ninguna prueba usaba un puntero con basura ahí. Añadida la prueba, la
+  regla queda escrita donde se comprueba.
+
+### Riesgos y límites
+
+- **Sin interrupciones del dispositivo**: no hay MSI-X ni manejador de la
+  línea INTx. El siguiente incremento sondea la cola, y eso se dirá allí.
+- El kernel **escribe** en un dispositivo por primera vez. Enumerar era
+  leer; negociar no lo es.
+- No se acepta ninguna bandera más que `VERSION_1`: cada una de las demás
+  cambia cómo es una petición, y todavía no hay peticiones.
+- El mapeo de registros acepta una página ya mapeada como caso normal: dos
+  estructuras de un dispositivo suelen compartir página. Eso significa que
+  no detectaría un solape con otra cosa que ya estuviera ahí, y la región
+  es solo de dispositivos.
+
 ## Incremento 26 — El kernel pregunta qué hay
 
 `docs/adr/0022-fase4-pci-enumeration.md`. Todo lo que el kernel tocaba
