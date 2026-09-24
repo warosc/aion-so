@@ -6,10 +6,12 @@ pub mod interrupts;
 pub mod keyboard;
 pub mod msr;
 pub mod paging;
+pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod stack;
+pub mod switch;
 pub mod syscall;
 pub mod user;
 

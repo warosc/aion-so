@@ -9,8 +9,8 @@ qué falta. Se revisa al cerrar cada incremento que toque memoria.
 | 2 | Propiedad explícita de cada frame, con transiciones válidas | `frame_allocator`: libre / retenido / en uso con `FramePurpose` (boot, tablas, heap, pilas, kernel); `deallocate_as` falla si no coincide | ✅ |
 | 3 | Retención conservadora ante mapas dudosos | `frame_allocator` (lo reservado gana los solapes, redondeo hacia fuera, aritmética saturada, página 0); ADR 0004 y 0007 | ✅ |
 | 4 | Guard pages alrededor de las pilas | `kernel::memory::stacks`, `arch::stack::switch_to`, IST1 del TSS | ✅ |
-| 5 | Validación centralizada de rangos | `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |
-| 6 | Separar físico y virtual con tipos | `hal::addr::PhysAddr`/`VirtAddr`, y sobre ellos `PhysFrame`, `PhysRange`, `Page`, `PageMapper::translate`, `Stack`, `KERNEL_*_START` | ✅ |
+| 5 | Validación centralizada de rangos | lo que llega de ring 3 pasa por un solo sitio: `process::owned_by`, detrás de `scheduler::Running::owns` (`log`, `send` y el rango que `recv` **escribe**); dentro del kernel sigue por frontera: `PhysFrame`/`Page::from_start_address`, `PhysWindow::frame_ptr`, `FreeListHeap::hole_ptr`, `manages()`, direcciones canónicas | ⚠️ parcial |
+| 6 | Separar físico y virtual con tipos | `hal::addr::PhysAddr`/`VirtAddr`, y sobre ellos `PhysFrame`, `PhysRange`, `Page`, `PageMapper::translate`, `Stack`, `KERNEL_*_START` (siete regiones: base, heap, pilas, imagen, ventana física, runtime services y **registros de dispositivo**, esta última no cacheable por ADR 0023) | ✅ |
 | 7 | Frames a cero antes de reutilizarlos | `kernel::memory::zeroed_frames::ZeroedFrames` (todo el kernel los recibe así); el arranque comprueba contra las tablas vivas que la ventana física alcanza cada marco antes de escribir uno | ✅ |
 | 8 | Liberación comprobada | `frame_allocator::deallocate_as` (`NotManaged`, `NotAllocated`, `WrongPurpose`; el kernel no tiene otra forma de devolver un marco), `FreeListHeap::deallocate` (doble liberación, memoria ajena) | ✅ |
 | 9 | Pruebas de propiedades contra un modelo | `frame_allocator` (10 000 operaciones), `FreeListHeap` (20 000), `heap::stress` (100 000 en host) | ✅ |
@@ -64,10 +64,14 @@ desde un manejador.
 
 1. **Varios núcleos** (punto 11): mientras haya uno solo, `IrqLock` basta;
    ver la sección anterior para lo que habrá que cambiar.
-2. **Validación de rangos** (punto 5): la validación existe en cada frontera
-   (`from_start_address`, `PhysWindow::frame_ptr`, `hole_ptr`, `manages`),
-   pero no en un único sitio; queda como estaba hasta que haya user space y
-   un punto natural donde centralizarla.
+2. **Validación de rangos** (punto 5): la mitad que importaba ya está en un
+   único sitio. Todo puntero que llega de ring 3 —el que `log` lee, el que
+   `send` copia y el que `recv` **escribe**— pasa por `process::owned_by`,
+   que es una función pura y probada, y ningún otro camino lo acepta
+   (ADR 0014 punto 9, ADR 0019 punto 9). Dentro del kernel la validación
+   sigue estando en cada frontera (`from_start_address`,
+   `PhysWindow::frame_ptr`, `hole_ptr`, `manages`) y no en un sitio común;
+   ahí sigue pendiente.
 3. **Permisos por sección dentro de la imagen**: desde el ADR 0011 el código
    del kernel es de solo lectura y el resto de la imagen no es ejecutable,
    pero `.rdata` sigue siendo escribible. Separarlo exige leer los permisos

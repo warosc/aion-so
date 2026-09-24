@@ -3,6 +3,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -303,6 +304,9 @@ struct QemuConfig {
     ovmf_code: PathBuf,
     ovmf_vars: PathBuf,
     esp_dir: PathBuf,
+    /// A disk for the kernel to find on the PCI bus and, from Fase 4 on,
+    /// to read (docs/adr/0022-fase4-pci-enumeration.md).
+    disk: PathBuf,
     memory: String,
     headless: bool,
     debug_stub: bool,
@@ -336,6 +340,22 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
         format!("if=pflash,format=raw,file={}", cfg.ovmf_vars.display()),
         "-drive".to_string(),
         format!("format=raw,file=fat:rw:{}", cfg.esp_dir.display()),
+        // The disk, as a virtio device rather than an emulated IDE
+        // controller: it is the one the kernel is going to learn to talk
+        // to, and it is the one the ROADMAP calls "almacenamiento
+        // virtual". Nothing boots from it; the firmware boots from the
+        // ESP above.
+        "-drive".to_string(),
+        format!(
+            "format=raw,file={},if=none,id=harlan-disk",
+            cfg.disk.display()
+        ),
+        "-device".to_string(),
+        // Modern-only. While the legacy interface is there the device is
+        // "transitional" and a driver with a mistake can work by the old
+        // path, which would make the test say nothing
+        // (docs/adr/0023-fase4-device-registers.md).
+        "virtio-blk-pci,drive=harlan-disk,disable-legacy=on,disable-modern=off".to_string(),
         // Must match the fixed port the `uefi` crate's `log-debugcon` feature
         // writes to (0xE9, the "debugcon"/Bochs-style debug port), not the
         // Bochs-BIOS-info-port default of 0x402.
@@ -378,6 +398,49 @@ fn qemu_binary() -> &'static str {
     "qemu-system-x86_64"
 }
 
+/// How big the disk is. Small on purpose: it is written on every build and
+/// read one sector at a time.
+const DISK_BYTES: u64 = 8 * 1024 * 1024;
+/// What the first sector holds, so that a driver reading it can say
+/// whether it read the right thing rather than "something".
+const DISK_SIGNATURE: &[u8] = b"HARLAN-DISK-0\n";
+
+/// The disk QEMU attaches: raw, and mostly zeroes until Fase 4 puts a
+/// filesystem on it. The signature in sector 0 is what makes a read
+/// verifiable — a driver that reads it can say whether it read the *right*
+/// thing rather than "something".
+///
+/// The file is created and sized only when it is missing or the wrong
+/// size, so whatever a later increment writes to the rest of it survives.
+/// The first sector is written every time, because a run that corrupted it
+/// would otherwise leave every run after it quietly checking against
+/// rubbish.
+fn prepare_disk(root: &Path) -> Result<PathBuf> {
+    let path = root.join("target").join("disk.img");
+    let right_size = fs::metadata(&path).is_ok_and(|disk| disk.len() == DISK_BYTES);
+    if !right_size {
+        fs::create_dir_all(path.parent().expect("target has a parent"))
+            .context("failed to create the target directory for the disk")?;
+        fs::File::create(&path)
+            .with_context(|| format!("failed to create the disk at {}", path.display()))?
+            .set_len(DISK_BYTES)
+            .context("failed to size the disk image")?;
+    }
+    let mut sector = [0u8; 512];
+    sector[..DISK_SIGNATURE.len()].copy_from_slice(DISK_SIGNATURE);
+    // The last two bytes of a boot sector, so that anything else looking
+    // at this image recognises the shape even though nothing boots from it.
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .context("failed to open the disk image to write its first sector")?
+        .write_all(&sector)
+        .context("failed to write the disk signature")?;
+    Ok(path)
+}
+
 fn prepare_qemu_config(
     root: &Path,
     headless: bool,
@@ -386,10 +449,12 @@ fn prepare_qemu_config(
 ) -> Result<QemuConfig> {
     let (ovmf_code, ovmf_vars_template) = fetch_ovmf(root)?;
     let ovmf_vars = prepare_vars_copy(root, &ovmf_vars_template)?;
+    let disk = prepare_disk(root)?;
     Ok(QemuConfig {
         ovmf_code,
         ovmf_vars,
         esp_dir: root.join("target").join("esp"),
+        disk,
         memory: memory.to_string(),
         headless,
         debug_stub,
@@ -763,6 +828,7 @@ mod tests {
             ovmf_code: PathBuf::from("target/ovmf/x64/code.fd"),
             ovmf_vars: PathBuf::from("target/ovmf-vars.fd"),
             esp_dir: PathBuf::from("target/esp"),
+            disk: PathBuf::from("target/disk.img"),
             memory: "256M".to_string(),
             headless: false,
             debug_stub: false,
@@ -778,6 +844,34 @@ mod tests {
             args.windows(2).any(|w| w == ["-net", "none"]),
             "expected -net none in {args:?}"
         );
+    }
+
+    /// The disk has to arrive as a virtio device and the drive it names
+    /// has to be the one the device is given, or QEMU starts without it
+    /// and the kernel finds nothing.
+    #[test]
+    fn qemu_args_attach_the_disk_to_a_virtio_device() {
+        let args = build_qemu_args(&sample_config());
+        let drive = args
+            .iter()
+            .find(|a| a.contains("disk.img"))
+            .expect("the disk is attached");
+        assert!(drive.contains("id=harlan-disk"), "{drive}");
+        assert!(
+            drive.contains("if=none"),
+            "not on a bus of its own: {drive}"
+        );
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("virtio-blk-pci"))
+            .expect("the device is there");
+        assert!(device.contains("drive=harlan-disk"), "{device}");
+        assert!(
+            device.contains("disable-legacy=on"),
+            "modern only, so a driver cannot work by the old path: {device}"
+        );
+        // And the ESP is still what the firmware boots from.
+        assert!(args.iter().any(|a| a.contains("fat:rw:")));
     }
 
     #[test]
