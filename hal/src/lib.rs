@@ -13,6 +13,7 @@ pub mod pci;
 pub mod pe;
 mod power;
 mod timer;
+pub mod virtio;
 
 pub use console::{Console, ConsoleKey};
 pub use cpu::CpuControl;

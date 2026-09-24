@@ -291,6 +291,180 @@ pub unsafe fn scan(space: &impl ConfigSpace) -> Devices {
     devices
 }
 
+// ---------------------------------------------------------------------
+// Base address registers (docs/adr/0023-fase4-device-registers.md)
+// ---------------------------------------------------------------------
+
+/// Where a device keeps its registers, as one BAR describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bar {
+    /// Registers in the memory address space, which is what a modern
+    /// device uses. `wide` means the BAR was a 64-bit one and took two
+    /// entries.
+    Memory {
+        address: u64,
+        wide: bool,
+        prefetchable: bool,
+    },
+    /// Registers behind `in`/`out`, which is where a legacy device keeps
+    /// them. Named so that a driver can refuse it rather than read a port
+    /// number as an address.
+    Ports { base: u16 },
+}
+
+impl Bar {
+    /// How many of the six entries this BAR used up. The entry after a
+    /// 64-bit BAR is not a BAR: it is the high half of this one, and
+    /// reading it as one gives an address in the middle of nowhere.
+    pub const fn entries(self) -> usize {
+        match self {
+            Bar::Memory { wide: true, .. } => 2,
+            _ => 1,
+        }
+    }
+
+    /// The memory address, or `None` for a BAR that is not memory.
+    pub const fn memory_address(self) -> Option<u64> {
+        match self {
+            Bar::Memory { address, .. } => Some(address),
+            Bar::Ports { .. } => None,
+        }
+    }
+}
+
+impl core::fmt::Display for Bar {
+    /// Addresses in hexadecimal, because an address in decimal is an
+    /// address nobody can check against a device's documentation.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Bar::Memory {
+                address,
+                wide,
+                prefetchable,
+            } => {
+                write!(f, "memory at {address:#x}")?;
+                if *wide {
+                    write!(f, ", 64-bit")?;
+                }
+                if *prefetchable {
+                    write!(f, ", prefetchable")?;
+                }
+                Ok(())
+            }
+            Bar::Ports { base } => write!(f, "ports at {base:#x}"),
+        }
+    }
+}
+
+/// Decodes the BAR at `index`, or `None` when there is nothing there.
+///
+/// A BAR of zero is one the firmware left unassigned, which for this
+/// kernel means unusable: it does not assign addresses (ADR 0022,
+/// point 4).
+pub const fn decode_bar(bars: &[u32; 6], index: usize) -> Option<Bar> {
+    if index >= 6 {
+        return None;
+    }
+    let raw = bars[index];
+    if raw == 0 {
+        return None;
+    }
+    // Bit 0 says which address space, and the meaning of every bit above
+    // it depends on the answer.
+    if raw & 1 != 0 {
+        // The low two bits are not part of a port number.
+        return Some(Bar::Ports {
+            base: (raw & 0xFFFF_FFFC) as u16,
+        });
+    }
+    // Bits 2:1 are the type: 0 for 32-bit, 2 for 64-bit. Bit 3 is
+    // prefetchable, and the address starts at bit 4.
+    let wide = (raw >> 1) & 0x3 == 0x2;
+    let low = (raw & 0xFFFF_FFF0) as u64;
+    let address = if wide {
+        if index + 1 >= 6 {
+            // A 64-bit BAR whose high half would be past the end of the
+            // header. Nothing this kernel can use.
+            return None;
+        }
+        low | (bars[index + 1] as u64) << 32
+    } else {
+        low
+    };
+    Some(Bar::Memory {
+        address,
+        wide,
+        prefetchable: raw & 0x8 != 0,
+    })
+}
+
+// ---------------------------------------------------------------------
+// The capability list
+// ---------------------------------------------------------------------
+
+/// Bit 4 of the status register: the function has a capability list.
+///
+/// The status register is the **upper** half of the dword at `0x04` — the
+/// lower half is the command register — so the bit sits sixteen places
+/// further up than its number suggests.
+const STATUS_CAPABILITIES: u32 = 1 << (16 + 4);
+/// Where the status register is, in the dword that also holds the command.
+const STATUS_DWORD: u8 = 0x04;
+/// And where the first capability's offset is.
+const CAPABILITY_POINTER: u8 = 0x34;
+/// A capability's offset must be inside the 256 bytes the ports reach, and
+/// dword-aligned; the two low bits are reserved.
+const CAPABILITY_MASK: u8 = 0xFC;
+/// How many capabilities to follow before deciding the list is a loop. A
+/// device whose `next` pointers form a cycle would otherwise hang the boot.
+const CAPABILITY_LIMIT: usize = 48;
+
+/// One entry of a function's capability list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capability {
+    /// What kind it is. `0x09` is vendor-specific, which is where virtio
+    /// keeps everything that matters.
+    pub id: u8,
+    /// Where it starts in configuration space.
+    pub offset: u8,
+}
+
+/// Walks a function's capability list, calling `each` with every entry.
+///
+/// Stops at a `next` of zero, at an offset that is not inside the 256
+/// bytes reachable here, or after `CAPABILITY_LIMIT` entries — a list that
+/// points at itself is a device saying something impossible, and hanging
+/// the boot over it would be worse than ignoring the rest.
+///
+/// # Safety
+///
+/// As `ConfigSpace::read_dword`.
+pub unsafe fn capabilities(
+    space: &impl ConfigSpace,
+    at: Address,
+    mut each: impl FnMut(Capability),
+) {
+    // SAFETY: forwarded from this function's contract.
+    let status = unsafe { space.read_dword(at, STATUS_DWORD) };
+    if status & STATUS_CAPABILITIES == 0 {
+        return;
+    }
+    // SAFETY: as above.
+    let pointer = unsafe { space.read_dword(at, CAPABILITY_POINTER) };
+    let mut offset = (pointer as u8) & CAPABILITY_MASK;
+    let mut seen = 0;
+    while offset != 0 && seen < CAPABILITY_LIMIT {
+        // SAFETY: as above.
+        let header = unsafe { space.read_dword(at, offset) };
+        each(Capability {
+            id: header as u8,
+            offset,
+        });
+        offset = ((header >> 8) as u8) & CAPABILITY_MASK;
+        seen += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,15 +613,34 @@ mod tests {
     /// A machine that does not exist: a table of what answers where, and a
     /// record of every read, so a test can say not only what the walk
     /// found but what it asked.
+    /// All 256 bytes the ports reach, because capabilities live above the
+    /// header.
+    const CONFIG_DWORDS: usize = 64;
+
     #[derive(Default)]
     struct FakeMachine {
-        functions: std::collections::BTreeMap<(u8, u8, u8), [u32; HEADER_DWORDS]>,
+        functions: std::collections::BTreeMap<(u8, u8, u8), [u32; CONFIG_DWORDS]>,
         reads: core::cell::RefCell<Vec<(u8, u8, u8, u8)>>,
     }
 
     impl FakeMachine {
-        fn with(mut self, bus: u8, device: u8, function: u8, config: [u32; HEADER_DWORDS]) -> Self {
-            self.functions.insert((bus, device, function), config);
+        /// A function with only a header, and zeroes above it.
+        fn with(mut self, bus: u8, device: u8, function: u8, header: [u32; HEADER_DWORDS]) -> Self {
+            let mut space = [0u32; CONFIG_DWORDS];
+            space[..HEADER_DWORDS].copy_from_slice(&header);
+            self.functions.insert((bus, device, function), space);
+            self
+        }
+
+        /// A function whose whole configuration space is spelled out.
+        fn with_space(
+            mut self,
+            bus: u8,
+            device: u8,
+            function: u8,
+            space: [u32; CONFIG_DWORDS],
+        ) -> Self {
+            self.functions.insert((bus, device, function), space);
             self
         }
 
@@ -456,6 +649,9 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|r| (r.0, r.1, r.2) == (bus, device, function))
+        }
+        fn asked_about_offset(&self, offset: u8) -> bool {
+            self.reads.borrow().iter().any(|r| r.3 == offset)
         }
     }
 
@@ -563,5 +759,213 @@ mod tests {
             found.find(0x1AF4, 0x1000).is_some(),
             "the first still there"
         );
+    }
+
+    #[test]
+    fn a_memory_bar_is_an_address_and_a_port_bar_is_not() {
+        // A 32-bit memory BAR: bit 0 clear, type 0, address from bit 4.
+        let bars = [0xFEBD_1000, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_bar(&bars, 0),
+            Some(Bar::Memory {
+                address: 0xFEBD_1000,
+                wide: false,
+                prefetchable: false
+            })
+        );
+        assert_eq!(decode_bar(&bars, 0).unwrap().entries(), 1);
+
+        // Prefetchable is bit 3, and is not part of the address.
+        let bars = [0xFEBD_1008, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_bar(&bars, 0),
+            Some(Bar::Memory {
+                address: 0xFEBD_1000,
+                wide: false,
+                prefetchable: true
+            })
+        );
+
+        // An I/O BAR: bit 0 set. The low two bits are not part of the port
+        // number, which is what `0xc001` in a boot log really means.
+        assert_eq!(
+            decode_bar(&[0x0000_C001, 0, 0, 0, 0, 0], 0),
+            Some(Bar::Ports { base: 0xC000 })
+        );
+        assert_eq!(
+            decode_bar(&[0x0000_C001, 0, 0, 0, 0, 0], 0)
+                .unwrap()
+                .memory_address(),
+            None,
+            "a port number is not an address"
+        );
+    }
+
+    /// The case that is not theoretical: virtio's modern BAR in QEMU is a
+    /// 64-bit one, so the entry after it is the high half of this address
+    /// and not a BAR at all.
+    #[test]
+    fn a_sixty_four_bit_bar_takes_two_entries() {
+        // Type 2 in bits 2:1 means 64-bit: 0b100 = 0x4.
+        let bars = [0, 0, 0, 0, 0xFE00_0004, 0x0000_0001];
+        let bar = decode_bar(&bars, 4).expect("a wide BAR");
+        assert_eq!(
+            bar,
+            Bar::Memory {
+                address: 0x1_FE00_0000,
+                wide: true,
+                prefetchable: false
+            }
+        );
+        assert_eq!(bar.entries(), 2, "the next entry is its high half");
+
+        // The same bits as a 32-bit BAR would name a different address
+        // entirely, which is the mistake this guards.
+        let narrow = [0, 0, 0, 0, 0xFE00_0000, 0x0000_0001];
+        assert_eq!(
+            decode_bar(&narrow, 4).unwrap().memory_address(),
+            Some(0xFE00_0000)
+        );
+
+        // A wide BAR in the last entry has nowhere to keep its high half.
+        let truncated = [0, 0, 0, 0, 0, 0xFE00_0004];
+        assert_eq!(decode_bar(&truncated, 5), None);
+    }
+
+    /// The boot log is read by people, and an address in decimal is one
+    /// nobody can check against what a device's documentation says.
+    #[test]
+    fn a_bar_says_where_it_is_in_hexadecimal() {
+        extern crate alloc;
+        let wide = decode_bar(&[0, 0, 0, 0, 0xC000_000C, 0x0000_00C0], 4).unwrap();
+        assert_eq!(
+            alloc::format!("{wide}"),
+            "memory at 0xc0c0000000, 64-bit, prefetchable"
+        );
+        let plain = decode_bar(&[0x8100_0000, 0, 0, 0, 0, 0], 0).unwrap();
+        assert_eq!(alloc::format!("{plain}"), "memory at 0x81000000");
+        let ports = decode_bar(&[0x0000_C001, 0, 0, 0, 0, 0], 0).unwrap();
+        assert_eq!(alloc::format!("{ports}"), "ports at 0xc000");
+    }
+
+    #[test]
+    fn what_is_not_a_bar() {
+        assert_eq!(decode_bar(&[0; 6], 0), None, "unassigned");
+        assert_eq!(decode_bar(&[1; 6], 6), None, "past the end");
+        assert_eq!(decode_bar(&[1; 6], 99), None);
+    }
+
+    /// The capability list, as virtio devices really present it: several
+    /// vendor-specific entries chained through their `next` pointers.
+    #[test]
+    fn the_capability_list_is_walked_to_its_end() {
+        let mut config = [0u32; CONFIG_DWORDS];
+        config[..HEADER_DWORDS].copy_from_slice(&config_of(0x1AF4, 0x1042, 0x0100_0000, 0x00));
+        // The status register says there is a list. It is the high half of
+        // the dword at 0x04, so its bit 4 is this dword's bit 20.
+        config[1] = 1 << 20;
+        config[0x34 / 4] = 0x40;
+        // Three capabilities at 0x40, 0x50 and 0x60, the last one ending
+        // the list with a `next` of zero.
+        config[0x40 / 4] = 0x09 | 0x50 << 8;
+        config[0x50 / 4] = 0x09 | 0x60 << 8;
+        config[0x60 / 4] = 0x11;
+        let machine = FakeMachine::default().with_space(0, 3, 0, config);
+
+        let mut found = Vec::new();
+        // SAFETY: the fake machine's reads touch nothing.
+        unsafe { capabilities(&machine, Address::new(0, 3, 0).unwrap(), |c| found.push(c)) };
+        assert_eq!(
+            found,
+            vec![
+                Capability {
+                    id: 0x09,
+                    offset: 0x40
+                },
+                Capability {
+                    id: 0x09,
+                    offset: 0x50
+                },
+                Capability {
+                    id: 0x11,
+                    offset: 0x60
+                },
+            ]
+        );
+    }
+
+    /// A function that does not claim a capability list is not asked for
+    /// one: the pointer at `0x34` means nothing when the status bit is
+    /// clear, and following it would walk whatever happened to be there.
+    #[test]
+    fn a_function_without_a_list_is_left_alone() {
+        let mut config = [0u32; CONFIG_DWORDS];
+        config[..HEADER_DWORDS].copy_from_slice(&config_of(0x8086, 0x1237, 0x0600_0000, 0x00));
+        // A pointer, and no status bit saying it means anything.
+        config[0x34 / 4] = 0x40;
+        config[0x40 / 4] = 0x09;
+        let machine = FakeMachine::default().with_space(0, 0, 0, config);
+
+        let mut found = Vec::new();
+        // SAFETY: as above.
+        unsafe { capabilities(&machine, Address::new(0, 0, 0).unwrap(), |c| found.push(c)) };
+        assert!(found.is_empty(), "the status bit said there was no list");
+        assert!(
+            !machine.asked_about_offset(0x40),
+            "and the pointer was never followed"
+        );
+    }
+
+    /// The low two bits of a next pointer are reserved, and a device that
+    /// sets them is not naming an offset three bytes further on. Masking
+    /// them is what the specification says; keeping them would report a
+    /// capability at an address that is not where it starts.
+    #[test]
+    fn the_reserved_bits_of_a_next_pointer_are_not_part_of_it() {
+        let mut config = [0u32; CONFIG_DWORDS];
+        config[..HEADER_DWORDS].copy_from_slice(&config_of(0x1AF4, 0x1042, 0x0100_0000, 0x00));
+        config[1] = 1 << 20;
+        // Both pointers carry rubbish in the two bits that are not theirs.
+        config[0x34 / 4] = 0x43;
+        config[0x40 / 4] = 0x09 | 0x52 << 8;
+        config[0x50 / 4] = 0x09;
+        let machine = FakeMachine::default().with_space(0, 3, 0, config);
+
+        let mut found = Vec::new();
+        // SAFETY: the fake machine's reads touch nothing.
+        unsafe { capabilities(&machine, Address::new(0, 3, 0).unwrap(), |c| found.push(c)) };
+        assert_eq!(
+            found,
+            vec![
+                Capability {
+                    id: 0x09,
+                    offset: 0x40
+                },
+                Capability {
+                    id: 0x09,
+                    offset: 0x50
+                },
+            ],
+            "0x43 is the capability at 0x40, and 0x52 the one at 0x50"
+        );
+    }
+
+    /// A list that points at itself is a device saying something
+    /// impossible. Ignoring the rest of it is better than never finishing
+    /// the boot.
+    #[test]
+    fn a_capability_list_that_loops_does_not_hang() {
+        let mut config = [0u32; CONFIG_DWORDS];
+        config[..HEADER_DWORDS].copy_from_slice(&config_of(0x1AF4, 0x1042, 0x0100_0000, 0x00));
+        config[1] = 1 << 20;
+        config[0x34 / 4] = 0x40;
+        config[0x40 / 4] = 0x09 | 0x50 << 8;
+        config[0x50 / 4] = 0x09 | 0x40 << 8;
+        let machine = FakeMachine::default().with_space(0, 3, 0, config);
+
+        let mut found = 0;
+        // SAFETY: as above.
+        unsafe { capabilities(&machine, Address::new(0, 3, 0).unwrap(), |_| found += 1) };
+        assert_eq!(found, CAPABILITY_LIMIT, "it stopped, and said how far");
     }
 }
