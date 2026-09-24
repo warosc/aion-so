@@ -9,6 +9,7 @@ mod interrupts;
 pub mod klog;
 pub mod memory_map;
 pub mod paging;
+pub mod pci;
 pub mod pe;
 mod power;
 mod timer;
