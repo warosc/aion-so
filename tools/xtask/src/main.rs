@@ -351,7 +351,11 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
             cfg.disk.display()
         ),
         "-device".to_string(),
-        "virtio-blk-pci,drive=harlan-disk".to_string(),
+        // Modern-only. While the legacy interface is there the device is
+        // "transitional" and a driver with a mistake can work by the old
+        // path, which would make the test say nothing
+        // (docs/adr/0023-fase4-device-registers.md).
+        "virtio-blk-pci,drive=harlan-disk,disable-legacy=on,disable-modern=off".to_string(),
         // Must match the fixed port the `uefi` crate's `log-debugcon` feature
         // writes to (0xE9, the "debugcon"/Bochs-style debug port), not the
         // Bochs-BIOS-info-port default of 0x402.
@@ -857,9 +861,14 @@ mod tests {
             drive.contains("if=none"),
             "not on a bus of its own: {drive}"
         );
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("virtio-blk-pci"))
+            .expect("the device is there");
+        assert!(device.contains("drive=harlan-disk"), "{device}");
         assert!(
-            args.contains(&"virtio-blk-pci,drive=harlan-disk".to_string()),
-            "the device names the drive: {args:?}"
+            device.contains("disable-legacy=on"),
+            "modern only, so a driver cannot work by the old path: {device}"
         );
         // And the ESP is still what the firmware boots from.
         assert!(args.iter().any(|a| a.contains("fat:rw:")));
