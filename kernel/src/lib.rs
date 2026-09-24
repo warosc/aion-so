@@ -858,27 +858,74 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
     // And the disk, if the kernel owns its tables: its registers have to
     // be mapped, which is only the kernel's to do once the firmware's
     // identity map is gone (docs/adr/0023-fase4-device-registers.md).
-    if own_tables {
+    let disk = if own_tables {
         // SAFETY: the kernel owns its tables and reaches frames through
         // its own window, the scan above is of this machine's bus, and
         // nothing else drives this device.
         match unsafe {
             devices::virtio_blk::start(&mut context.mapper, &mut context.frames, &devices)
         } {
-            Ok(disk) => info!(
-                "HARLAN: the disk at pci {:02x}:{:02x}.{} is negotiated: registers from bar {} at {:#x}, offers {:#x}, agreed {:#x}, {} queue(s), queue 0 holds {} descriptor(s) and is notified at {}",
-                disk.at.bus,
-                disk.at.device,
-                disk.at.function,
-                disk.bar,
-                disk.registers,
-                disk.offered,
-                disk.accepted,
-                disk.queues,
-                disk.queue_size,
-                disk.notify_offset
-            ),
-            Err(err) => error!("HARLAN: the disk could not be started ({err:?})"),
+            Ok(disk) => {
+                info!(
+                    "HARLAN: the disk at pci {:02x}:{:02x}.{} is negotiated: registers from bar {} at {:#x}, offers {:#x}, agreed {:#x}, {} queue(s), queue 0 holds {} descriptor(s) and is notified at {}",
+                    disk.at.bus,
+                    disk.at.device,
+                    disk.at.function,
+                    disk.bar,
+                    disk.registers,
+                    disk.offered,
+                    disk.accepted,
+                    disk.queues,
+                    disk.queue_size,
+                    disk.notify_offset
+                );
+                Some(disk)
+            }
+            Err(err) => {
+                error!("HARLAN: the disk could not be started ({err:?})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // And one sector off it, which is the whole point of the phase
+    // (docs/adr/0024-fase4-dma-and-the-queue.md).
+    if let Some(disk) = &disk {
+        // SAFETY: the disk is negotiated and not started, the kernel owns
+        // its tables, and `frames` reaches frames through its window.
+        match unsafe {
+            devices::virtio_blk::start_queue(disk, &mut context.mapper, &mut context.frames)
+        } {
+            Ok(mut reader) => {
+                // Two sectors, not one. Reading only sector 0 cannot
+                // tell a driver that asks for sector 0 from one whose
+                // sector number never reaches the device: both give the
+                // same bytes. The second marker is what tells them apart.
+                for (which, expected) in [(0u64, "HARLAN-DISK-0"), (8, "HARLAN-SECTOR-8")] {
+                    let mut sector = [0u8; 512];
+                    // SAFETY: the reader owns its queue and its request
+                    // frame, and nothing else has a request in flight.
+                    match unsafe { reader.read_sector(disk, which, &mut sector) } {
+                        Ok(()) => {
+                            let read = core::str::from_utf8(&sector[..expected.len()])
+                                .unwrap_or("not text");
+                            if read == expected {
+                                info!(
+                                    "HARLAN: sector {which} of the disk reads {read:?}, which is what is there"
+                                );
+                            } else {
+                                error!(
+                                    "HARLAN: sector {which} reads {read:?}, and {expected:?} is what is there"
+                                );
+                            }
+                        }
+                        Err(err) => error!("HARLAN: sector {which} could not be read ({err:?})"),
+                    }
+                }
+            }
+            Err(err) => error!("HARLAN: the disk's queue could not be started ({err:?})"),
         }
     }
 
