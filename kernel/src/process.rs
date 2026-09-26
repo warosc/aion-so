@@ -11,11 +11,12 @@
 
 use harlan_arch_x86_64::paging::AddressSpace;
 use harlan_hal::addr::{PhysAddr, VirtAddr};
-use harlan_hal::frame::PhysRange;
+use harlan_hal::frame::{PhysFrame, PhysRange};
 use harlan_hal::info;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags};
 
 use crate::memory::frame_allocator::FramePurpose;
+use crate::memory::stacks::{self, Stack};
 use crate::memory::zeroed_frames::KernelFrames;
 
 /// Where a program's code goes, in every process: they do not share a
@@ -45,6 +46,12 @@ pub struct Process {
     /// against (ADR 0014, point 9).
     pub code: PhysRange,
     pub stack: PhysRange,
+    /// The frames behind that memory, so that they can be given back when
+    /// it exits.
+    pub frames: [PhysFrame; 2],
+    /// Where it enters the kernel: its own stack, with guard pages
+    /// (docs/adr/0018-fase3-context-switch.md).
+    pub kernel_stack: Stack,
 }
 
 /// Whether `[ptr, ptr + len)` falls inside one of `ranges`.
@@ -103,6 +110,7 @@ pub unsafe fn spawn(
     mapper: &mut harlan_arch_x86_64::paging::KernelPageTable,
     frames: &mut KernelFrames<'_>,
     program: &[u8],
+    kernel_stack: Stack,
 ) -> Result<Process, SpawnError> {
     if program.len() > PAGE_SIZE as usize {
         return Err(SpawnError::ProgramTooBig);
@@ -162,7 +170,52 @@ pub unsafe fn spawn(
         space,
         code: PhysRange::new(PhysAddr::new(CODE_BASE.as_u64()), PAGE_SIZE),
         stack: PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
+        frames: [code_frame, stack_frame],
+        kernel_stack,
     })
+}
+
+/// Gives back everything a process that has ended was using: its memory,
+/// its kernel stack, and the page tables of its own half
+/// (docs/adr/0021-fase3-reclaiming-a-dead-space.md).
+///
+/// The three are told apart by what they were labelled when they were
+/// handed out, so a leaf frame can never be given back as a page table or
+/// the other way round. That check is the whole of the safety argument
+/// for walking a dead space's tables.
+///
+/// # Safety
+///
+/// The process must not be running, its space must not be the one the CPU
+/// is walking, and nothing may still be using its memory or its kernel
+/// stack — including the stack this is called on.
+pub unsafe fn destroy(
+    mapper: &mut dyn harlan_hal::paging::PageMapper,
+    frames: &mut KernelFrames<'_>,
+    process: &mut Process,
+) -> u64 {
+    let mut returned = 0;
+    for (frame, purpose) in [
+        (process.frames[0], FramePurpose::Kernel),
+        (process.frames[1], FramePurpose::Stack),
+    ] {
+        if frames.deallocate_as(frame, purpose).is_ok() {
+            returned += 1;
+        }
+    }
+    // SAFETY: the process is not running and nothing points into its
+    // kernel stack any more (the caller's contract).
+    returned += unsafe { stacks::unmap(mapper, frames, process.kernel_stack) };
+    // SAFETY: the space is not active and nothing uses it again (the
+    // caller's contract). Every frame offered is refused unless it was
+    // labelled a page table, so the process's own memory — already given
+    // back above — cannot go round twice.
+    returned += unsafe {
+        process
+            .space
+            .destroy(&mut |frame| frames.deallocate_as(frame, FramePurpose::PageTable).is_ok())
+    };
+    returned
 }
 
 #[cfg(test)]

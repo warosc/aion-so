@@ -2,12 +2,17 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+pub mod devices;
 pub mod identity;
+pub mod ipc;
 #[cfg(target_arch = "x86_64")]
 pub mod klog;
 mod memory;
 #[cfg(target_arch = "x86_64")]
 pub mod process;
+#[cfg(target_arch = "x86_64")]
+pub mod scheduler;
 mod shell;
 mod sync;
 #[cfg(target_arch = "x86_64")]
@@ -790,6 +795,140 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         );
     }
 
+    // What is on the bus. Reading only: no BAR is written, no device is
+    // configured (docs/adr/0022-fase4-pci-enumeration.md).
+    // SAFETY: one core, and nothing else in this kernel uses the two
+    // configuration ports.
+    let devices = unsafe { harlan_arch_x86_64::pci::scan() };
+    for found in devices.iter() {
+        info!(
+            "HARLAN: pci {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}.{:02x})",
+            found.at.bus,
+            found.at.device,
+            found.at.function,
+            found.header.vendor,
+            found.header.device,
+            found.header.class_name(),
+            found.header.class,
+            found.header.subclass
+        );
+    }
+    if devices.lost() > 0 {
+        warn!(
+            "HARLAN: {} more function(s) on the bus than the kernel keeps ({})",
+            devices.lost(),
+            harlan_arch_x86_64::pci::KEPT_AT_MOST
+        );
+    }
+    // The one Fase 4 is going to learn to talk to. Named by vendor, not
+    // by class: the machine also has an emulated IDE controller, and
+    // "the first storage device" would be whichever the scan met first.
+    const VIRTIO_VENDOR: u16 = 0x1AF4;
+    const MASS_STORAGE: u8 = 0x01;
+    match devices
+        .iter()
+        .find(|f| f.header.vendor == VIRTIO_VENDOR && f.header.class == MASS_STORAGE)
+    {
+        Some(disk) => {
+            info!(
+                "HARLAN: a virtio disk at pci {:02x}:{:02x}.{} ({:04x}:{:04x})",
+                disk.at.bus,
+                disk.at.device,
+                disk.at.function,
+                disk.header.vendor,
+                disk.header.device
+            );
+            // Its registers, as the firmware left them. A 64-bit BAR takes
+            // two of the six entries, so the walk steps over the half it
+            // has already read rather than reading it as a BAR of its own.
+            let mut index = 0;
+            while index < 6 {
+                match harlan_hal::pci::decode_bar(&disk.header.bars, index) {
+                    Some(bar) => {
+                        info!("HARLAN:   bar {index}: {bar}");
+                        index += bar.entries();
+                    }
+                    None => index += 1,
+                }
+            }
+        }
+        None => warn!("HARLAN: no virtio storage on the bus"),
+    }
+
+    // And the disk, if the kernel owns its tables: its registers have to
+    // be mapped, which is only the kernel's to do once the firmware's
+    // identity map is gone (docs/adr/0023-fase4-device-registers.md).
+    let disk = if own_tables {
+        // SAFETY: the kernel owns its tables and reaches frames through
+        // its own window, the scan above is of this machine's bus, and
+        // nothing else drives this device.
+        match unsafe {
+            devices::virtio_blk::start(&mut context.mapper, &mut context.frames, &devices)
+        } {
+            Ok(disk) => {
+                info!(
+                    "HARLAN: the disk at pci {:02x}:{:02x}.{} is negotiated: registers from bar {} at {:#x}, offers {:#x}, agreed {:#x}, {} queue(s), queue 0 holds {} descriptor(s) and is notified at {}",
+                    disk.at.bus,
+                    disk.at.device,
+                    disk.at.function,
+                    disk.bar,
+                    disk.registers,
+                    disk.offered,
+                    disk.accepted,
+                    disk.queues,
+                    disk.queue_size,
+                    disk.notify_offset
+                );
+                Some(disk)
+            }
+            Err(err) => {
+                error!("HARLAN: the disk could not be started ({err:?})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // And one sector off it, which is the whole point of the phase
+    // (docs/adr/0024-fase4-dma-and-the-queue.md).
+    if let Some(disk) = &disk {
+        // SAFETY: the disk is negotiated and not started, the kernel owns
+        // its tables, and `frames` reaches frames through its window.
+        match unsafe {
+            devices::virtio_blk::start_queue(disk, &mut context.mapper, &mut context.frames)
+        } {
+            Ok(mut reader) => {
+                // Two sectors, not one. Reading only sector 0 cannot
+                // tell a driver that asks for sector 0 from one whose
+                // sector number never reaches the device: both give the
+                // same bytes. The second marker is what tells them apart.
+                for (which, expected) in [(0u64, "HARLAN-DISK-0"), (8, "HARLAN-SECTOR-8")] {
+                    let mut sector = [0u8; 512];
+                    // SAFETY: the reader owns its queue and its request
+                    // frame, and nothing else has a request in flight.
+                    match unsafe { reader.read_sector(disk, which, &mut sector) } {
+                        Ok(()) => {
+                            let read = core::str::from_utf8(&sector[..expected.len()])
+                                .unwrap_or("not text");
+                            if read == expected {
+                                info!(
+                                    "HARLAN: sector {which} of the disk reads {read:?}, which is what is there"
+                                );
+                            } else {
+                                error!(
+                                    "HARLAN: sector {which} reads {read:?}, and {expected:?} is what is there"
+                                );
+                            }
+                        }
+                        Err(err) => error!("HARLAN: sector {which} could not be read ({err:?})"),
+                    }
+                }
+            }
+            Err(err) => error!("HARLAN: the disk's queue could not be started ({err:?})"),
+        }
+    }
+
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
     // heap stress rounds until QEMU is stopped.
     if cfg!(feature = "soak") {
@@ -809,45 +948,146 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // Two processes, each with a space of its own, to show that the
-        // same address is different memory in each (ADR 0017). Only one
-        // runs: there is no scheduler yet.
-        // SAFETY: the kernel owns its tables and reaches frames through
-        // its own window; nothing else uses what these take.
-        let spawned = unsafe {
-            let first = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
-            let second = process::spawn(&mut context.mapper, &mut context.frames, &user::PROGRAM);
-            first.and_then(|first| second.map(|second| (first, second)))
-        };
-        match spawned {
-            Ok((first, second)) => {
-                let entry = first.entry();
-                match (first.space.translate(entry), second.space.translate(entry)) {
-                    (Some(one), Some(other)) if one != other => info!(
-                        "HARLAN: {entry:#x} is {one} in one process and {other} in the other: different memory, same address"
-                    ),
-                    (one, other) => error!(
-                        "HARLAN: the two processes do not have separate memory at {entry:#x} ({one:?}, {other:?})"
-                    ),
+        // Eight processes, each with a space of its own and a kernel
+        // stack of its own.
+        //
+        // Four do their work: two say who they are and take turns (ADR
+        // 0017 and ADR 0018), and two exchange a message, which is what
+        // Fase 3 set out to show (ADR 0019). The receiver is spawned
+        // **before** the sender on purpose: round robin reaches it first,
+        // it finds an empty mailbox and parks, and the sender is what
+        // wakes it. The other order would never wait.
+        //
+        // The other four try what must not work (ADR 0020). What they
+        // demonstrate is not that each attempt fails, but that the four
+        // above finish their work afterwards, on a machine that is still
+        // running.
+        const RECEIVER_SLOT: u8 = 2;
+        // Kernel memory, named so that the trespassers can aim at it. The
+        // address is the kernel's own code: mapped, with something in it,
+        // and a fault away from ring 3.
+        let kernel_address = user::handle as *const () as u64;
+        match harlan_hal::paging::PageMapper::translate(
+            &context.mapper,
+            harlan_hal::addr::VirtAddr::new(kernel_address),
+        ) {
+            Some(frame) => info!(
+                "HARLAN: {kernel_address:#x} is kernel code, mapped at {frame}; two processes are about to try to reach it"
+            ),
+            None => error!(
+                "HARLAN: {kernel_address:#x} is not mapped, so trying to read it would prove nothing"
+            ),
+        }
+        let talking_one = user::talker_program(b'1');
+        let talking_two = user::talker_program(b'2');
+        let receiving = user::receiver_program();
+        let sending = user::sender_program(RECEIVER_SLOT);
+        let reading_the_kernel = user::reads_kernel_memory(kernel_address);
+        let writing_its_code = user::writes_its_own_code();
+        let running_its_stack = user::runs_its_own_stack();
+        let lying = user::lies_about_a_pointer(kernel_address);
+        let programs: [&[u8]; 8] = [
+            &talking_one,
+            &talking_two,
+            &receiving,
+            &sending,
+            &reading_the_kernel,
+            &writing_its_code,
+            &running_its_stack,
+            &lying,
+        ];
+
+        // What the allocator has before any process exists. Everything
+        // taken from here on belongs to a process, and once they are all
+        // gone the number has to come back
+        // (docs/adr/0021-fase3-reclaiming-a-dead-space.md).
+        let free_before_any_process = context.frames.free_frames();
+        let mut next_stack = syscall_stack.top();
+        let mut started = 0;
+        let mut first_entry = None;
+        for (which, program) in programs.iter().enumerate() {
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let Ok(stack) = stack else {
+                error!("HARLAN: no kernel stack for process {which}");
+                break;
+            };
+            next_stack = stack.top();
+            // SAFETY: the kernel owns its tables and reaches frames
+            // through its own window; nothing else uses what this takes.
+            let spawned =
+                unsafe { process::spawn(&mut context.mapper, &mut context.frames, program, stack) };
+            match spawned {
+                Ok(process) => {
+                    let entry = process.entry();
+                    let here = process.space.translate(entry);
+                    match (first_entry, here) {
+                        (None, _) => first_entry = here,
+                        (Some(before), Some(now)) if before != now => info!(
+                            "HARLAN: {entry:#x} is {before} in one process and {now} in another: different memory, same address"
+                        ),
+                        (before, now) => error!(
+                            "HARLAN: the processes do not have separate memory at {entry:#x} ({before:?}, {now:?})"
+                        ),
+                    }
+                    let process = alloc::boxed::Box::leak(alloc::boxed::Box::new(process));
+                    // SAFETY: `spawn` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(process) } {
+                        // The sender was built naming a slot, so a
+                        // process that lands somewhere else would be
+                        // sending to a stranger.
+                        Some(slot) if slot == which => {
+                            info!("HARLAN: process {which} runs in slot {slot}");
+                            started += 1;
+                        }
+                        Some(slot) => error!(
+                            "HARLAN: process {which} landed in slot {slot}, not the one it was built for"
+                        ),
+                        None => error!("HARLAN: no room in the scheduler for process {which}"),
+                    }
                 }
-                // The second one has nowhere to run yet; its space stays
-                // built, which is what the comparison above needed.
-                let first: &'static process::Process =
-                    alloc::boxed::Box::leak(alloc::boxed::Box::new(first));
-                let _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(second));
-                // SAFETY: `init` ran above, `spawn` built the space and
-                // mapped its memory, and `into_the_shell` is a function of
-                // this kernel's, safe to run on the syscall stack once the
-                // kernel's own space is back.
-                unsafe {
-                    user::enter(
-                        first,
-                        into_the_shell::<C, P>,
-                        (context as *mut KernelContext<C, P>).cast(),
-                    )
-                }
+                Err(err) => error!("HARLAN: process {which} could not be started ({err:?})"),
             }
-            Err(err) => error!("HARLAN: no process could be started ({err:?})"),
+        }
+
+        if started > 0 {
+            // The timer gives the CPU away too, not just `yield`.
+            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+            // And a process that faults ends there, rather than taking the
+            // machine with it (ADR 0020). Until this is set, a fault in
+            // ring 3 stops the CPU like one in the kernel.
+            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
+            // SAFETY: the kernel is in its own space, on its own stack,
+            // and no process is running yet.
+            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+            // With the CPU back, what the dead were using can go.
+            let mut returned = 0;
+            // SAFETY: nothing is running on them.
+            for dead in unsafe { scheduler::dead_processes() } {
+                // SAFETY: the process is gone and nothing is on its
+                // stack: this runs on the kernel's own.
+                returned +=
+                    unsafe { process::destroy(&mut context.mapper, &mut context.frames, dead) };
+            }
+            let free_now = context.frames.free_frames();
+            match free_now.cmp(&free_before_any_process) {
+                core::cmp::Ordering::Equal => info!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
+                ),
+                core::cmp::Ordering::Less => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, but {} are still held; {free_now} free",
+                    free_before_any_process - free_now
+                ),
+                core::cmp::Ordering::Greater => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, which is {} more than they ever took; {free_now} free",
+                    free_now - free_before_any_process
+                ),
+            }
         }
     }
 

@@ -42,3 +42,45 @@ pub unsafe fn outb(port: u16, value: u8) {
         );
     }
 }
+
+/// Reads a doubleword from an x86 I/O port.
+///
+/// # Safety
+///
+/// As `inb`: the caller must know that reading `port` is appropriate here.
+/// The only user in this kernel is PCI configuration space, which is read
+/// four bytes at a time by construction
+/// (docs/adr/0022-fase4-pci-enumeration.md).
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: delegated to the caller's contract above; `in` itself has no
+    // memory or stack effects, and is not marked `pure` for the same
+    // reason as `inb`.
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            in("dx") port,
+            out("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value
+}
+
+/// Writes a doubleword to an x86 I/O port.
+///
+/// # Safety
+///
+/// As `outb`.
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: delegated to the caller's contract above; `out` itself has
+    // no memory or stack effects.
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}

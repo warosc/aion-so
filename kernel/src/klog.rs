@@ -11,6 +11,7 @@
 
 use core::fmt::{self, Write};
 
+use harlan_hal::InterruptControl;
 use harlan_hal::klog::{self, Level};
 
 const DEBUGCON: u16 = 0xE9;
@@ -30,7 +31,16 @@ impl Write for Port {
 }
 
 fn sink(level: Level, file: &str, line: u32, args: fmt::Arguments<'_>) {
+    // A line goes out whole. The port takes one byte at a time, and since
+    // the timer can hand the CPU to another process mid-line (ADR 0018),
+    // two of them would otherwise write into each other — which is
+    // exactly what the first run of the scheduler printed.
+    let cpu = harlan_arch_x86_64::Cpu;
+    let were_enabled = cpu.disable();
     let _ = writeln!(Port, "[{}]: {file}@{line:03}: {args}", level.name());
+    if were_enabled {
+        cpu.enable();
+    }
 }
 
 /// Sends log lines to the debug port, from wherever this code lives now.

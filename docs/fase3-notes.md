@@ -1,11 +1,368 @@
 # Notas de Fase 3 — Procesos y aislamiento
 
 Lo más reciente arriba. Salida de la fase (ROADMAP.md): dos procesos
-aislados se comunican sin compartir memoria no autorizada.
+aislados se comunican sin compartir memoria no autorizada. **Cumplida en
+el Incremento 24**: el mensaje cruza porque el kernel lo copia, la misma
+dirección es memoria distinta en cada proceso, y los cuatro intentos de
+salirse de ahí acaban con el proceso que los hizo y con nadie más. El
+Incremento 25 paga la primera deuda que la fase dejó: un proceso muerto no
+se queda con nada.
 
 Decisiones de alcance tomadas al abrir la fase: primero la mudanza a la
 mitad alta, binario plano incrustado para el primer programa de usuario, y
 `syscall`/`sysret` en vez de `int 0x80`.
+
+## Incremento 25 — Un proceso muerto no se queda con nada
+
+`docs/adr/0021-fase3-reclaiming-a-dead-space.md`. La primera deuda que
+Fase 3 dejó nombrada, pagada: las tablas de páginas de un proceso que
+termina vuelven al asignador.
+
+Era una nota al pie mientras corría un proceso. Con la demostración de
+salida de fase —ocho procesos, todos muertos— pasó a ser medible, y crece
+con cada proceso que el sistema llegue a arrancar.
+
+### Qué hace
+
+- **`AddressSpace::destroy` recorre la mitad baja** de su propio árbol y
+  ofrece cada marco de tabla al asignador, la raíz incluida.
+- **Solo la mitad baja**: las entradas del PML4 en y por encima de
+  `KERNEL_SPACE_BASE` apuntan a las tablas del kernel, compartidas por
+  referencia, y liberar una desmapearía el kernel de todos los demás
+  espacios —incluido el que la CPU está recorriendo—.
+- **Una entrada hoja no es una tabla**: lo que apunta una página de 2 MiB
+  o de 1 GiB es memoria de alguien, y el recorrido no baja de ahí.
+- **Quién decide si un marco era una tabla es el asignador.** `destroy`
+  recibe una función que devuelve si lo aceptó, y el kernel le pasa
+  `deallocate_as(frame, PageTable)`. Un marco etiquetado de otra cosa se
+  rechaza, así que la memoria del proceso no puede volver dos veces aunque
+  el recorrido se equivocara. Es la propiedad por marco del ADR 0004
+  haciendo de red, y es toda la seguridad del recorrido.
+- **Se cuenta lo que volvió**, no lo que se ofreció.
+- **El arranque comprueba que no queda nada**: el kernel anota los marcos
+  libres antes de que exista ningún proceso y, cuando todos han muerto,
+  compara.
+
+### La cifra estaba mal
+
+Los ADR 0017 y 0018 decían cinco marcos por proceso. Medida, es **cuatro**:
+el código en 4 MiB y la pila en 5 MiB caen en la misma entrada del
+directorio —que cubre 2 MiB— así que comparten tabla de páginas. Raíz,
+puntero de directorios, directorio y tabla. Los dos ADR contaron una tabla
+por región mapeada sin mirar la granularidad. El ADR 0021 lo corrige con
+el número medido.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+  `80 frame(s) back from the processes that ended; the allocator has the
+  62771 it started with`. Ochenta en vez de cuarenta y ocho: treinta y dos
+  más, cuatro por proceso. Y la segunda mitad de la línea es la que
+  importa —el asignador tiene exactamente los marcos que tenía antes de
+  que existiera ningún proceso—.
+- Diez marcos por proceso mientras vive —código, pila de usuario, cuatro
+  páginas de pila de kernel y cuatro tablas— y cero cuando muere.
+- Host: 246 pruebas (243 + 3: que devuelve exactamente las tablas que tomó
+  y ninguna del kernel, que una página grande no se confunde con una
+  tabla, y que un marco rechazado no se cuenta).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Prueba negativa del propio detector: pidiéndole las tablas al asignador
+  con la etiqueta equivocada —que las rechaza— el arranque dice
+  `48 frame(s) back from the processes that ended, but 32 are still held`.
+  La línea nueva no solo está: dispara, y con el número exacto.
+- Mutación: 8, las 8 detectadas. Una sobrevivió primero y era un `match`
+  sobre una conversión que no puede fallar —`ADDRESS_MASK` ya alinea la
+  dirección—, es decir código muerto disfrazado de manejo de errores.
+  Sustituido por el constructor infalible y una prueba que comprueba la
+  alineación que lo justifica, no queda rama inalcanzable que mutar.
+
+### Riesgos y límites
+
+- El recorrido supone que **nada de la mitad baja se comparte entre
+  espacios**. Hoy es cierto: cada proceso tiene su código y su pila y nada
+  más. El día que haya memoria compartida o copy-on-write hará falta un
+  recuento de referencias por tabla, que el ADR 0021 aplaza con nombre.
+- `dead_processes` entrega los procesos como `&mut`, porque vaciar un árbol
+  lo modifica.
+
+## Incremento 24 — Aislamiento demostrado: la salida de Fase 3
+
+`docs/adr/0020-fase3-a-fault-belongs-to-the-process.md`. Dos procesos
+aislados ya se comunican (Incremento 23). Faltaba la otra mitad de lo que
+"aislado" significa: que uno pueda portarse mal sin arrastrar a nadie.
+
+Hasta aquí no era así. Toda excepción terminaba en `halt()`, así que un
+programa de usuario que leyera una dirección que no era suya paraba la
+máquina entera. Y de los 32 vectores de excepción, solo seis tenían
+puerta: alcanzar cualquiera de los otros —`ud2` ocupa dos bytes— daba un
+`#GP` cuyo código de error nombraba un selector de segmento sin relación
+con lo ocurrido.
+
+### Qué hace
+
+- **Quién causó la falta lo dice la CPU**: los dos bits bajos del `CS` que
+  apiló la interrupción. `came_from_ring_3` es una función con nombre y con
+  prueba, fijada contra los selectores que la GDT usa de verdad, porque es
+  entera la diferencia entre "lo hizo el proceso" y "lo hizo el kernel".
+- **Si fue ring 3, el proceso termina** y la CPU pasa al siguiente, por el
+  mismo camino que `exit`. El marco que dejó la excepción en su pila de
+  kernel se abandona con ella; nadie la reanuda.
+- **Si fue ring 0, la máquina se para donde está.** Una falta dentro del
+  kernel no tiene a quién culpar.
+- **`arch` sigue sin saber qué es un proceso**: la falta se entrega por
+  puntero a función, como el reloj. Hasta que el kernel lo instala, una
+  falta en ring 3 para la máquina igual que antes.
+- **Los 32 vectores tienen puerta** y el despachador los nombra. Qué
+  vectores llevan código de error está escrito dos veces, en sitios
+  distintos —la lista que genera los stubs y una función que copia la tabla
+  6-1 del SDM— y una prueba las compara: equivocarse ahí desplaza ocho
+  bytes todo el marco.
+- **Cuatro programas nuevos que intentan lo que no debe funcionar**: leer
+  memoria del kernel, escribir en su propia página de código, ejecutar su
+  pila, y entregarle al kernel un puntero a la mitad alta. Cada uno es un
+  proceso, porque lo primero que intenta es lo último que hace.
+
+### Verificación ejecutada: la salida de fase
+
+Ocho procesos en un arranque. Cuatro trabajan, cuatro delinquen, y lo que
+se demuestra no es que cada intento falle, sino que los otros acaban su
+trabajo después, en una máquina que sigue viva.
+
+- `0xffff818000016b00 is kernel code, mapped at 0xddc1b00`: la dirección a
+  la que apuntan dos de los intrusos es memoria del kernel real, mapeada,
+  con algo dentro. Sin eso, no leerla no probaría nada.
+- Leer esa dirección desde ring 3: `#PF error_code=0x5` —presente, en modo
+  usuario— y `the process in slot 4 caused #PF page fault (...); it does
+  not run again`. La página existe y ring 3 no la alcanza.
+- Escribir en su propio código: `#PF error_code=0x7` —presente, escritura,
+  usuario—. W^X vale también para el usuario.
+- Saltar a su propia pila: `#PF accessing 0x500000, error_code=0x15,
+  rip=0x500000` —presente, usuario, búsqueda de instrucción—. La escritura
+  sí funcionó, era su pila; la ejecución no. Es la otra mitad de W^X.
+- Entregarle al kernel un puntero a la mitad alta:
+  `syscall log(0xffff818000016b00, 8) is not this process's memory`, y
+  **el proceso sigue vivo**: sale con código 2, el número de la negativa.
+  Una negativa vista desde el otro lado es una respuesta, no un choque.
+- Y mientras: los dos que hablan registran sus dos líneas y salen con 7, y
+  el mensaje cruza igual que antes (`slot 2 took 55 byte(s) sent by slot
+  3`, `this crossed from one address space to another`, `exited with 3`).
+  `48 frame(s) back`, seis por proceso, los de los muertos incluidos.
+- Host: 243 pruebas en verde (236 + 7: las puertas, los nombres, los
+  códigos de error, el discriminador de ring 3 y los cuatro intrusos).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Interactivo, por el monitor de QEMU: después de los ocho procesos la
+  shell sigue respondiendo (`help`, `version`), `shutdown` apaga la
+  máquina sola, y `reboot` rearranca y vuelve a hacerlo todo —dos
+  marcadores de shell, dos autopruebas del mapeador, seis faltas
+  atribuidas y dos mensajes cruzados, tres y uno por arranque—.
+
+### Pruebas negativas
+
+Tres sondas temporales, revertidas después:
+
+1. **Una falta en el kernel, con todos los procesos ya muertos**:
+   `#PF accessing 0xffff8f0000000000, error_code=0x0` —supervisor— sin
+   línea de atribución y sin llegar al shell. La máquina se para.
+2. **Una falta en el kernel *con un proceso corriendo***, metida dentro de
+   `log`: `PROBE faulting inside the kernel, on behalf of slot 0`, y otra
+   vez `#PF error_code=0x0` sin culpar a nadie y sin shell. Es la sonda que
+   prueba el discriminador: si decidiera por "¿hay un proceso corriendo?"
+   en vez de por el nivel de privilegio, aquí habría matado a la ranura 0 y
+   habría seguido con el kernel roto.
+3. **Un proceso que ejecuta basura**: `#UD invalid opcode (vector=6)`,
+   nombrado y atribuido, solo ese proceso muere, los demás acaban y el
+   arranque llega al shell. Vector 6 no tenía puerta hasta este incremento.
+
+### Mutación
+
+10, las 10 detectadas. Dos de ellas sobre el discriminador —invertirlo, y
+hacerlo decidir por el descriptor en vez de por el RPL— que es lo que
+obligó a sacarlo a una función con nombre: dentro de un `if` no había nada
+que una prueba de host pudiera alcanzar.
+
+### Riesgos y límites
+
+- **Sin señales**: un proceso no puede enterarse de su propia falta ni
+  decidir qué hacer con ella. Hace falta un formato de marco, una pila
+  alternativa y un camino de vuelta a ring 3; nada de eso se diseña bien
+  con programas escritos a mano en hexadecimal.
+- **Sin memoria bajo demanda**: ninguna falta se resuelve mapeando algo y
+  reintentando, porque no hay nada que mapear.
+- Una falta se registra dos veces: la línea de `arch`, que dice lo que vio
+  la CPU, y la del kernel, que dice de quién era.
+- Las tablas de páginas de un proceso muerto siguen sin liberarse: cinco
+  marcos por proceso, y ahora son ocho procesos. Es lo primero que hay que
+  arreglar de la deuda de Fase 3. **Pagado en el Incremento 25**, y eran
+  cuatro por proceso, no cinco: treinta y dos marcos por arranque.
+- El `#MC` (machine check) se trata como todo lo demás. Si llega desde ring
+  3, mata al proceso, y una comprobación de máquina no es culpa del
+  proceso. Queda dicho; hace falta hardware real para que importe.
+
+## Incremento 23 — IPC mínimo: un mensaje cruza de un espacio a otro
+
+`docs/adr/0019-fase3-ipc-v0.md`. Hay cuatro procesos a la vez; dos se
+turnan diciendo quiénes son, y los otros dos se pasan un mensaje.
+
+### Qué hace
+
+- **El kernel copia, nadie comparte.** Cada proceso tiene un buzón de un
+  mensaje y 64 bytes en memoria del kernel, dentro de su ranura del
+  planificador. Ninguna página de un proceso aparece nunca en las tablas de
+  otro: los bytes cruzan porque el kernel los copia, y por ningún otro
+  camino.
+- **Cada copia ocurre con el CR3 de su dueño activo**: `send` copia de la
+  memoria del remitente al buzón mientras corre el remitente, y `recv` del
+  buzón a la memoria del receptor mientras corre el receptor. El kernel no
+  necesita leer un espacio que no sea el activo, y es la primera vez que
+  **escribe** en memoria de usuario: el rango se comprueba entero antes del
+  primer byte.
+- **`recv` bloquea y `send` no.** Un receptor sin mensaje pasa a `Blocked`,
+  deja de recibir turnos y vuelve, dentro de la misma syscall, cuando
+  alguien le escribe. Un remitente que encuentra el buzón ocupado recibe
+  `-4` y decide; el programa de la demostración cede la CPU y reintenta.
+- **Nadie espera para siempre.** `recv` mira antes de bloquear si queda
+  alguien que pueda correr, y si no queda devuelve `-6`. Y si el kernel
+  recupera la CPU con alguien todavía bloqueado, lo dice y lo da por
+  muerto, para que su memoria vuelva con la del resto.
+- **El receptor sabe quién le escribió**: `recv` devuelve la longitud en
+  `RAX` y la ranura del remitente en `RDX`.
+- **"Quién corre" tiene una sola respuesta.** El manejador de syscalls
+  guardaba su propia copia del proceso actual, escrita al entrar en ring 3
+  y nunca al cambiar de proceso: desde el segundo cambio comprobaba los
+  punteros de uno contra la memoria de otro. Funcionaba solo porque los dos
+  procesos tenían los mismos rangos. Ahora se la pide al planificador, que
+  es quien lo sabe.
+- **Tres programas escritos a mano**: los dos que hablan (de antes), un
+  remitente con su bucle de reintento y un receptor que pide el mensaje en
+  su **pila** —su página de código es de solo lectura, el kernel no podría
+  escribir ahí— y sale con la ranura de quien le escribió como código de
+  salida.
+
+### Verificación ejecutada
+
+- Host: 236 pruebas en verde (201 + 35 nuevas: el buzón puro, las
+  transiciones de estado, el orden con un proceso bloqueado, los bytes de
+  los dos programas nuevos y lo que el manejador rechaza).
+- QEMU, lo que demuestra que funcionó: el receptor entra en ring 3, se
+  queda sin registrar nada —está bloqueado— y solo después de
+  `55 byte(s) from slot 3 are waiting in the mailbox of slot 2` aparece
+  `slot 2 took 55 byte(s) sent by slot 3` y, desde ring 3,
+  `HARLAN: this crossed from one address space to another`. Ese texto lo
+  escribió un proceso cuyo espacio está en `0x5a2000` y lo leyó otro cuyo
+  espacio está en `0x598000`.
+- `the process in slot 2 exited with 3`: el receptor sale con la ranura del
+  remitente, que es la única forma de ver desde fuera del kernel que `RDX`
+  llevó el remitente de vuelta a ring 3 a través de `sysret`.
+- `0x400000 is 0x585000 in one process and 0x5a3000 in another`: la misma
+  dirección sigue siendo memoria distinta en cada uno.
+- `24 frame(s) back from the processes that exited; 62758 free`: seis
+  marcos por proceso —código, pila de usuario y cuatro páginas de pila de
+  kernel— vuelven al asignador.
+- Prueba negativa 1, un receptor solo: `slot 0 is waiting for a message
+  nobody could send`, la syscall devuelve `-6`, el programa sigue y sale.
+  La máquina no se cuelga.
+- Prueba negativa 2, un receptor y alguien más que no le escribirá: el
+  receptor se bloquea, el otro proceso acaba, y el kernel recupera la CPU
+  con alguien todavía esperando: `the process in slot 0 is still waiting
+  for a message that will not come`, y sus marcos vuelven con los del otro
+  (`12 frame(s) back`). Es el único camino que ejercita ese rescate.
+- Prueba negativa 3, dos remitentes y un buzón: `the mailbox of slot 2
+  still holds a message, so slot 1 was told to wait`, el remitente cede el
+  turno, reintenta cuando le toca y para entonces el receptor ya no está:
+  `syscall send() names slot 2, where there is no process`. Los tres
+  caminos de `send` —entregado, ocupado, nadie— en un arranque.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 12, las 12 detectadas a la primera. Dos de ellas obligaron a
+  mover lógica a donde una prueba de host la alcanza: las transiciones
+  `waiting()` y `woken()` vivían dentro de métodos que necesitan una ranura
+  con un proceso dentro, que en host no se puede construir.
+
+### Riesgos y límites
+
+- **Sin permisos**: cualquier proceso puede escribir en el buzón de
+  cualquiera, nombrándolo por su número de ranura. Un proceso puede llenar
+  el buzón de otro y dejarlo ahí. Es la denegación de servicio entre
+  iguales que el ADR 0019 deja dicha y que resolverán las capacidades.
+- **Un mensaje por buzón y 64 bytes**: suficiente para la salida de fase, y
+  lo primero que se queda corto con trabajo real.
+- **El remitente lleva la ranura del destino escrita por el kernel que lo
+  arranca**: v0 no tiene forma de que un programa pregunte quién hay.
+- Las tablas de páginas de un proceso muerto siguen sin liberarse (cinco
+  marcos por proceso), como en el Incremento 22. **Pagado en el
+  Incremento 25.**
+
+## Incremento 22 — El scheduler: dos procesos turnándose
+
+`docs/adr/0018-fase3-context-switch.md`. Ya hay dos procesos con espacio
+propio, y ahora existen a la vez y se pasan la CPU.
+
+### Qué hace
+
+- **El estado de un proceso vive en su propia pila de kernel**, que es
+  donde ya lo dejaban el trampolín de la IDT y el stub de `syscall`. Cada
+  proceso tiene una, con guard pages.
+- **`switch`**: diez instrucciones que apilan los registros que la ABI
+  obliga a conservar, guardan `rsp` en el que sale, cargan el del que
+  entra, escriben su CR3 y vuelven. Quien vuelve es el otro proceso.
+- **Un proceso nuevo tiene la pila preparada** para que ese primer retorno
+  caiga en un trampolín que entra en ring 3: no hay dos caminos, arrancar
+  y reanudar, solo uno.
+- **Round robin**, con dos formas de ceder: el temporizador y la syscall
+  `yield`. La segunda hace la prueba determinista.
+- **`TSS.rsp0` y la pila que usa `syscall` se actualizan en cada cambio**,
+  porque son del proceso que entra.
+- **Un proceso que sale devuelve su memoria de usuario y su pila de
+  kernel**: 12 marcos de los dos, medido. Sus tablas, no —queda dicho.
+
+### Lo que la máquina enseñó, y es lo mejor del incremento
+
+**`GS` no sobrevive a un cambio de contexto.** El stub de `syscall` usaba
+`swapgs` y `KERNEL_GS_BASE` para encontrar la pila del kernel, como hace un
+kernel multinúcleo. En cuanto los procesos pudieron turnarse, eso se rompió:
+un proceso entra al kernel por syscall —que hace `swapgs`— y **sale por el
+`iretq` del temporizador, que no lo deshace**. El siguiente `swapgs` deja
+`GS` con el valor del usuario, y el stub escribe a través de él:
+`#PF accessing 0x8, error_code=0x2`.
+
+Con un solo núcleo, `GS` no aportaba nada: la dirección se lee de un
+estático, RIP-relativo, y el puntero de pila del usuario se guarda **en la
+pila del propio proceso**, no en un global —porque un global lo sobrescribe
+quien corra mientras ese proceso está aparcado a mitad de syscall—.
+Recuperar `swapgs` significa enseñarle al camino de interrupción a hacerlo
+también, y eso va con el resto del trabajo multinúcleo.
+
+Y una segunda, pequeña: la primera corrida imprimió **una línea de registro
+partida en dos**, porque la preempción cayó en medio. El sumidero escribe
+byte a byte por un puerto, así que ahora una línea sale entera con las
+interrupciones desactivadas.
+
+### Verificación ejecutada
+
+- Host: 220 pruebas en verde.
+- QEMU, la alternancia completa: proceso 1 habla y cede → entra el 2 y
+  habla → vuelve el 1, habla otra vez y sale con 7 → sigue el 2 y sale →
+  `every process has exited; the kernel has the CPU back` → `12 frame(s)
+  back from the processes that exited` → shell.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `shutdown` apaga,
+  `reboot` rearranca, `fmt-lint` limpio.
+- Mutación: 7. Dos detectadas a la primera; **cinco sobrevivieron** porque
+  el orden del turno, la guarda del tick y el marco que prepara la pila no
+  tenían prueba en host. Escritas —incluida una que lee el marco slot a
+  slot—, las 7 detectadas. Una de esas pruebas era además tautológica: ataba
+  el tamaño del marco a su propia constante; ahora lo ata a la posición del
+  último registro.
+
+### Riesgos y límites
+
+- **Una syscall ya no puede dar por hecho que vuelve al mismo proceso.** Si
+  cede, vuelve más tarde y en otra pila.
+- Las tablas de un proceso muerto no se recuperan: cinco marcos por
+  proceso. El mapper todavía no sabe qué tablas son de quién. **Pagado en
+  el Incremento 25**, y eran cuatro, no cinco.
+- Sin prioridades y sin dormir: un proceso que no hace nada sigue
+  gastando su turno.
+- `swapgs` volverá con SMP, y entonces el camino de interrupción tendrá que
+  cambiar también.
 
 ## Incremento 21 — El proceso como objeto
 
