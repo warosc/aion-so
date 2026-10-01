@@ -211,6 +211,357 @@ impl BootSector {
     }
 }
 
+// ---------------------------------------------------------------------
+// The allocation table
+// ---------------------------------------------------------------------
+
+/// Only the low 28 bits of a FAT32 entry are the cluster number; the top
+/// four are reserved and a reader has to mask them off. A disk written by
+/// something that left them set would otherwise look full of impossible
+/// cluster numbers.
+const ENTRY_MASK: u32 = 0x0FFF_FFFF;
+
+/// What one entry of the table says about its cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// Nothing is using it.
+    Free,
+    /// Reserved, or a value no chain may point at.
+    Reserved,
+    /// The chain goes on, there.
+    Next(u32),
+    /// The medium is bad here. A chain that reaches one is broken, not
+    /// finished.
+    Bad,
+    /// The chain ends with this cluster.
+    End,
+}
+
+impl Entry {
+    /// Reads an entry, masking off the four bits that are not part of it.
+    pub const fn decode(raw: u32) -> Self {
+        match raw & ENTRY_MASK {
+            0 => Entry::Free,
+            1 => Entry::Reserved,
+            0x0FFF_FFF7 => Entry::Bad,
+            // Everything from 0x0FFFFFF8 up is an end-of-chain marker;
+            // only 0x0FFFFFFF is written, and all of them mean the same.
+            end if end >= 0x0FFF_FFF8 => Entry::End,
+            next => Entry::Next(next),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Directories
+// ---------------------------------------------------------------------
+
+/// A directory entry is thirty-two bytes.
+pub const DIRECTORY_ENTRY_BYTES: usize = 32;
+/// A first byte of zero: this entry has never been used, and neither has
+/// any after it. It is what ends a directory.
+const ENTRY_NEVER_USED: u8 = 0x00;
+/// A first byte of `0xE5`: the entry was deleted. The ones after it may
+/// still be good.
+const ENTRY_DELETED: u8 = 0xE5;
+/// The attribute combination that marks a long-name fragment rather than
+/// a file. They are skipped: this kernel reads 8.3 names (ADR 0025).
+const ATTR_LONG_NAME: u8 = 0x0F;
+const ATTR_VOLUME_LABEL: u8 = 0x08;
+const ATTR_DIRECTORY: u8 = 0x10;
+
+/// What a directory says about one of the things in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    /// The 8.3 name, as `NAME.EXT`, upper case, without the padding the
+    /// entry stores. Short enough that it needs no allocation.
+    pub name: [u8; 12],
+    pub name_len: usize,
+    pub attributes: u8,
+    pub first_cluster: u32,
+    pub size: u32,
+}
+
+impl DirectoryEntry {
+    pub fn is_directory(&self) -> bool {
+        self.attributes & ATTR_DIRECTORY != 0
+    }
+
+    /// The name as text. Always ASCII: a short name holds no other.
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("")
+    }
+
+    /// Whether this names the same file as `other`, ignoring case — short
+    /// names are stored upper case, and nobody types them that way.
+    pub fn is_named(&self, other: &str) -> bool {
+        self.name().len() == other.len()
+            && self
+                .name()
+                .bytes()
+                .zip(other.bytes())
+                .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+    }
+}
+
+/// What reading one slot of a directory turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// Something that is in the directory.
+    Entry(DirectoryEntry),
+    /// A slot that holds nothing worth reporting: a deleted entry, a
+    /// fragment of a long name, or the volume's label.
+    Skip,
+    /// The end of the directory. Nothing after this slot has ever been
+    /// used, so there is no point reading on.
+    End,
+}
+
+/// Reads one slot of a directory.
+pub fn decode_slot(bytes: &[u8; DIRECTORY_ENTRY_BYTES]) -> Slot {
+    match bytes[0] {
+        ENTRY_NEVER_USED => return Slot::End,
+        ENTRY_DELETED => return Slot::Skip,
+        _ => {}
+    }
+    let attributes = bytes[11];
+    // A long-name fragment is not a file, and neither is the label.
+    if attributes & ATTR_LONG_NAME == ATTR_LONG_NAME || attributes & ATTR_VOLUME_LABEL != 0 {
+        return Slot::Skip;
+    }
+
+    // The stored name is eight characters and three, each padded with
+    // spaces and with no dot between them. The dot is put back here.
+    let mut name = [0u8; 12];
+    let mut len = 0;
+    for byte in &bytes[..8] {
+        if *byte == b' ' {
+            break;
+        }
+        name[len] = *byte;
+        len += 1;
+    }
+    if bytes[8] != b' ' {
+        name[len] = b'.';
+        len += 1;
+        for byte in &bytes[8..11] {
+            if *byte == b' ' {
+                break;
+            }
+            name[len] = *byte;
+            len += 1;
+        }
+    }
+
+    Slot::Entry(DirectoryEntry {
+        name,
+        name_len: len,
+        attributes,
+        // The cluster number arrives in two halves, sixteen bits apart,
+        // with the high one earlier in the entry than the low one.
+        first_cluster: u32::from(u16::from_le_bytes([bytes[20], bytes[21]])) << 16
+            | u32::from(u16::from_le_bytes([bytes[26], bytes[27]])),
+        size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+    })
+}
+
+// ---------------------------------------------------------------------
+// A volume, over whatever can hand it sectors
+// ---------------------------------------------------------------------
+
+/// Where sectors come from. A disk in the kernel, an image in a test: the
+/// code that walks a volume does not know which, which is what lets the
+/// whole path be tested without a machine.
+pub trait Sectors {
+    type Error;
+
+    /// Reads one 512-byte sector.
+    fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), Self::Error>;
+}
+
+/// What can go wrong reading a volume, beyond what the device itself says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeError<E> {
+    /// The device could not read a sector.
+    Device(E),
+    /// Its boot sector is not one this kernel reads.
+    BootSector(BootSectorError),
+    /// A chain pointed at a cluster this volume does not have. A disk
+    /// saying something impossible, not a bug to work around.
+    BadCluster { cluster: u32 },
+    /// A chain reached a cluster marked bad, or one that is free — either
+    /// way the file is not all there.
+    BrokenChain { cluster: u32, entry: Entry },
+    /// A chain longer than the volume has clusters, which means it points
+    /// back into itself. Stopping is the only safe answer.
+    ChainLoops,
+    /// The buffer offered is smaller than the file.
+    TooBig { size: u32 },
+}
+
+/// A FAT32 volume that has been read far enough to be used.
+pub struct Volume<S> {
+    sectors: S,
+    boot: BootSector,
+}
+
+impl<S: Sectors> Volume<S> {
+    /// Reads the boot sector and believes none of it (`BootSector::parse`).
+    pub fn mount(mut sectors: S) -> Result<Self, VolumeError<S::Error>> {
+        let mut first = [0u8; 512];
+        sectors
+            .read_sector(0, &mut first)
+            .map_err(VolumeError::Device)?;
+        let boot = BootSector::parse(&first).map_err(VolumeError::BootSector)?;
+        Ok(Self { sectors, boot })
+    }
+
+    pub const fn boot_sector(&self) -> &BootSector {
+        &self.boot
+    }
+
+    /// What the table says follows `cluster`.
+    pub fn next_cluster(&mut self, cluster: u32) -> Result<Entry, VolumeError<S::Error>> {
+        if cluster < FIRST_DATA_CLUSTER || cluster >= FIRST_DATA_CLUSTER + self.boot.clusters {
+            return Err(VolumeError::BadCluster { cluster });
+        }
+        // Four bytes per entry, so a sector holds 128 of them.
+        let per_sector = u32::from(self.boot.bytes_per_sector) / 4;
+        let sector = self.boot.first_fat_sector() + cluster / per_sector;
+        let offset = (cluster % per_sector) as usize * 4;
+        let mut bytes = [0u8; 512];
+        self.sectors
+            .read_sector(sector, &mut bytes)
+            .map_err(VolumeError::Device)?;
+        Ok(Entry::decode(u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])))
+    }
+
+    /// Hands every entry of the root directory to `each`, stopping where
+    /// the directory ends.
+    ///
+    /// `each` answers whether to go on, so that looking for one name does
+    /// not mean reading the whole directory.
+    pub fn read_root(
+        &mut self,
+        mut each: impl FnMut(DirectoryEntry) -> bool,
+    ) -> Result<(), VolumeError<S::Error>> {
+        let mut cluster = self.boot.root_cluster;
+        let mut seen = 0;
+        loop {
+            let first = self
+                .boot
+                .sector_of_cluster(cluster)
+                .ok_or(VolumeError::BadCluster { cluster })?;
+            for offset in 0..u32::from(self.boot.sectors_per_cluster) {
+                let mut bytes = [0u8; 512];
+                self.sectors
+                    .read_sector(first + offset, &mut bytes)
+                    .map_err(VolumeError::Device)?;
+                // A sector holds a whole number of entries, so there is
+                // nothing left over to think about.
+                let (slots, _) = bytes.as_chunks::<DIRECTORY_ENTRY_BYTES>();
+                for slot in slots {
+                    match decode_slot(slot) {
+                        Slot::End => return Ok(()),
+                        Slot::Skip => {}
+                        Slot::Entry(entry) => {
+                            if !each(entry) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            // A directory is a chain like any other file.
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops);
+            }
+            match self.next_cluster(cluster)? {
+                Entry::Next(next) => cluster = next,
+                Entry::End => return Ok(()),
+                entry => return Err(VolumeError::BrokenChain { cluster, entry }),
+            }
+        }
+    }
+
+    /// The entry for `name` in the root directory, if it is there.
+    pub fn find(&mut self, name: &str) -> Result<Option<DirectoryEntry>, VolumeError<S::Error>> {
+        let mut found = None;
+        self.read_root(|entry| {
+            if entry.is_named(name) {
+                found = Some(entry);
+                false
+            } else {
+                true
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// Reads a file's bytes into `into`, following its chain, and answers
+    /// how many there were.
+    ///
+    /// Stops where the file's length says, not where its last cluster
+    /// does: the bytes after the end of a file inside its last cluster are
+    /// whatever was there before.
+    pub fn read_file(
+        &mut self,
+        entry: &DirectoryEntry,
+        into: &mut [u8],
+    ) -> Result<usize, VolumeError<S::Error>> {
+        let size = entry.size as usize;
+        if size > into.len() {
+            return Err(VolumeError::TooBig { size: entry.size });
+        }
+        let mut cluster = entry.first_cluster;
+        let mut written = 0;
+        let mut seen = 0;
+        // A file of no bytes owns no cluster, and its entry says so with a
+        // first cluster of zero. Nothing special is needed for it: there
+        // is nothing to read, so this loop does not run and that zero is
+        // never followed into the reserved entries of the table. An early
+        // return here would be a branch no test could ever take.
+        while written < size {
+            let first = self
+                .boot
+                .sector_of_cluster(cluster)
+                .ok_or(VolumeError::BadCluster { cluster })?;
+            for offset in 0..u32::from(self.boot.sectors_per_cluster) {
+                if written == size {
+                    break;
+                }
+                let mut bytes = [0u8; 512];
+                self.sectors
+                    .read_sector(first + offset, &mut bytes)
+                    .map_err(VolumeError::Device)?;
+                let taking = (size - written).min(bytes.len());
+                into[written..written + taking].copy_from_slice(&bytes[..taking]);
+                written += taking;
+            }
+            if written == size {
+                break;
+            }
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops);
+            }
+            match self.next_cluster(cluster)? {
+                Entry::Next(next) => cluster = next,
+                // The chain ended before the file did, which means the
+                // directory and the table disagree about this file.
+                entry => return Err(VolumeError::BrokenChain { cluster, entry }),
+            }
+        }
+        Ok(written)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +776,109 @@ mod tests {
         // Whatever this is, it is refused rather than wrapped into
         // something that looks reasonable.
         assert!(BootSector::parse(&everything_max).is_err());
+    }
+
+    #[test]
+    fn an_entry_says_what_follows_its_cluster() {
+        assert_eq!(Entry::decode(0), Entry::Free);
+        assert_eq!(Entry::decode(1), Entry::Reserved);
+        assert_eq!(Entry::decode(3), Entry::Next(3));
+        assert_eq!(Entry::decode(0x0FFF_FFF7), Entry::Bad);
+        assert_eq!(Entry::decode(0x0FFF_FFFF), Entry::End);
+        // Everything from 0x0FFFFFF8 up ends a chain; only the last is
+        // written, and a reader that checked for equality would walk off
+        // a disk written by something that used another.
+        assert_eq!(Entry::decode(0x0FFF_FFF8), Entry::End);
+        assert_eq!(Entry::decode(0x0FFF_FFFE), Entry::End);
+
+        // The top four bits are not part of the number. A disk that left
+        // them set would otherwise look full of impossible clusters.
+        assert_eq!(Entry::decode(0xF000_0003), Entry::Next(3));
+        assert_eq!(Entry::decode(0xFFFF_FFFF), Entry::End);
+        assert_eq!(Entry::decode(0xF000_0000), Entry::Free);
+    }
+
+    fn entry_bytes(name: &[u8; 11], attributes: u8, cluster: u32, size: u32) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[..11].copy_from_slice(name);
+        bytes[11] = attributes;
+        bytes[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        bytes[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        bytes[28..32].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_directory_entry_gets_its_dot_back() {
+        let slot = decode_slot(&entry_bytes(b"HELLO   TXT", 0x20, 3, 27));
+        let Slot::Entry(entry) = slot else {
+            panic!("a file, not {slot:?}");
+        };
+        assert_eq!(entry.name(), "HELLO.TXT");
+        assert_eq!(entry.first_cluster, 3);
+        assert_eq!(entry.size, 27);
+        assert!(!entry.is_directory());
+
+        // A name with no extension gets no dot.
+        let Slot::Entry(entry) = decode_slot(&entry_bytes(b"README     ", 0x20, 4, 1)) else {
+            panic!("a file");
+        };
+        assert_eq!(entry.name(), "README");
+
+        // And one that fills both halves.
+        let Slot::Entry(entry) = decode_slot(&entry_bytes(b"LONGNAMETXT", 0x20, 5, 1)) else {
+            panic!("a file");
+        };
+        assert_eq!(entry.name(), "LONGNAME.TXT");
+
+        // A directory says so in its attributes.
+        let Slot::Entry(entry) = decode_slot(&entry_bytes(b"SUBDIR     ", 0x10, 6, 0)) else {
+            panic!("a directory");
+        };
+        assert!(entry.is_directory());
+
+        // The cluster number's two halves are sixteen bits apart, with the
+        // high one earlier in the entry.
+        let Slot::Entry(entry) = decode_slot(&entry_bytes(b"BIG     BIN", 0x20, 0x1234_5678, 9))
+        else {
+            panic!("a file");
+        };
+        assert_eq!(entry.first_cluster, 0x1234_5678);
+    }
+
+    #[test]
+    fn what_a_directory_slot_is_not() {
+        // The end of the directory: nothing after it has ever been used.
+        assert_eq!(decode_slot(&[0u8; 32]), Slot::End);
+
+        // A deleted entry, which the ones after it may still follow.
+        let mut deleted = entry_bytes(b"GONE    TXT", 0x20, 3, 1);
+        deleted[0] = 0xE5;
+        assert_eq!(decode_slot(&deleted), Slot::Skip);
+
+        // A fragment of a long name, which this kernel does not read.
+        assert_eq!(
+            decode_slot(&entry_bytes(b"XXXXXXXXXXX", 0x0F, 0, 0)),
+            Slot::Skip
+        );
+
+        // And the volume's label, which is not a file.
+        assert_eq!(
+            decode_slot(&entry_bytes(b"HARLAN     ", 0x08, 0, 0)),
+            Slot::Skip
+        );
+    }
+
+    #[test]
+    fn a_name_is_matched_whatever_case_it_is_typed_in() {
+        let Slot::Entry(entry) = decode_slot(&entry_bytes(b"HELLO   TXT", 0x20, 3, 1)) else {
+            panic!("a file");
+        };
+        assert!(entry.is_named("HELLO.TXT"));
+        assert!(entry.is_named("hello.txt"));
+        assert!(entry.is_named("Hello.Txt"));
+        assert!(!entry.is_named("HELLO.TX"), "not a prefix");
+        assert!(!entry.is_named("HELLO.TXTX"), "and not a longer one");
+        assert!(!entry.is_named("OTHER.TXT"));
     }
 }
