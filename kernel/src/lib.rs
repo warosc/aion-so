@@ -4,6 +4,7 @@ extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 pub mod devices;
+pub mod fs;
 pub mod identity;
 pub mod ipc;
 #[cfg(target_arch = "x86_64")]
@@ -895,15 +896,13 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
     // The reader outlives this block: the program the kernel runs comes
     // off the same disk, further down
     // (docs/adr/0026-fase4-elf-user-programs.md).
-    let mut disk_reader = None;
-    if let Some(disk) = &disk {
+    if let Some(disk) = disk {
         // SAFETY: the disk is negotiated and not started, the kernel owns
         // its tables, and `frames` reaches frames through its window.
         match unsafe {
-            devices::virtio_blk::start_queue(disk, &mut context.mapper, &mut context.frames)
+            devices::virtio_blk::start_queue(&disk, &mut context.mapper, &mut context.frames)
         } {
-            Ok(reader) => {
-                let reader = disk_reader.insert(reader);
+            Ok(mut reader) => {
                 // The boot sector, and the copy FAT32 keeps at sector 6.
                 // Reading both checks three things at once: that the BPB
                 // parses, that the sector number reaches the device — six
@@ -913,7 +912,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                 let mut boot_sector = [0u8; 512];
                 // SAFETY: the reader owns its queue and its request frame,
                 // and nothing else has a request in flight.
-                let first = unsafe { reader.read_sector(disk, 0, &mut boot_sector) };
+                let first = unsafe { reader.read_sector(&disk, 0, &mut boot_sector) };
                 match first.map(|()| harlan_hal::fat::BootSector::parse(&boot_sector)) {
                     Ok(Ok(volume)) => {
                         info!(
@@ -929,9 +928,15 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                             volume.sector_of_cluster(volume.root_cluster),
                             volume.first_data_sector()
                         );
-                        check_backup_boot_sector(disk, reader, &volume, &boot_sector);
-                        read_a_file(disk, reader);
-                        count_this_boot(disk, reader);
+                        // From here the disk belongs to `fs`, where a
+                        // syscall can reach it
+                        // (docs/adr/0028-fase4-file-abi-v0.md). The boot
+                        // reads the rest of its files through the same
+                        // path a program's `open` takes.
+                        fs::adopt(disk, reader, volume);
+                        check_backup_boot_sector(&volume, &boot_sector);
+                        read_a_file();
+                        count_this_boot();
                     }
                     Ok(Err(err)) => {
                         error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
@@ -966,10 +971,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // before anything is started, because one of the processes is it
         // (docs/adr/0026-fase4-elf-user-programs.md).
         let mut elf_bytes = alloc::vec![0u8; 64 * 1024];
-        let elf = disk
-            .as_ref()
-            .zip(disk_reader.as_mut())
-            .and_then(|(disk, reader)| read_user_program(disk, reader, &mut elf_bytes))
+        let elf = read_user_program(&mut elf_bytes)
             .and_then(|read| {
                 match harlan_hal::elf::parse(
                     &elf_bytes[..read],
@@ -1204,34 +1206,6 @@ fn banner(console: &mut dyn Console) {
     console.write_str("Kernel.......... READY\n\n");
 }
 
-/// The disk, as something a filesystem can ask for sectors.
-///
-/// The reader does not know it is talking to virtio, and the disk does not
-/// know it is holding a filesystem. That is what lets the whole of the FAT
-/// code be tested in host against an image in memory.
-struct DiskSectors<'a> {
-    disk: &'a devices::virtio_blk::Disk,
-    /// Borrowed, so that the disk can be read again once the filesystem
-    /// built over it is done with.
-    reader: &'a mut devices::virtio_blk::Reader,
-}
-
-impl harlan_hal::fat::Sectors for DiskSectors<'_> {
-    type Error = devices::virtio_blk::ReadError;
-
-    fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), Self::Error> {
-        // SAFETY: the reader owns its queue and its request frame, and
-        // this is the only thing using it: a request is never in flight
-        // when another starts, because this returns before the next call.
-        unsafe { self.reader.read_sector(self.disk, u64::from(sector), into) }
-    }
-
-    fn write_sector(&mut self, sector: u32, from: &[u8; 512]) -> Result<(), Self::Error> {
-        // SAFETY: as above.
-        unsafe { self.reader.write_sector(self.disk, u64::from(sector), from) }
-    }
-}
-
 /// Counts this boot in a file on the disk, and says what the file said
 /// before.
 ///
@@ -1240,21 +1214,14 @@ impl harlan_hal::fat::Sectors for DiskSectors<'_> {
 /// (docs/adr/0027-fase4-fat32-write.md). The number only grows because
 /// what was written survived; a disk that forgot would start again at one
 /// every time, and so would a reader that could not find what it wrote.
-fn count_this_boot(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_blk::Reader) {
+fn count_this_boot() {
     const NAME: &str = "BOOTS.TXT";
-    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
-        Ok(volume) => volume,
-        Err(err) => {
-            error!("HARLAN: this boot cannot be counted: {err:?}");
-            return;
-        }
-    };
 
     // What the last boot left, if there was one.
-    let before = match volume.find(NAME) {
-        Ok(Some(entry)) => {
+    let before = match fs::find(NAME) {
+        Ok(entry) => {
             let mut bytes = [0u8; 32];
-            match volume.read_file(&entry, &mut bytes) {
+            match fs::read_file(&entry, &mut bytes) {
                 Ok(read) => core::str::from_utf8(&bytes[..read])
                     .ok()
                     .and_then(|text| text.trim().parse::<u32>().ok()),
@@ -1264,7 +1231,7 @@ fn count_this_boot(disk: &devices::virtio_blk::Disk, reader: &mut devices::virti
                 }
             }
         }
-        Ok(None) => None,
+        Err(fs::FileError::NoSuchFile) => None,
         Err(err) => {
             error!("HARLAN: {NAME} could not be looked up ({err:?})");
             return;
@@ -1275,7 +1242,7 @@ fn count_this_boot(disk: &devices::virtio_blk::Disk, reader: &mut devices::virti
     // Up to ten digits and a newline, which is more than a `u32` needs.
     let mut text = [0u8; 11];
     let written = write_number(&mut text, this);
-    match volume.write_file(NAME, &text[..written]) {
+    match fs::write_file(NAME, &text[..written]) {
         Ok(entry) => match before {
             Some(before) => info!(
                 "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
@@ -1329,31 +1296,16 @@ enum ToStart<'a> {
 /// Answers `None` and says why if it is not there or cannot be read: a
 /// kernel whose disk failed has no user program, and that has to be a line
 /// in the log rather than a boot that carries on as if it had one.
-fn read_user_program(
-    disk: &devices::virtio_blk::Disk,
-    reader: &mut devices::virtio_blk::Reader,
-    into: &mut [u8],
-) -> Option<usize> {
+fn read_user_program(into: &mut [u8]) -> Option<usize> {
     const NAME: &str = "HELLO.ELF";
-    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
-        Ok(volume) => volume,
+    let entry = match fs::find(NAME) {
+        Ok(entry) => entry,
         Err(err) => {
-            error!("HARLAN: no program can be loaded: the volume would not mount ({err:?})");
+            error!("HARLAN: no program can be loaded: {NAME} ({err:?})");
             return None;
         }
     };
-    let entry = match volume.find(NAME) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => {
-            error!("HARLAN: there is no {NAME} on the disk");
-            return None;
-        }
-        Err(err) => {
-            error!("HARLAN: {NAME} could not be looked up ({err:?})");
-            return None;
-        }
-    };
-    match volume.read_file(&entry, into) {
+    match fs::read_file(&entry, into) {
         Ok(read) => {
             info!("HARLAN: {NAME} is {read} byte(s), read off the disk");
             Some(read)
@@ -1367,17 +1319,9 @@ fn read_user_program(
 
 /// Lists the root directory and reads one file off it, which is as far as
 /// a filesystem has to work before a shell can use it.
-fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_blk::Reader) {
-    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
-        Ok(volume) => volume,
-        Err(err) => {
-            error!("HARLAN: the volume could not be mounted ({err:?})");
-            return;
-        }
-    };
-
+fn read_a_file() {
     let mut files = 0;
-    if let Err(err) = volume.read_root(|entry| {
+    if let Err(err) = fs::each_name(|entry| {
         files += 1;
         info!(
             "HARLAN:   {} — {} byte(s){}, from cluster {}",
@@ -1402,19 +1346,15 @@ fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_bl
     // different answers.
     const NAME: &str = "HELLO.TXT";
     const EXPECTED: &str = "HARLAN reads its own disk.\n";
-    let entry = match volume.find(NAME) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => {
-            error!("HARLAN: there is no {NAME} on the disk");
-            return;
-        }
+    let entry = match fs::find(NAME) {
+        Ok(entry) => entry,
         Err(err) => {
             error!("HARLAN: {NAME} could not be looked up ({err:?})");
             return;
         }
     };
     let mut bytes = [0u8; 512];
-    match volume.read_file(&entry, &mut bytes) {
+    match fs::read_file(&entry, &mut bytes) {
         Ok(read) => {
             let text = core::str::from_utf8(&bytes[..read]).unwrap_or("not text");
             if text == EXPECTED {
@@ -1433,10 +1373,10 @@ fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_bl
     // clusters and a byte, so a reader that stopped at a cluster boundary
     // or ran past the file's length would not match.
     const LONG: &str = "LONG.BIN";
-    match volume.find(LONG) {
-        Ok(Some(entry)) => {
+    match fs::find(LONG) {
+        Ok(entry) => {
             let mut bytes = [0u8; 4096];
-            match volume.read_file(&entry, &mut bytes) {
+            match fs::read_file(&entry, &mut bytes) {
                 Ok(read) => {
                     let right = read == entry.size as usize
                         && bytes[..read]
@@ -1444,9 +1384,11 @@ fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_bl
                             .enumerate()
                             .all(|(at, byte)| *byte == (at % 251) as u8);
                     if right {
+                        let per_cluster =
+                            fs::boot_sector().map_or(1, |boot| boot.cluster_bytes() as usize);
                         info!(
                             "HARLAN: {LONG} is {read} byte(s) across {} cluster(s), every one of them what it should be",
-                            read.div_ceil(volume.boot_sector().cluster_bytes() as usize)
+                            read.div_ceil(per_cluster)
                         );
                     } else {
                         error!("HARLAN: {LONG} read {read} byte(s) and they are not what is in it");
@@ -1455,7 +1397,6 @@ fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_bl
                 Err(err) => error!("HARLAN: {LONG} could not be read ({err:?})"),
             }
         }
-        Ok(None) => error!("HARLAN: there is no {LONG} on the disk"),
         Err(err) => error!("HARLAN: {LONG} could not be looked up ({err:?})"),
     }
 }
@@ -1468,21 +1409,14 @@ fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_bl
 /// only check in this boot that the sector number really travels — the
 /// backup is at sector 6, and a driver that always read sector 0 would be
 /// comparing a sector with itself.
-fn check_backup_boot_sector(
-    disk: &devices::virtio_blk::Disk,
-    reader: &mut devices::virtio_blk::Reader,
-    volume: &harlan_hal::fat::BootSector,
-    first: &[u8; 512],
-) {
-    let backup = u64::from(volume.backup_boot_sector);
+fn check_backup_boot_sector(volume: &harlan_hal::fat::BootSector, first: &[u8; 512]) {
+    let backup = u32::from(volume.backup_boot_sector);
     if backup == 0 {
         warn!("HARLAN: this volume keeps no backup boot sector");
         return;
     }
     let mut copy = [0u8; 512];
-    // SAFETY: the reader owns its queue and its request frame, and nothing
-    // else has a request in flight.
-    match unsafe { reader.read_sector(disk, backup, &mut copy) } {
+    match fs::read_sector(backup, &mut copy) {
         Ok(()) if copy == *first => {
             info!("HARLAN: sector {backup} holds the same boot sector as sector 0, byte for byte")
         }
