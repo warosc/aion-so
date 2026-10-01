@@ -8,6 +8,98 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 31 — Los programas de usuario pasan a ser programas
+
+`docs/adr/0026-fase4-elf-user-programs.md`. El ADR 0014 eligió un binario
+plano incrustado como primer programa de usuario y dijo cuándo se
+revisaría: *"El formato de verdad se decide cuando haya filesystem (Fase
+4)."* Ya lo hay.
+
+Los programas incrustados habían llegado a su límite: ocho, escritos a mano
+en hexadecimal dentro de `kernel/src/user.rs`, con los desplazamientos
+calculados a mano y fijados por pruebas que comprueban byte a byte que el
+comentario dice la verdad. Eso fue lo correcto para demostrar un salto a
+ring 3; no es forma de escribir una shell.
+
+### Qué hace
+
+- **Un crate de usuario de verdad**, `user/hello`, compilado para
+  `x86_64-unknown-none`. No es parte del kernel y no se enlaza con él: se
+  compila aparte, acaba en el disco, y el kernel no sabe de él más que su
+  nombre.
+- **ELF64 estático.** El toolchain produce un PIE por defecto, que
+  necesitaría reubicarse al cargar; se le pide explícitamente
+  `relocation-model=static`, `-no-pie` y una base de imagen, y entonces
+  sale un `ET_EXEC` con su entrada donde el kernel la espera.
+- **Los permisos salen de los segmentos**, no de una convención. Lo que el
+  arranque enseña —`r--` para los datos de solo lectura y `r-x` para el
+  código— lo dice el fichero, y un segmento que pidiera escritura **y**
+  ejecución se rechaza: el ADR 0008 vale también para un programa de
+  usuario.
+- **El fichero se valida entero antes de mapear nada**: la cabecera, la
+  tabla de cabeceras de programa, y de cada segmento que quepa en el
+  fichero, que no encoja, que no cruce a la mitad alta y que no pida W y X
+  a la vez. Un ELF es un fichero del disco, o sea dato de fuera.
+- **`p_memsz` mayor que `p_filesz` se pone a cero**: es el `.bss`, y como
+  los marcos llegan a cero del asignador, basta con no escribir encima.
+- **Un `Process` deja de tener dos rangos fijos** —código y pila— y pasa a
+  tener uno por segmento más la pila, con los marcos que haya tomado
+  anotados con su propósito. Las dos formas de arrancar un proceso
+  comparten esa contabilidad.
+- **Los programas escritos a mano siguen ahí**, los que se portan mal a
+  propósito (ADR 0020): un compilador no produce un programa que escribe
+  en su propio código.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+    HELLO.ELF — 6360 byte(s), from cluster 3
+  HELLO.ELF is 6360 byte(s), read off the disk
+  it is an ELF with 2 loadable segment(s), entry 0x401240, reaching 0x401285
+    segment at 0x400000, 492 byte(s) of file and 492 of memory, r--
+    segment at 0x4011f0, 149 byte(s) of file and 149 of memory, r-x
+  a process from an ELF: space at 0x5d9000, 2 segment(s), entry 0x401240,
+  a stack at 0x500000
+  process 8 runs in slot 8
+  from ring 3: HARLAN: hello from a program that came off the disk
+  from ring 3: HARLAN: compiled by the toolchain, loaded as ELF
+  the process in slot 8 exited with 0
+  ```
+
+- **La contabilidad sigue cuadrando** con nueve procesos:
+  `91 frame(s) back from the processes that ended; the allocator has the
+  62740 it started with`.
+- **Pruebas negativas**, rompiendo los bytes del ELF en `xtask` *después*
+  de que el toolchain haya producido uno bueno —así se prueba el cargador
+  y no el compilador—:
+  - poniéndole el bit de escritura al segmento ejecutable:
+    `SegmentWritableAndExecutable { at: 4198896 }`, que es `0x4011f0`;
+  - moviendo un segmento a la mitad alta: `SegmentOutsideUserSpace`;
+  - rompiendo el número mágico: `NotElf`.
+  Las tres llegan al shell y los otros ocho procesos siguen su camino.
+- Host: 318 pruebas (309 + 9), `fmt-lint` limpio —con el crate nuevo
+  añadido a clippy, en su propio target—.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 23, las 23 detectadas. Dos sobrevivieron primero y eran huecos
+  reales: ninguna prueba tenía una tabla de cabeceras fuera del fichero, y
+  ninguna tenía un fichero **sin** segmentos cargables —sin esa, quitar la
+  comprobación daba otro error y parecía bien—.
+
+### Riesgos y límites
+
+- **Estático y nada más**: sin enlazado dinámico, sin intérprete, sin
+  reubicaciones.
+- **Dos segmentos en una misma página se rechazan** con nombre, en vez de
+  adivinar qué permisos debería tener. El enlazador separa los segmentos
+  por páginas, así que no ocurre; si ocurriera, el kernel lo diría.
+- El programa se lee entero a un buffer del heap antes de analizarlo. Un
+  programa grande querrá leerse por segmentos, que es la misma cadena
+  recorrida desde un punto.
+- `p_vaddr` decide dónde va un segmento, así que el mapa de un proceso ya
+  no lo fija el kernel. La pila sí.
+
 ## Incremento 30 — Un fichero, leído por su nombre
 
 `docs/adr/0025-fase4-fat32-read-only.md`, que ya estaba decidido. Esto es
