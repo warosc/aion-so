@@ -1384,4 +1384,297 @@ mod tests {
         let said_next = u32::from_le_bytes([bytes[492], bytes[493], bytes[494], bytes[495]]);
         assert!(said_next >= harlan_hal::fat::FIRST_DATA_CLUSTER);
     }
+
+    /// Reading in pieces gives exactly what reading whole gives.
+    ///
+    /// This is the property that covers every piece of `read_at`'s
+    /// arithmetic at once: which cluster a byte is in, which sector of
+    /// that cluster, and which byte of that sector. An off-by-one in any
+    /// of the three shows up here as bytes in the wrong place.
+    ///
+    /// The sizes are chosen to straddle the boundaries that exist. On this
+    /// volume a cluster is one sector of 512 bytes, so a sector boundary
+    /// and a cluster boundary are the same boundary and a file of 5000
+    /// bytes crosses it nine times, ending part of the way into the tenth.
+    /// Pieces of 1, 3, 511, 512, 513, 1024 and 4096 bytes each start and
+    /// end somewhere different with respect to it.
+    #[test]
+    fn reading_in_pieces_is_reading_whole() {
+        let mut volume = volume();
+        // Not a repeating pattern: a byte in the wrong place has to be
+        // visible as a wrong value, not hidden by its neighbours.
+        let contents: Vec<u8> = (0..5000u32)
+            .map(|at| (at.wrapping_mul(31).wrapping_add(7) % 251) as u8)
+            .collect();
+        let entry = volume.write_file("PIECES.BIN", &contents).unwrap();
+
+        let mut whole = vec![0u8; contents.len()];
+        let read = volume.read_file(&entry, &mut whole).unwrap();
+        assert_eq!(read, contents.len());
+        assert_eq!(whole, contents, "the whole file, for a baseline");
+
+        for piece in [1usize, 3, 511, 512, 513, 1024, 4096] {
+            let mut rebuilt = Vec::new();
+            let mut buffer = vec![0u8; piece];
+            loop {
+                let at = rebuilt.len() as u32;
+                let got = volume.read_at(&entry, at, &mut buffer).unwrap();
+                if got == 0 {
+                    break;
+                }
+                assert!(got <= piece, "more than was asked for");
+                rebuilt.extend_from_slice(&buffer[..got]);
+            }
+            assert_eq!(
+                rebuilt.len(),
+                contents.len(),
+                "pieces of {piece}: wrong length"
+            );
+            assert_eq!(rebuilt, contents, "pieces of {piece}: wrong bytes");
+        }
+    }
+
+    /// Every single offset, one byte at a time, against the whole file.
+    ///
+    /// Slower than the loop above and worth it: it reads *from* every
+    /// offset rather than only from the ones a piece size lands on, so an
+    /// error that only happens at, say, the first byte of the second
+    /// cluster cannot hide between two pieces.
+    #[test]
+    fn every_offset_reads_the_byte_that_is_there() {
+        let mut volume = volume();
+        let contents: Vec<u8> = (0..4600u32)
+            .map(|at| (at.wrapping_mul(17).wrapping_add(3) % 253) as u8)
+            .collect();
+        let entry = volume.write_file("OFFSETS.BIN", &contents).unwrap();
+
+        let mut one = [0u8; 1];
+        for (at, want) in contents.iter().enumerate() {
+            let got = volume.read_at(&entry, at as u32, &mut one).unwrap();
+            assert_eq!(got, 1, "offset {at} read nothing");
+            assert_eq!(one[0], *want, "offset {at} read the wrong byte");
+        }
+        // And one past the end is zero, not an error: that is how a
+        // reading loop knows it is done (ADR 0028).
+        assert_eq!(
+            volume
+                .read_at(&entry, contents.len() as u32, &mut one)
+                .unwrap(),
+            0
+        );
+        assert_eq!(volume.read_at(&entry, u32::MAX, &mut one).unwrap(), 0);
+    }
+
+    /// A read that asks for more than is left gets what is left, not an
+    /// error and not padding.
+    #[test]
+    fn a_read_past_the_end_gets_what_is_left() {
+        let mut volume = volume();
+        let entry = volume.write_file("SHORT.BIN", &[9u8; 700]).unwrap();
+
+        let mut buffer = [0xAAu8; 1024];
+        let got = volume.read_at(&entry, 600, &mut buffer).unwrap();
+        assert_eq!(got, 100, "100 bytes left of 700 from offset 600");
+        assert!(buffer[..got].iter().all(|byte| *byte == 9));
+        // What was not read was not touched.
+        assert!(buffer[got..].iter().all(|byte| *byte == 0xAA));
+    }
+
+    /// A file of no bytes reads as zero from the start, and owns no
+    /// cluster to walk to.
+    #[test]
+    fn an_empty_file_reads_nothing_without_following_anything() {
+        let mut volume = volume();
+        let entry = volume.write_file("NONE.BIN", b"").unwrap();
+        assert_eq!(entry.first_cluster, 0, "an empty file owns no cluster");
+
+        let mut buffer = [0u8; 16];
+        assert_eq!(volume.read_at(&entry, 0, &mut buffer).unwrap(), 0);
+        assert_eq!(volume.read_at(&entry, 100, &mut buffer).unwrap(), 0);
+    }
+
+    /// A buffer of no bytes reads no bytes, and says so rather than
+    /// walking the chain to find that out.
+    #[test]
+    fn an_empty_buffer_reads_nothing() {
+        let mut volume = volume();
+        let entry = volume.write_file("SOME.BIN", &[1u8; 2000]).unwrap();
+        assert_eq!(volume.read_at(&entry, 0, &mut []).unwrap(), 0);
+        assert_eq!(volume.read_at(&entry, 1000, &mut []).unwrap(), 0);
+    }
+
+    /// A directory that claims a file reaches further than its chain does
+    /// is refused at the offset where the two disagree, not read into
+    /// whatever cluster happens to be next.
+    #[test]
+    fn an_offset_past_the_chain_is_refused() {
+        let mut volume = volume();
+        let mut entry = volume.write_file("LIAR.BIN", &[4u8; 2000]).unwrap();
+        // The entry says the file is much larger than its chain.
+        entry.size = 40_000;
+
+        let mut buffer = [0u8; 16];
+        // Inside the chain, this still reads.
+        assert_eq!(volume.read_at(&entry, 0, &mut buffer).unwrap(), 16);
+        // Past it, the two disagree and the read refuses.
+        let far = volume.read_at(&entry, 30_000, &mut buffer);
+        assert!(
+            matches!(far, Err(harlan_hal::fat::VolumeError::BrokenChain { .. })),
+            "{far:?}"
+        );
+    }
+
+    /// `read_at` on a volume whose clusters hold more than one sector.
+    ///
+    /// The disk this kernel boots from has one sector per cluster, so a
+    /// sector boundary and a cluster boundary are the same boundary and
+    /// `read_at`'s inner loop over the sectors inside a cluster runs once
+    /// every time. Everything that tells the two apart — the byte offset
+    /// inside a cluster, which sector of it that lands in, and carrying on
+    /// to the next sector without following the chain — is untested
+    /// without a volume like this one.
+    #[test]
+    fn reading_in_pieces_across_sectors_inside_a_cluster() {
+        // Two, not more: FAT32 needs at least 65 525 clusters to be
+        // FAT32 at all, so every sector added to a cluster needs twice as
+        // many sectors in the volume to stay legal. Two already separates
+        // a sector boundary from a cluster boundary, which is the whole
+        // point, and keeps the image the size of the others here.
+        const PER_CLUSTER: u8 = 2;
+        const BIG_CLUSTER_SECTORS: u32 = 140_000;
+        let (image, geometry) = format(BIG_CLUSTER_SECTORS, PER_CLUSTER, "HARLAN", &[]).unwrap();
+        assert_eq!(geometry.sectors_per_cluster, PER_CLUSTER);
+        let mut volume = harlan_hal::fat::Volume::mount(Image(image)).unwrap();
+        assert_eq!(volume.boot_sector().sectors_per_cluster, PER_CLUSTER);
+
+        // Twelve clusters and a bit: 1024 bytes to a cluster here.
+        let contents: Vec<u8> = (0..13_000u32)
+            .map(|at| (at.wrapping_mul(37).wrapping_add(11) % 249) as u8)
+            .collect();
+        let entry = volume.write_file("BIG.BIN", &contents).unwrap();
+
+        let mut whole = vec![0u8; contents.len()];
+        assert_eq!(
+            volume.read_file(&entry, &mut whole).unwrap(),
+            contents.len()
+        );
+        assert_eq!(whole, contents, "whole, for a baseline");
+
+        // Piece sizes that land on, just before and just after both kinds
+        // of boundary: 512 is a sector and 1024 is a cluster.
+        for piece in [1usize, 7, 511, 512, 513, 1023, 1024, 1025, 9000] {
+            let mut rebuilt = Vec::new();
+            let mut buffer = vec![0u8; piece];
+            loop {
+                let got = volume
+                    .read_at(&entry, rebuilt.len() as u32, &mut buffer)
+                    .unwrap();
+                if got == 0 {
+                    break;
+                }
+                rebuilt.extend_from_slice(&buffer[..got]);
+            }
+            assert_eq!(rebuilt, contents, "pieces of {piece}");
+        }
+
+        // And the offsets either side of each boundary, one byte at a
+        // time, which is where an error of one shows up as a wrong byte.
+        let mut one = [0u8; 1];
+        for boundary in [512usize, 1024, 1536, 2048, 4096, 8192, 12_288] {
+            let from = boundary.saturating_sub(2);
+            let to = (boundary + 2).min(contents.len());
+            for (step, want) in contents[from..to].iter().enumerate() {
+                let at = from + step;
+                let got = volume.read_at(&entry, at as u32, &mut one).unwrap();
+                assert_eq!(got, 1, "offset {at}");
+                assert_eq!(one[0], *want, "offset {at} near {boundary}");
+            }
+        }
+    }
+
+    /// `read_at` across a chain that is not contiguous.
+    ///
+    /// Found by a mutation that survived: removing the bound on how many
+    /// sectors of a cluster to read passed every other test here. Not
+    /// because the bound is unnecessary — because every chain in every
+    /// other test is contiguous, so reading past a cluster without
+    /// following the chain lands on the next physical cluster, which holds
+    /// exactly the bytes that were wanted. Only a chain that jumps can
+    /// tell the two apart.
+    ///
+    /// The fragmentation is made with the write path rather than by hand,
+    /// because the write path is what will make it on a real disk: a file
+    /// is written, overwritten shorter so its tail is freed, and then a
+    /// longer file takes the freed clusters and has to carry on past them
+    /// (first free from the start of the table, ADR 0027 point 7).
+    #[test]
+    fn reading_a_chain_that_is_not_contiguous() {
+        const PER_CLUSTER: u8 = 2;
+        let (image, _) = format(140_000, PER_CLUSTER, "HARLAN", &[]).unwrap();
+        let mut volume = harlan_hal::fat::Volume::mount(Image(image)).unwrap();
+        let per_cluster = 1024usize;
+
+        // Four clusters, then one after them, then the four shrunk to one:
+        // what was the tail of the first file is now a hole with a file on
+        // the far side of it.
+        volume.write_file("HOLE.BIN", &[1u8; 4 * 1024]).unwrap();
+        volume.write_file("WALL.BIN", &[2u8; 1024]).unwrap();
+        volume.write_file("HOLE.BIN", &[1u8; 16]).unwrap();
+
+        // Six clusters: the hole cannot hold them all, so the chain has to
+        // jump over WALL.BIN to finish.
+        let contents: Vec<u8> = (0..6 * per_cluster as u32)
+            .map(|at| (at.wrapping_mul(29).wrapping_add(5) % 247) as u8)
+            .collect();
+        let entry = volume.write_file("JUMPS.BIN", &contents).unwrap();
+
+        // Prove the chain really does jump before trusting what follows.
+        let mut cluster = entry.first_cluster;
+        let mut jumped = false;
+        while let harlan_hal::fat::Entry::Next(next) = volume.next_cluster(cluster).unwrap() {
+            if next != cluster + 1 {
+                jumped = true;
+            }
+            cluster = next;
+        }
+        assert!(
+            jumped,
+            "this test is worthless unless the chain is fragmented"
+        );
+
+        // Whole, in pieces, and one byte at a time across the jump.
+        let mut whole = vec![0u8; contents.len()];
+        assert_eq!(
+            volume.read_file(&entry, &mut whole).unwrap(),
+            contents.len()
+        );
+        assert_eq!(whole, contents, "whole");
+
+        for piece in [1usize, 512, 1024, 1536, 9000] {
+            let mut rebuilt = Vec::new();
+            let mut buffer = vec![0u8; piece];
+            loop {
+                let got = volume
+                    .read_at(&entry, rebuilt.len() as u32, &mut buffer)
+                    .unwrap();
+                if got == 0 {
+                    break;
+                }
+                rebuilt.extend_from_slice(&buffer[..got]);
+            }
+            assert_eq!(rebuilt, contents, "pieces of {piece} across a jump");
+        }
+
+        let mut one = [0u8; 1];
+        for (at, want) in contents.iter().enumerate() {
+            assert_eq!(volume.read_at(&entry, at as u32, &mut one).unwrap(), 1);
+            assert_eq!(one[0], *want, "offset {at} across a jump");
+        }
+
+        // And the file on the far side of the hole was not read over.
+        let wall = volume.find("WALL.BIN").unwrap().unwrap();
+        let mut bytes = [0u8; 1024];
+        assert_eq!(volume.read_file(&wall, &mut bytes).unwrap(), 1024);
+        assert!(bytes.iter().all(|byte| *byte == 2), "WALL.BIN is intact");
+    }
 }

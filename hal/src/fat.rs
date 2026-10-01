@@ -583,6 +583,92 @@ impl<S: Sectors> Volume<S> {
         }
         Ok(written)
     }
+
+    /// Reads at most `into.len()` bytes starting `offset` bytes into the
+    /// file, and answers how many landed there.
+    ///
+    /// This is what a file descriptor is built on (ADR 0028): fewer bytes
+    /// than asked for means the file ended, and **zero means `offset` is
+    /// at or past the end**, which is how a reader knows it is done. Both
+    /// are answers, not errors.
+    ///
+    /// An offset past the end is not a mistake worth refusing. A program
+    /// that has read a file to its end and asks once more gets zero, which
+    /// is the one thing every reading loop already knows how to handle.
+    pub fn read_at(
+        &mut self,
+        entry: &DirectoryEntry,
+        offset: u32,
+        into: &mut [u8],
+    ) -> Result<usize, VolumeError<S::Error>> {
+        if offset >= entry.size {
+            return Ok(0);
+        }
+        let want = ((entry.size - offset) as usize).min(into.len());
+        if want == 0 {
+            return Ok(0);
+        }
+
+        let per_cluster = u32::from(self.boot.sectors_per_cluster) * u32::from(SECTOR_BYTES);
+        let mut cluster = entry.first_cluster;
+        let mut seen = 0;
+
+        // Walk to the cluster holding `offset`. A chain is the only way to
+        // find it: FAT has no index, which is why reading the end of a
+        // large file costs a walk and why `read` is a long syscall
+        // (ADR 0028, last consequence).
+        for _ in 0..(offset / per_cluster) {
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops);
+            }
+            match self.next_cluster(cluster)? {
+                Entry::Next(next) => cluster = next,
+                // The directory says the file reaches this far and the
+                // table says it does not. Believing the directory would
+                // mean reading somebody else's cluster.
+                entry => return Err(VolumeError::BrokenChain { cluster, entry }),
+            }
+        }
+
+        // Where inside that cluster the first wanted byte is.
+        let mut inside = offset % per_cluster;
+        let mut written = 0;
+        while written < want {
+            let first = self
+                .boot
+                .sector_of_cluster(cluster)
+                .ok_or(VolumeError::BadCluster { cluster })?;
+            let mut sector = inside / u32::from(SECTOR_BYTES);
+            let mut within = (inside % u32::from(SECTOR_BYTES)) as usize;
+            while written < want && sector < u32::from(self.boot.sectors_per_cluster) {
+                let mut bytes = [0u8; 512];
+                self.sectors
+                    .read_sector(first + sector, &mut bytes)
+                    .map_err(VolumeError::Device)?;
+                let taking = (want - written).min(512 - within);
+                into[written..written + taking].copy_from_slice(&bytes[within..within + taking]);
+                written += taking;
+                sector += 1;
+                // Only the first sector starts part of the way in.
+                within = 0;
+            }
+            if written == want {
+                break;
+            }
+            // Every cluster after the first starts at its beginning.
+            inside = 0;
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops);
+            }
+            match self.next_cluster(cluster)? {
+                Entry::Next(next) => cluster = next,
+                entry => return Err(VolumeError::BrokenChain { cluster, entry }),
+            }
+        }
+        Ok(written)
+    }
 }
 
 // ---------------------------------------------------------------------
