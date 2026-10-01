@@ -1,12 +1,114 @@
 # Notas de Fase 4 — Almacenamiento y shell
 
-Lo más reciente arriba. Salida de la fase (ROADMAP.md): arrancar, leer y
-escribir ficheros desde una shell de usuario.
+Lo más reciente arriba. Salida de la fase (ROADMAP.md): **crear, leer y
+persistir un archivo entre reinicios** — cumplida en el Incremento 32, con
+diez arranques seguidos sobre el mismo disco contando cuántos van.
 
 Decisiones de alcance tomadas al abrir la fase: **virtio-blk** como primer
 driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
+
+## Incremento 32 — Escribir, y que lo escrito siga ahí
+
+`docs/adr/0027-fase4-fat32-write.md`. **La salida de Fase 4**: *crear, leer
+y persistir un archivo entre reinicios.*
+
+Leer mal da una respuesta equivocada y se nota al momento. Escribir mal
+deja un disco roto que se descubre después, y con él se pierde lo que
+hubiera dentro.
+
+### Qué hace
+
+- **Crear, extender y sobrescribir un fichero en el directorio raíz.** Ni
+  borrar, ni truncar, ni subdirectorios: lo que la salida de fase necesita.
+- **El orden, que es la decisión entera**: primero los datos, después la
+  cadena, y el directorio **al final, en una sola escritura de un sector**.
+  Cada paso deja el volumen en un estado que otro lector entiende. Escribir
+  en clusters que ninguna cadena nombra no cambia nada; escribir la cadena
+  deja, en el peor caso, clusters ocupados que no son de nadie —una cadena
+  perdida, que `fsck` sabe nombrar—; y la entrada del directorio es lo que
+  hace aparecer el fichero. Al revés, un corte deja un directorio que
+  apunta a clusters que todavía no son suyos: un disco que miente.
+- **Las dos tablas se escriben las dos.** Un volumen cuyas tablas no
+  coinciden es el que todo lo demás llama dañado.
+- **Si no hay clusters libres suficientes, no se escribe nada.** Se reserva
+  antes de tocar un byte: un fichero a medias porque el disco se llenó es
+  peor que un fichero que no está.
+- **Lo que un fichero no llena se pone a cero**, no se deja como estaba.
+  Devolver lo que era de otro es como un disco filtra.
+- **Los clusters del fichero viejo se liberan después** de que el
+  directorio diga el tamaño nuevo, por la misma razón que el orden de
+  arriba.
+- **La imagen deja de reescribirse en cada arranque.** Pasa a ser una
+  salida de `build`: si se rehiciera antes de cada arranque, borraría justo
+  lo que hay que demostrar.
+
+### Verificación ejecutada: la salida de fase
+
+Diez arranques seguidos sobre **el mismo disco**:
+
+```
+this is boot 10; BOOTS.TXT said 9 and now says 10, in 2 byte(s) from cluster 22
+```
+
+El fichero lo creó el primer arranque y lo leyó el segundo, con nada entre
+ellos salvo el disco. El número solo crece porque lo escrito sobrevivió.
+
+- **7-Zip, sobre la imagen después de que el kernel escribiera en ella**:
+  cinco ficheros, `Everything is Ok`, y `BOOTS.TXT` contiene el número que
+  el registro dice. Es la regla del ADR 0025 punto 5 aplicada al escritor:
+  lo que este kernel escribe lo lee otro.
+- **`fsck.vfat` en CI pasa a comprobar dos imágenes**: la que `xtask`
+  dispone, y —en el trabajo de arranque, después de once arranques— la que
+  el kernel ha estado escribiendo. Ahí es donde un escritor se gana el
+  sueldo.
+- Host: 330 pruebas (318 + 12), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 17, las 17 detectadas — **después de arreglar seis pruebas**.
+
+### Seis mutaciones que sobrevivieron, y lo que decían
+
+La primera vuelta detectó 11 de 17. Los seis supervivientes no eran código
+malo: eran pruebas mías que solo recorrían el camino feliz.
+
+1. **Un nombre en minúsculas se guardaba tal cual**: ninguna prueba
+   escribía uno.
+2. **Los cuatro bits reservados de una entrada se machacaban**: ninguna
+   prueba los tenía puestos.
+3. **Una entrada fuera del volumen se escribía igual.** Esta era distinta:
+   la comprobación era **inalcanzable** desde dentro del módulo, porque
+   todos los llamantes acotan su cluster antes. En vez de quitarla, la
+   operación pasó a ser pública: así la guarda está donde se puede confiar
+   en ella y donde una prueba la alcanza.
+4. **Un fichero a medias cuando el disco se llena**: ninguna prueba llenaba
+   el disco. Ahora una marca todas las entradas de las dos tablas a mano y
+   comprueba que el directorio no se toca.
+5. **Lo que un fichero no llena se quedaba como estaba**: hay que poner
+   basura en un cluster libre y comprobar que desaparece.
+6. **Una entrada reescrita conservaba campos de la vieja**: las fechas, que
+   este kernel no usa, seguían diciendo algo de un fichero que ya no
+   estaba.
+
+Dos de esas pruebas las escribí mal a la primera, y el fallo enseñó cosas
+del código: la primera entrada del raíz es la **etiqueta del volumen**, no
+un fichero; y escribir **reserva antes de liberar**, así que un fichero
+reescrito no cae en el cluster del que sustituye.
+
+### Riesgos y límites
+
+- **Sin journal y sin barreras.** Un corte entre dos sectores deja lo que
+  el orden permite y nada peor: en el peor caso, clusters ocupados que no
+  son de nadie. Este kernel no promete atomicidad; promete que el peor caso
+  es recuperable.
+- **Primer hueco, buscando desde el principio de la tabla**, sin mapa de
+  bits. Es lento y no tiene estado que mantener de acuerdo con el disco.
+- **Solo el directorio raíz, solo 8.3, y el fichero entero de una vez.**
+  Escribir a trozos exige saber dónde se quedó, y eso es un descriptor de
+  fichero.
+- **El kernel puede ahora dejar un disco peor de lo que lo encontró.** Es
+  la primera vez, y es la razón de que el orden sea una decisión y no un
+  detalle.
 
 ## Incremento 31 — Los programas de usuario pasan a ser programas
 

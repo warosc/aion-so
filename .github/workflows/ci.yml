@@ -64,13 +64,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - name: Install QEMU
+      - name: Install QEMU and dosfstools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y qemu-system-x86 dosfstools
       - run: cargo xtask boot-test --timeout-secs 30 --repeat 10
       # Quoted: an unquoted ": " inside the marker would break the YAML.
       - run: 'cargo xtask boot-test --timeout-secs 120 --heap-stress --marker "HARLAN: heap stress complete, 200000 cycles"'
+      # The disk after the kernel has written to it, eleven boots' worth.
+      # The other job checks the image this repository lays out; this one
+      # checks what the kernel did to it, which is where a writer earns
+      # its keep (docs/adr/0027-fase4-fat32-write.md, point 10).
+      - name: The disk the kernel wrote is still a FAT32 volume
+        run: fsck.vfat -n -V target/disk.img
 
   soak-test:
     needs: build-freestanding
