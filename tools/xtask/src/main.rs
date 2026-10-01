@@ -21,6 +21,20 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// of the freestanding boot chain. Override with `--marker` to check the
 /// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
 const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
+
+/// What the program in ring 3 says when every one of its file checks
+/// passed (user/hello/src/main.rs, docs/adr/0028-fase4-file-abi-v0.md).
+///
+/// Checked as well as the boot marker, because the shell comes up whether
+/// or not a program could read a file: a boot that only reaches the marker
+/// is a boot that proves the kernel got that far and nothing about the
+/// ABI.
+const RING3_FILE_MARKER: &str = "HARLAN: ring3-file ALL OK";
+
+/// What it says when one of them did not. Looked for because its absence
+/// is not evidence on its own — a program that dies before its last check
+/// prints no verdict at all — but its presence is proof of a failure.
+const RING3_FILE_FAILED: &str = "HARLAN: ring3-file FAILED";
 /// Guest RAM the frame allocator's fixed bitmap is sized for (see
 /// kernel::memory::FRAME_BITMAP_WORDS). More RAM boots too; the frames
 /// above the covered range are ignored and logged.
@@ -194,8 +208,15 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
 /// where a user program lives.
 const USER_PACKAGE: &str = "harlan-hello";
 const USER_BINARY: &str = "hello";
-const USER_RUSTFLAGS: &str =
-    "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000";
+const USER_RUSTFLAGS: &str = concat!(
+    "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000",
+    // Without this, a program of 2.9 KB of code ships with 750 KB of
+    // DWARF that nothing on this machine can read: the kernel loads the
+    // PT_LOAD segments and nothing else. It is the on-disk size that
+    // matters, because the kernel reads the whole file into a fixed buffer
+    // before parsing it, and refuses one that does not fit.
+    " -C strip=debuginfo",
+);
 /// What it is called on the disk. Eight and three, like everything else
 /// there (ADR 0025).
 const USER_ON_DISK: &str = "HELLO.ELF";
@@ -670,6 +691,29 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
             "boot-test: marker {marker:?} observed after {:?}",
             start.elapsed()
         );
+        // Only when the boot was not asked to look for something else:
+        // a `--marker` of its own means somebody is testing one stage, and
+        // the ring-3 program may not have run at all.
+        if marker == DEFAULT_MARKER {
+            let log = fs::read_to_string(&log_path).context("failed to re-read the boot log")?;
+            if log.contains(RING3_FILE_FAILED) {
+                let which: Vec<&str> = log
+                    .lines()
+                    .filter(|line| line.contains(RING3_FILE_FAILED))
+                    .collect();
+                bail!(
+                    "boot-test: the program in ring 3 failed a file check:\n  {}",
+                    which.join("\n  ")
+                );
+            }
+            if !log.contains(RING3_FILE_MARKER) {
+                bail!(
+                    "boot-test: {RING3_FILE_MARKER:?} is not in the log, so the program in ring 3 did not finish its file checks (see {})",
+                    log_path.display()
+                );
+            }
+            println!("boot-test: the program in ring 3 passed every file check");
+        }
         Ok(())
     } else {
         bail!(
