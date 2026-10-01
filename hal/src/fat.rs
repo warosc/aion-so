@@ -954,13 +954,32 @@ impl<S: Sectors> Volume<S> {
             return Ok(());
         }
 
+        // A sector at a time, not an entry at a time. `next_cluster` reads
+        // a whole sector to look at four bytes of it, which for a volume
+        // of 129 022 clusters is 129 022 trips to the disk to read the
+        // same thousand sectors over and over — eight seconds of boot,
+        // measured. Read each sector once and look at all 128 entries.
+        const PER_SECTOR: u32 = 512 / 4;
+        let last = FIRST_DATA_CLUSTER + self.boot.clusters - 1;
+        let table = self.boot.first_fat_sector();
         let mut free: u32 = 0;
         let mut first_free: u32 = 0;
-        for cluster in FIRST_DATA_CLUSTER..FIRST_DATA_CLUSTER + self.boot.clusters {
-            if self.next_cluster(cluster)? == Entry::Free {
-                free += 1;
-                if first_free == 0 {
-                    first_free = cluster;
+        let mut entry_bytes = [0u8; 512];
+        for sector in (FIRST_DATA_CLUSTER / PER_SECTOR)..=(last / PER_SECTOR) {
+            self.sectors
+                .read_sector(table + sector, &mut entry_bytes)
+                .map_err(VolumeError::Device)?;
+            let (entries, _) = entry_bytes.as_chunks::<4>();
+            for (at, entry) in entries.iter().enumerate() {
+                let cluster = sector * PER_SECTOR + at as u32;
+                if cluster < FIRST_DATA_CLUSTER || cluster > last {
+                    continue;
+                }
+                if u32::from_le_bytes(*entry) & ENTRY_MASK == 0 {
+                    free += 1;
+                    if first_free == 0 {
+                        first_free = cluster;
+                    }
                 }
             }
         }

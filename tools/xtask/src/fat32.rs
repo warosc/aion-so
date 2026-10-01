@@ -1317,4 +1317,71 @@ mod tests {
             "refused here, so the loader is never asked to find its last page"
         );
     }
+
+    /// What FSInfo ends up saying, against the same count made one entry
+    /// at a time.
+    ///
+    /// `update_fs_info` reads the table a sector at a time and turns a
+    /// position inside the sector back into a cluster number. That is the
+    /// arithmetic that is off by one and still looks plausible, so it is
+    /// pinned to `next_cluster`, which reads a single entry and has
+    /// nowhere to be wrong.
+    #[test]
+    fn fs_info_says_what_counting_one_entry_at_a_time_says() {
+        let mut volume = volume();
+        // Write something, so FSInfo is rewritten rather than left as the
+        // formatter wrote it.
+        volume.write_file("COUNT.BIN", &[7u8; 3000]).unwrap();
+
+        let clusters = volume.boot_sector().clusters;
+        let mut free = 0u32;
+        let mut first_free = 0u32;
+        for cluster in
+            harlan_hal::fat::FIRST_DATA_CLUSTER..harlan_hal::fat::FIRST_DATA_CLUSTER + clusters
+        {
+            if volume.next_cluster(cluster).unwrap() == harlan_hal::fat::Entry::Free {
+                free += 1;
+                if first_free == 0 {
+                    first_free = cluster;
+                }
+            }
+        }
+
+        let at = u32::from(volume.boot_sector().fs_info_sector);
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), at, &mut bytes).unwrap();
+        let said_free = u32::from_le_bytes([bytes[488], bytes[489], bytes[490], bytes[491]]);
+        let said_next = u32::from_le_bytes([bytes[492], bytes[493], bytes[494], bytes[495]]);
+        assert_eq!(said_free, free, "how many are free");
+        assert_eq!(said_next, first_free, "which one is the first free");
+        // And the hint has to be worth something: not every cluster, and
+        // not none of them.
+        assert!(free > 0 && free < clusters);
+    }
+
+    /// The sector walk must not count the two reserved entries, nor any
+    /// entry past the last cluster, however many of those share the last
+    /// sector of the table.
+    #[test]
+    fn the_sector_walk_counts_only_real_clusters() {
+        let mut volume = volume();
+        volume.write_file("EDGE.BIN", b"edge").unwrap();
+
+        let clusters = volume.boot_sector().clusters;
+        let at = u32::from(volume.boot_sector().fs_info_sector);
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), at, &mut bytes).unwrap();
+        let said_free = u32::from_le_bytes([bytes[488], bytes[489], bytes[490], bytes[491]]);
+
+        // Entries 0 and 1 are the signature and the dirty flag, never
+        // free, and the entries after the last cluster are padding. If
+        // either were counted the total would be above the cluster count.
+        assert!(
+            said_free <= clusters,
+            "{said_free} free of {clusters} clusters: something outside the volume was counted"
+        );
+        // And the first free one is never a reserved entry.
+        let said_next = u32::from_le_bytes([bytes[492], bytes[493], bytes[494], bytes[495]]);
+        assert!(said_next >= harlan_hal::fat::FIRST_DATA_CLUSTER);
+    }
 }
