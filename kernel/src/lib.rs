@@ -908,28 +908,28 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                 let mut boot_sector = [0u8; 512];
                 // SAFETY: the reader owns its queue and its request frame,
                 // and nothing else has a request in flight.
-                match unsafe { reader.read_sector(disk, 0, &mut boot_sector) } {
-                    Ok(()) => match harlan_hal::fat::BootSector::parse(&boot_sector) {
-                        Ok(volume) => {
-                            info!(
-                                "HARLAN: the disk holds FAT32: {} sector(s) of {} byte(s), {} cluster(s) of {} sector(s), {} table(s) of {} sector(s) from sector {}, root at cluster {} (sector {:?}), data from sector {}",
-                                volume.total_sectors,
-                                volume.bytes_per_sector,
-                                volume.clusters,
-                                volume.sectors_per_cluster,
-                                volume.fat_count,
-                                volume.sectors_per_fat,
-                                volume.first_fat_sector(),
-                                volume.root_cluster,
-                                volume.sector_of_cluster(volume.root_cluster),
-                                volume.first_data_sector()
-                            );
-                            check_backup_boot_sector(disk, &mut reader, &volume, &boot_sector);
-                        }
-                        Err(err) => {
-                            error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
-                        }
-                    },
+                let first = unsafe { reader.read_sector(disk, 0, &mut boot_sector) };
+                match first.map(|()| harlan_hal::fat::BootSector::parse(&boot_sector)) {
+                    Ok(Ok(volume)) => {
+                        info!(
+                            "HARLAN: the disk holds FAT32: {} sector(s) of {} byte(s), {} cluster(s) of {} sector(s), {} table(s) of {} sector(s) from sector {}, root at cluster {} (sector {:?}), data from sector {}",
+                            volume.total_sectors,
+                            volume.bytes_per_sector,
+                            volume.clusters,
+                            volume.sectors_per_cluster,
+                            volume.fat_count,
+                            volume.sectors_per_fat,
+                            volume.first_fat_sector(),
+                            volume.root_cluster,
+                            volume.sector_of_cluster(volume.root_cluster),
+                            volume.first_data_sector()
+                        );
+                        check_backup_boot_sector(disk, &mut reader, &volume, &boot_sector);
+                        read_a_file(disk, reader);
+                    }
+                    Ok(Err(err)) => {
+                        error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
+                    }
                     Err(err) => error!("HARLAN: the boot sector could not be read ({err:?})"),
                 }
             }
@@ -1138,6 +1138,122 @@ fn banner(console: &mut dyn Console) {
     console.write_str(ARCH_NAME);
     console.write_str("\n");
     console.write_str("Kernel.......... READY\n\n");
+}
+
+/// The disk, as something a filesystem can ask for sectors.
+///
+/// The reader does not know it is talking to virtio, and the disk does not
+/// know it is holding a filesystem. That is what lets the whole of the FAT
+/// code be tested in host against an image in memory.
+struct DiskSectors<'a> {
+    disk: &'a devices::virtio_blk::Disk,
+    reader: devices::virtio_blk::Reader,
+}
+
+impl harlan_hal::fat::Sectors for DiskSectors<'_> {
+    type Error = devices::virtio_blk::ReadError;
+
+    fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), Self::Error> {
+        // SAFETY: the reader owns its queue and its request frame, and
+        // this is the only thing using it: a request is never in flight
+        // when another starts, because this returns before the next call.
+        unsafe { self.reader.read_sector(self.disk, u64::from(sector), into) }
+    }
+}
+
+/// Lists the root directory and reads one file off it, which is as far as
+/// a filesystem has to work before a shell can use it.
+fn read_a_file(disk: &devices::virtio_blk::Disk, reader: devices::virtio_blk::Reader) {
+    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
+        Ok(volume) => volume,
+        Err(err) => {
+            error!("HARLAN: the volume could not be mounted ({err:?})");
+            return;
+        }
+    };
+
+    let mut files = 0;
+    if let Err(err) = volume.read_root(|entry| {
+        files += 1;
+        info!(
+            "HARLAN:   {} — {} byte(s){}, from cluster {}",
+            entry.name(),
+            entry.size,
+            if entry.is_directory() {
+                ", a directory"
+            } else {
+                ""
+            },
+            entry.first_cluster
+        );
+        true
+    }) {
+        error!("HARLAN: the root directory could not be read ({err:?})");
+        return;
+    }
+    info!("HARLAN: {files} thing(s) in the root directory");
+
+    // One of them, read through its chain and checked against what xtask
+    // put there. "It read something" and "it read the right thing" are
+    // different answers.
+    const NAME: &str = "HELLO.TXT";
+    const EXPECTED: &str = "HARLAN reads its own disk.\n";
+    let entry = match volume.find(NAME) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            error!("HARLAN: there is no {NAME} on the disk");
+            return;
+        }
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+    let mut bytes = [0u8; 512];
+    match volume.read_file(&entry, &mut bytes) {
+        Ok(read) => {
+            let text = core::str::from_utf8(&bytes[..read]).unwrap_or("not text");
+            if text == EXPECTED {
+                info!(
+                    "HARLAN: {NAME} is {read} byte(s) and reads {:?}, which is what is in it",
+                    text.trim_end()
+                );
+            } else {
+                error!("HARLAN: {NAME} reads {text:?}, and {EXPECTED:?} is what is in it");
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be read ({err:?})"),
+    }
+
+    // And a longer one, to show the chain really is followed: four
+    // clusters and a byte, so a reader that stopped at a cluster boundary
+    // or ran past the file's length would not match.
+    const LONG: &str = "LONG.BIN";
+    match volume.find(LONG) {
+        Ok(Some(entry)) => {
+            let mut bytes = [0u8; 4096];
+            match volume.read_file(&entry, &mut bytes) {
+                Ok(read) => {
+                    let right = read == entry.size as usize
+                        && bytes[..read]
+                            .iter()
+                            .enumerate()
+                            .all(|(at, byte)| *byte == (at % 251) as u8);
+                    if right {
+                        info!(
+                            "HARLAN: {LONG} is {read} byte(s) across {} cluster(s), every one of them what it should be",
+                            read.div_ceil(volume.boot_sector().cluster_bytes() as usize)
+                        );
+                    } else {
+                        error!("HARLAN: {LONG} read {read} byte(s) and they are not what is in it");
+                    }
+                }
+                Err(err) => error!("HARLAN: {LONG} could not be read ({err:?})"),
+            }
+        }
+        Ok(None) => error!("HARLAN: there is no {LONG} on the disk"),
+        Err(err) => error!("HARLAN: {LONG} could not be looked up ({err:?})"),
+    }
 }
 
 /// Reads the copy of the boot sector FAT32 keeps further in, and checks it

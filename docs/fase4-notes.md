@@ -8,6 +8,95 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 30 — Un fichero, leído por su nombre
+
+`docs/adr/0025-fase4-fat32-read-only.md`, que ya estaba decidido. Esto es
+el resto del camino: de la tabla de asignación y el directorio raíz a los
+bytes de un fichero.
+
+### Qué hace
+
+- **La tabla**, con las cuatro cosas que una entrada puede decir: libre,
+  reservada, sigue en otro cluster, medio defectuoso, o fin de cadena.
+  Solo los 28 bits bajos son el número de cluster —los cuatro altos están
+  reservados y hay que enmascararlos—, y **todo lo que va de `0x0FFFFFF8`
+  arriba termina una cadena**, no solo el valor que escribe un formateador;
+  un lector que comparase por igualdad se saldría del disco al leer uno
+  escrito por otra herramienta.
+- **El directorio**, con lo que no es un fichero: la entrada que termina el
+  directorio, las borradas, los fragmentos de nombre largo y la etiqueta
+  del volumen. El nombre 8.3 recupera su punto, que la entrada no guarda, y
+  se compara sin distinguir mayúsculas porque nadie los escribe como se
+  almacenan.
+- **`Volume` sobre un rasgo `Sectors`**: un disco en el kernel, una imagen
+  en una prueba. El lector no sabe que habla con virtio y el disco no sabe
+  que guarda un sistema de ficheros.
+- **Un fichero se lee hasta donde dice su longitud**, no hasta donde acaba
+  su último cluster: lo que hay después del final de un fichero dentro de
+  su cluster es lo que hubiera antes.
+- **Una cadena rota es un error con nombre**, no un fichero corto: si la
+  cadena acaba antes que el fichero, el directorio y la tabla no están de
+  acuerdo y eso se dice. Y una cadena más larga que el volumen se
+  abandona, porque se apunta a sí misma.
+
+### La prueba que vale
+
+`xtask` escribe la imagen y `hal` la lee; ninguna de las dos cosas sirve
+sin la otra, así que la prueba de que se entienden vive donde están las
+dos. `xtask` pasa a depender de `harlan-hal` **solo en `dev-dependencies`**
+y monta en memoria la imagen que acaba de formatear.
+
+El camino entero —sector de arranque, directorio raíz, tabla, bytes— se
+recorre así en una prueba de host, contra los mismos bytes que recibe
+QEMU. Lo que antes solo podía fallar en un arranque ahora falla en medio
+segundo.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+    HELLO.TXT — 27 byte(s), from cluster 3
+    LONG.BIN — 2049 byte(s), from cluster 4
+    EMPTY.BIN — 0 byte(s), from cluster 0
+  3 thing(s) in the root directory
+  HELLO.TXT is 27 byte(s) and reads "HARLAN reads its own disk.", which is
+  what is in it
+  LONG.BIN is 2049 byte(s) across 5 cluster(s), every one of them what it
+  should be
+  ```
+
+  Tres cosas en el directorio y no cuatro: la etiqueta del volumen no es un
+  fichero. `LONG.BIN` son cuatro clusters y un byte, así que un lector que
+  parase en el límite de un cluster, o que leyera hasta el final del
+  último, no daría esos 2049 bytes correctos.
+- **Prueba negativa**: liberando el segundo cluster de la cadena de
+  `LONG.BIN` en la imagen, el kernel dice
+  `could not be read (BrokenChain { cluster: 5, entry: Free })` —y sigue
+  hasta el shell—. Mira lo que dice cada entrada en vez de limitarse a
+  seguirla.
+- Host: 309 pruebas (299 + 10), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 19, las 19 detectadas. Dos sobrevivieron primero:
+  - **Que una cadena rota se leyera como un fichero completo.** Ninguna
+    prueba de host rompía una cadena; solo lo hacía la sonda de arranque.
+    Añadida una que corrompe la imagen y comprueba el error exacto.
+  - **Quitar el atajo del fichero vacío no cambiaba nada**, porque el bucle
+    ya no se ejecuta cuando la longitud es cero. Era una rama que ninguna
+    prueba podía tomar, así que se ha ido y su razón está donde está el
+    bucle.
+
+### Riesgos y límites
+
+- **Solo el directorio raíz**: no se baja a subdirectorios. La estructura
+  es la misma —un directorio es una cadena como cualquier fichero— y lo que
+  falta es el camino, no el mecanismo.
+- **Sin nombres largos**, 8.3 y nada más.
+- **Solo lectura**: nada escribe en el disco.
+- Un fichero se lee entero en un buffer que el llamante da. Para un fichero
+  grande hará falta leerlo a trozos, que es la misma cadena recorrida desde
+  un punto.
+
 ## Incremento 29 — El disco con un sistema de ficheros de verdad
 
 `docs/adr/0025-fase4-fat32-read-only.md`. El kernel lee sectores; un sector
