@@ -377,6 +377,11 @@ pub trait Sectors {
 
     /// Reads one 512-byte sector.
     fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), Self::Error>;
+
+    /// Writes one. A source that cannot — an image a test only reads —
+    /// says so with an error of its own rather than pretending
+    /// (docs/adr/0027-fase4-fat32-write.md).
+    fn write_sector(&mut self, sector: u32, from: &[u8; 512]) -> Result<(), Self::Error>;
 }
 
 /// What can go wrong reading a volume, beyond what the device itself says.
@@ -418,6 +423,12 @@ impl<S: Sectors> Volume<S> {
 
     pub const fn boot_sector(&self) -> &BootSector {
         &self.boot
+    }
+
+    /// The sectors underneath, for whoever needs to look at the volume as
+    /// bytes rather than as files — a test comparing the two tables, say.
+    pub const fn sectors_mut(&mut self) -> &mut S {
+        &mut self.sectors
     }
 
     /// What the table says follows `cluster`.
@@ -561,6 +572,333 @@ impl<S: Sectors> Volume<S> {
         Ok(written)
     }
 }
+
+// ---------------------------------------------------------------------
+// Writing (docs/adr/0027-fase4-fat32-write.md)
+// ---------------------------------------------------------------------
+
+/// The most clusters one file may take. A limit, so that running out is an
+/// error with a name rather than a loop that walks a whole volume.
+pub const MAX_FILE_CLUSTERS: usize = 64;
+
+/// What a name looks like in a directory entry: eight characters and
+/// three, space-padded, upper case, with no dot between them.
+///
+/// `None` for a name that would not fit, because a name of the wrong
+/// length does not get truncated into somebody else's file — it gets
+/// refused.
+pub fn encode_name(name: &str) -> Option<[u8; 11]> {
+    let (base, extension) = match name.split_once('.') {
+        Some((base, extension)) => (base, extension),
+        None => (name, ""),
+    };
+    if base.is_empty() || base.len() > 8 || extension.len() > 3 {
+        return None;
+    }
+    let mut encoded = [b' '; 11];
+    for (at, byte) in base.bytes().enumerate() {
+        if !byte.is_ascii() || byte == b' ' {
+            return None;
+        }
+        encoded[at] = byte.to_ascii_uppercase();
+    }
+    for (at, byte) in extension.bytes().enumerate() {
+        if !byte.is_ascii() || byte == b' ' {
+            return None;
+        }
+        encoded[8 + at] = byte.to_ascii_uppercase();
+    }
+    Some(encoded)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError<E> {
+    /// Everything reading can go wrong with.
+    Reading(VolumeError<E>),
+    /// The device could not write a sector.
+    Device(E),
+    /// A name that does not fit in eight and three.
+    BadName,
+    /// More clusters than one file may take here.
+    TooManyClusters { needed: usize },
+    /// The volume has not got that many free.
+    Full { needed: usize, free: usize },
+    /// The root directory has no slot left for another file.
+    DirectoryFull,
+}
+
+impl<E> From<VolumeError<E>> for WriteError<E> {
+    fn from(err: VolumeError<E>) -> Self {
+        WriteError::Reading(err)
+    }
+}
+
+impl<S: Sectors> Volume<S> {
+    /// Writes one entry of the table, in **every** copy of it.
+    ///
+    /// A volume whose tables disagree is one a checker calls damaged, and
+    /// keeping them the same costs one more sector written
+    /// (ADR 0027, point 4).
+    ///
+    /// A cluster the volume has not got is refused. Every caller inside
+    /// this module bounds its cluster before getting here, so the check
+    /// would be unreachable if this were private — it is part of the
+    /// surface instead, where it can be relied on and taken.
+    pub fn set_next_cluster(
+        &mut self,
+        cluster: u32,
+        entry: u32,
+    ) -> Result<(), WriteError<S::Error>> {
+        if cluster < FIRST_DATA_CLUSTER || cluster >= FIRST_DATA_CLUSTER + self.boot.clusters {
+            return Err(VolumeError::BadCluster { cluster }.into());
+        }
+        let per_sector = u32::from(self.boot.bytes_per_sector) / 4;
+        let offset = (cluster % per_sector) as usize * 4;
+        for table in 0..u32::from(self.boot.fat_count) {
+            let sector = self.boot.first_fat_sector()
+                + table * self.boot.sectors_per_fat
+                + cluster / per_sector;
+            let mut bytes = [0u8; 512];
+            self.sectors
+                .read_sector(sector, &mut bytes)
+                .map_err(VolumeError::Device)?;
+            // The top four bits of an entry are reserved and belong to
+            // whatever was there: only the low twenty-eight are ours.
+            let kept = u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) & !ENTRY_MASK;
+            bytes[offset..offset + 4].copy_from_slice(&(kept | (entry & ENTRY_MASK)).to_le_bytes());
+            self.sectors
+                .write_sector(sector, &bytes)
+                .map_err(WriteError::Device)?;
+        }
+        Ok(())
+    }
+
+    /// Finds `count` free clusters, from the start of the table.
+    ///
+    /// No bitmap and no memory of where it got to: a bitmap is state that
+    /// has to be kept in step with the disk and rebuilt on every boot
+    /// (ADR 0027, point 7). Nothing is written here — if there are not
+    /// enough, nothing has been touched.
+    fn free_clusters(
+        &mut self,
+        count: usize,
+    ) -> Result<[u32; MAX_FILE_CLUSTERS], WriteError<S::Error>> {
+        if count > MAX_FILE_CLUSTERS {
+            return Err(WriteError::TooManyClusters { needed: count });
+        }
+        let mut found = [0u32; MAX_FILE_CLUSTERS];
+        let mut at = 0;
+        let mut cluster = FIRST_DATA_CLUSTER;
+        while at < count && cluster < FIRST_DATA_CLUSTER + self.boot.clusters {
+            if self.next_cluster(cluster)? == Entry::Free {
+                found[at] = cluster;
+                at += 1;
+            }
+            cluster += 1;
+        }
+        if at < count {
+            return Err(WriteError::Full {
+                needed: count,
+                free: at,
+            });
+        }
+        Ok(found)
+    }
+
+    /// Writes `contents` into the clusters of `chain`, which must be as
+    /// many as the contents need.
+    fn write_clusters(
+        &mut self,
+        chain: &[u32],
+        contents: &[u8],
+    ) -> Result<(), WriteError<S::Error>> {
+        let per_cluster = self.boot.cluster_bytes() as usize;
+        for (index, cluster) in chain.iter().enumerate() {
+            let first = self
+                .boot
+                .sector_of_cluster(*cluster)
+                .ok_or(VolumeError::BadCluster { cluster: *cluster })?;
+            for offset in 0..u32::from(self.boot.sectors_per_cluster) {
+                let at = index * per_cluster + offset as usize * 512;
+                if at >= contents.len() {
+                    break;
+                }
+                let taking = (contents.len() - at).min(512);
+                // The rest of the last sector is zeroed rather than left
+                // as it was: what a file does not fill is nobody's, and
+                // handing back what used to be somebody else's is how a
+                // disk leaks.
+                let mut bytes = [0u8; 512];
+                bytes[..taking].copy_from_slice(&contents[at..at + taking]);
+                self.sectors
+                    .write_sector(first + offset, &bytes)
+                    .map_err(WriteError::Device)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the entry for `name` is in the root directory, or where a new
+    /// one would go.
+    ///
+    /// Answers the sector and the offset in it, and whether something was
+    /// already there — overwriting reuses the entry so that a file does
+    /// not appear twice.
+    fn directory_slot(
+        &mut self,
+        name: &[u8; 11],
+    ) -> Result<(u32, usize, Option<DirectoryEntry>), WriteError<S::Error>> {
+        let mut cluster = self.boot.root_cluster;
+        let mut free = None;
+        loop {
+            let first = self
+                .boot
+                .sector_of_cluster(cluster)
+                .ok_or(VolumeError::BadCluster { cluster })?;
+            for offset in 0..u32::from(self.boot.sectors_per_cluster) {
+                let sector = first + offset;
+                let mut bytes = [0u8; 512];
+                self.sectors
+                    .read_sector(sector, &mut bytes)
+                    .map_err(VolumeError::Device)?;
+                let (slots, _) = bytes.as_chunks::<DIRECTORY_ENTRY_BYTES>();
+                for (index, slot) in slots.iter().enumerate() {
+                    let at = index * DIRECTORY_ENTRY_BYTES;
+                    match decode_slot(slot) {
+                        Slot::Entry(entry) if slot[..11] == name[..] => {
+                            return Ok((sector, at, Some(entry)));
+                        }
+                        Slot::Entry(_) => {}
+                        Slot::Skip if free.is_none() && slot[0] == ENTRY_DELETED => {
+                            free = Some((sector, at));
+                        }
+                        Slot::Skip => {}
+                        // The end of the directory: nothing after it has
+                        // ever been used, so this is where a new entry
+                        // goes if no deleted one came first.
+                        Slot::End => {
+                            return Ok((
+                                free.unwrap_or((sector, at)).0,
+                                free.unwrap_or((sector, at)).1,
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+            match self.next_cluster(cluster)? {
+                Entry::Next(next) => cluster = next,
+                _ => break,
+            }
+        }
+        match free {
+            Some((sector, at)) => Ok((sector, at, None)),
+            None => Err(WriteError::DirectoryFull),
+        }
+    }
+
+    /// Creates `name` in the root directory with `contents`, or replaces
+    /// what is there.
+    ///
+    /// The order is the whole of this (ADR 0027, point 3): the data goes
+    /// into clusters nothing names, then the chain, then — in one write of
+    /// one sector — the directory entry that makes the file appear. A
+    /// machine that stopped between any two of those steps leaves a volume
+    /// another reader still understands; at worst some clusters are
+    /// marked used and belong to nobody, which is a lost chain and a thing
+    /// `fsck` knows how to say.
+    pub fn write_file(
+        &mut self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<DirectoryEntry, WriteError<S::Error>> {
+        let encoded = encode_name(name).ok_or(WriteError::BadName)?;
+        let per_cluster = self.boot.cluster_bytes() as usize;
+        let needed = contents.len().div_ceil(per_cluster);
+
+        // Where it will go, before anything is written. A file half
+        // written because the disk filled up is worse than no file.
+        let (sector, offset, existing) = self.directory_slot(&encoded)?;
+        let chain = self.free_clusters(needed)?;
+        let chain = &chain[..needed];
+
+        self.write_clusters(chain, contents)?;
+        for (index, cluster) in chain.iter().enumerate() {
+            let next = match chain.get(index + 1) {
+                Some(next) => *next,
+                None => END_OF_CHAIN,
+            };
+            self.set_next_cluster(*cluster, next)?;
+        }
+
+        // And now the entry, which is what makes it a file.
+        let mut bytes = [0u8; 512];
+        self.sectors
+            .read_sector(sector, &mut bytes)
+            .map_err(VolumeError::Device)?;
+        let entry = &mut bytes[offset..offset + DIRECTORY_ENTRY_BYTES];
+        entry.fill(0);
+        entry[..11].copy_from_slice(&encoded);
+        entry[11] = ATTR_ARCHIVE;
+        let first = chain.first().copied().unwrap_or(0);
+        entry[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+        entry[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+        entry[28..32].copy_from_slice(&(contents.len() as u32).to_le_bytes());
+        self.sectors
+            .write_sector(sector, &bytes)
+            .map_err(WriteError::Device)?;
+
+        // Whatever the old one used is only free once nothing points at
+        // it any more, which is now.
+        if let Some(existing) = existing
+            && existing.first_cluster != 0
+        {
+            self.free_chain(existing.first_cluster)?;
+        }
+
+        let written = decode_slot(
+            bytes[offset..offset + DIRECTORY_ENTRY_BYTES]
+                .try_into()
+                .expect("an entry's worth of bytes"),
+        );
+        match written {
+            Slot::Entry(entry) => Ok(entry),
+            _ => Err(WriteError::BadName),
+        }
+    }
+
+    /// Marks a chain's clusters free, from `first` to its end.
+    ///
+    /// Stops at anything that is not another cluster: a chain that was
+    /// already broken is not made worse by walking off it.
+    fn free_chain(&mut self, first: u32) -> Result<(), WriteError<S::Error>> {
+        let mut cluster = first;
+        let mut seen = 0;
+        loop {
+            let next = self.next_cluster(cluster)?;
+            self.set_next_cluster(cluster, 0)?;
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops.into());
+            }
+            match next {
+                Entry::Next(next) => cluster = next,
+                _ => return Ok(()),
+            }
+        }
+    }
+}
+
+/// What a file is marked as. Nothing here makes directories.
+const ATTR_ARCHIVE: u8 = 0x20;
+/// What ends a chain. Only the low 28 bits are the number, so this is the
+/// value a formatter writes; anything from `0x0FFFFFF8` up means the same.
+const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
 
 #[cfg(test)]
 mod tests {
