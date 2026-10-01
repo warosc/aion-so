@@ -64,6 +64,10 @@ pub enum ElfError {
     SegmentOutsideFile { offset: u64, size: u64 },
     /// A segment that holds less memory than it holds file.
     SegmentShrinks { file_size: u64, memory_size: u64 },
+    /// A segment that occupies nothing. There is no page to map for it,
+    /// and its end is one before its start — which is a subtraction the
+    /// loader should never be asked to make.
+    SegmentOfNothing { at: u64 },
     /// A segment that would land outside the half a program lives in.
     SegmentOutsideUserSpace { at: u64, size: u64 },
     /// A segment asking to be both writable and executable. The kernel
@@ -222,9 +226,12 @@ pub fn parse(file: &[u8], user_space_end: u64) -> Result<Program, ElfError> {
     }
 
     let table = u64_at(file, at::PROGRAM_HEADER_OFFSET);
-    // In sixty-four bits throughout: these are numbers from a file, and a
-    // multiplication that wrapped would point back inside it.
-    let table_end = table + u64::from(count) * u64::from(entry_size);
+    // In sixty-four bits throughout, and saturating: these are numbers
+    // from a file. The multiplication cannot overflow — at most 65 535
+    // headers of 56 bytes — but the offset is eight arbitrary bytes, and
+    // adding to one near the top of the address space wraps round to a
+    // small number that would walk straight past this guard.
+    let table_end = table.saturating_add(u64::from(count) * u64::from(entry_size));
     if table_end > file.len() as u64 {
         return Err(ElfError::Truncated {
             needed: table_end,
@@ -260,6 +267,9 @@ pub fn parse(file: &[u8], user_space_end: u64) -> Result<Program, ElfError> {
                 file_size,
                 memory_size,
             });
+        }
+        if memory_size == 0 {
+            return Err(ElfError::SegmentOfNothing { at: address });
         }
         match address.checked_add(memory_size) {
             Some(end) if end <= user_space_end => {}
@@ -635,6 +645,24 @@ mod tests {
         assert!(parse(&last.build(), USER_SPACE_END).is_err(), "one past");
     }
 
+    /// An offset so near the top of the address space that adding the
+    /// table's own size wraps round. The guard is a comparison against
+    /// the file's length, and a wrapped sum is a small number that walks
+    /// straight past it — into a slice of the file that is not there.
+    #[test]
+    fn a_table_offset_that_wraps_is_refused() {
+        let mut file = Builder::new().code().build();
+        file[at::PROGRAM_HEADER_OFFSET..at::PROGRAM_HEADER_OFFSET + 8]
+            .copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        assert!(
+            matches!(
+                parse(&file, USER_SPACE_END),
+                Err(ElfError::Truncated { .. })
+            ),
+            "refused, and without panicking on the way"
+        );
+    }
+
     /// A table of program headers that does not fit in the file. Without
     /// the check, reading the first header reads past the end of it.
     #[test]
@@ -673,6 +701,22 @@ mod tests {
             .segment((4, FLAG_READ, 0x1500, 0x20, 0, 0))
             .build();
         assert_eq!(parse(&file, USER_SPACE_END), Err(ElfError::NoSegments));
+    }
+
+    /// A loadable segment that occupies no memory. The loader takes one
+    /// from its end to find its last page, so an empty one at address
+    /// zero is a subtraction below zero — and this kernel is built with
+    /// overflow checks on, so that is a panic at boot.
+    #[test]
+    fn a_segment_that_occupies_nothing_is_refused() {
+        let file = Builder::new()
+            .code()
+            .segment((PT_LOAD, FLAG_READ, 0x1000, 0, 0, 0))
+            .build();
+        assert_eq!(
+            parse(&file, USER_SPACE_END),
+            Err(ElfError::SegmentOfNothing { at: 0 })
+        );
     }
 
     #[test]
