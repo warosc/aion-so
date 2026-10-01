@@ -433,6 +433,26 @@ impl<S: Sectors> Volume<S> {
         Ok(Self { sectors, boot })
     }
 
+    /// Builds a volume over a boot sector that has already been read and
+    /// parsed, without reading sector 0 again.
+    ///
+    /// For a caller that mounts once and then needs the volume back many
+    /// times — the kernel, which rebuilds it on every file syscall
+    /// (ADR 0028) — and would otherwise pay a sector read each time for a
+    /// structure that cannot have changed. Nothing in this crate writes
+    /// sector 0, so the only way for `boot` to stop describing the volume
+    /// is for something outside to rewrite it underneath, which is the
+    /// same thing that would invalidate the volume anyway.
+    ///
+    /// `boot` has to have come from `BootSector::parse` on **this**
+    /// volume's sector 0. Every check it performs is the reason the rest
+    /// of this module can do arithmetic without re-checking, so handing it
+    /// a boot sector from somewhere else hands it arithmetic about a
+    /// volume that is not there.
+    pub const fn with_boot_sector(sectors: S, boot: BootSector) -> Self {
+        Self { sectors, boot }
+    }
+
     pub const fn boot_sector(&self) -> &BootSector {
         &self.boot
     }
