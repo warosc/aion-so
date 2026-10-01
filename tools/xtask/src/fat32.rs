@@ -618,18 +618,30 @@ mod tests {
     /// the reader asks of a disk.
     struct Image(Vec<u8>);
 
+    impl Image {
+        /// Where a sector is, or an error naming it: off the end of the
+        /// disk is something to report, not to panic over.
+        fn at(&self, sector: u32) -> Result<usize, u32> {
+            let at = sector as usize * SECTOR_BYTES;
+            if at + SECTOR_BYTES > self.0.len() {
+                return Err(sector);
+            }
+            Ok(at)
+        }
+    }
+
     impl harlan_hal::fat::Sectors for Image {
         type Error = u32;
 
         fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), u32> {
-            let at = sector as usize * SECTOR_BYTES;
-            let end = at + SECTOR_BYTES;
-            if end > self.0.len() {
-                // Off the end of the disk, which a reader should never ask
-                // for and which this reports rather than panicking.
-                return Err(sector);
-            }
-            into.copy_from_slice(&self.0[at..end]);
+            let at = self.at(sector)?;
+            into.copy_from_slice(&self.0[at..at + SECTOR_BYTES]);
+            Ok(())
+        }
+
+        fn write_sector(&mut self, sector: u32, from: &[u8; 512]) -> Result<(), u32> {
+            let at = self.at(sector)?;
+            self.0[at..at + SECTOR_BYTES].copy_from_slice(from);
             Ok(())
         }
     }
@@ -814,5 +826,349 @@ mod tests {
                 Err(harlan_hal::fat::VolumeError::BadCluster { cluster })
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Writing: what this reads back, and what another tool makes of it
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_file_written_is_a_file_read_back() {
+        let mut volume = volume();
+        let written = volume
+            .write_file("NEW.TXT", b"written by the kernel\n")
+            .expect("a file this volume has room for");
+        assert_eq!(written.name(), "NEW.TXT");
+        assert_eq!(written.size, 22);
+        assert_ne!(written.first_cluster, 0);
+
+        // And it is there when asked for by name, like any other.
+        let found = volume.find("new.txt").unwrap().expect("it is in the root");
+        assert_eq!(found, written);
+        let mut bytes = [0u8; 64];
+        let read = volume.read_file(&found, &mut bytes).expect("its contents");
+        assert_eq!(&bytes[..read], b"written by the kernel\n");
+
+        // The files that were already there are still there.
+        let mut names = Vec::new();
+        volume
+            .read_root(|entry| {
+                names.push(entry.name().to_string());
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "HELLO.TXT".to_string(),
+                "LONG.BIN".to_string(),
+                "EMPTY.BIN".to_string(),
+                "NEW.TXT".to_string()
+            ]
+        );
+    }
+
+    /// A file of several clusters: the chain has to be written as well as
+    /// the bytes, and read back the same way.
+    #[test]
+    fn a_long_file_written_keeps_its_chain() {
+        let mut volume = volume();
+        let contents: Vec<u8> = (0..3 * 512 + 7).map(|n| (n % 253) as u8).collect();
+        let written = volume.write_file("BIG.BIN", &contents).unwrap();
+        assert_eq!(written.size, contents.len() as u32);
+
+        let mut bytes = vec![0u8; 8192];
+        let read = volume.read_file(&written, &mut bytes).unwrap();
+        assert_eq!(&bytes[..read], &contents[..]);
+
+        // Four clusters, the last one ending the chain.
+        let mut cluster = written.first_cluster;
+        let mut walked = 1;
+        while let harlan_hal::fat::Entry::Next(next) = volume.next_cluster(cluster).unwrap() {
+            cluster = next;
+            walked += 1;
+        }
+        assert_eq!(walked, 4);
+        assert_eq!(
+            volume.next_cluster(cluster).unwrap(),
+            harlan_hal::fat::Entry::End
+        );
+    }
+
+    /// Writing over a file keeps one entry, not two, and gives back what
+    /// the old contents were using.
+    #[test]
+    fn writing_over_a_file_replaces_it() {
+        let mut volume = volume();
+        let first = volume.write_file("SAME.TXT", &[1u8; 2000]).unwrap();
+        let old_cluster = first.first_cluster;
+        assert_eq!(first.size, 2000);
+
+        let second = volume.write_file("SAME.TXT", b"shorter").unwrap();
+        assert_eq!(second.size, 7);
+
+        let mut seen = 0;
+        volume
+            .read_root(|entry| {
+                if entry.is_named("SAME.TXT") {
+                    seen += 1;
+                }
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, 1, "one file called that, not two");
+
+        let mut bytes = [0u8; 32];
+        let read = volume.read_file(&second, &mut bytes).unwrap();
+        assert_eq!(&bytes[..read], b"shorter");
+
+        // The clusters the long version used are free again. The first of
+        // them may well have been taken back by the short one, so this
+        // looks at the fourth, which nothing needs now.
+        assert_eq!(
+            volume.next_cluster(old_cluster + 3).unwrap(),
+            harlan_hal::fat::Entry::Free
+        );
+    }
+
+    #[test]
+    fn what_will_not_be_written() {
+        let mut volume = volume();
+        for name in ["TOOLONGNAME.TXT", "A.TOOLONG", ""] {
+            assert_eq!(
+                volume.write_file(name, b"x"),
+                Err(harlan_hal::fat::WriteError::BadName),
+                "{name}"
+            );
+        }
+
+        let huge = vec![0u8; (harlan_hal::fat::MAX_FILE_CLUSTERS + 1) * 512];
+        assert!(matches!(
+            volume.write_file("HUGE.BIN", &huge),
+            Err(harlan_hal::fat::WriteError::TooManyClusters { .. })
+        ));
+    }
+
+    /// A file of no bytes owns no cluster, the same when written as when
+    /// formatted — which is the thing 7-Zip caught the formatter getting
+    /// wrong.
+    #[test]
+    fn a_file_of_no_bytes_written_takes_no_cluster() {
+        let mut volume = volume();
+        let written = volume.write_file("NOTHING.BIN", &[]).unwrap();
+        assert_eq!(written.size, 0);
+        assert_eq!(written.first_cluster, 0);
+        let mut bytes = [0xAAu8; 8];
+        assert_eq!(volume.read_file(&written, &mut bytes), Ok(0));
+        assert_eq!(bytes, [0xAA; 8]);
+    }
+
+    /// Both tables are written, because a volume whose tables disagree is
+    /// one every other system calls damaged.
+    #[test]
+    fn both_tables_are_kept_in_step_when_writing() {
+        let (image, geometry) = format(
+            SECTORS,
+            1,
+            "HARLAN",
+            &[File {
+                name: "ONE.TXT",
+                contents: b"one".to_vec(),
+            }],
+        )
+        .unwrap();
+        let mut volume = harlan_hal::fat::Volume::mount(Image(image)).unwrap();
+        volume.write_file("TWO.TXT", &[9u8; 1500]).unwrap();
+
+        let mut first = [0u8; 512];
+        let mut second = [0u8; 512];
+        for sector in 0..geometry.sectors_per_fat {
+            harlan_hal::fat::Sectors::read_sector(
+                volume.sectors_mut(),
+                RESERVED_SECTORS + sector,
+                &mut first,
+            )
+            .unwrap();
+            harlan_hal::fat::Sectors::read_sector(
+                volume.sectors_mut(),
+                RESERVED_SECTORS + geometry.sectors_per_fat + sector,
+                &mut second,
+            )
+            .unwrap();
+            assert_eq!(first, second, "the two tables disagree at sector {sector}");
+        }
+    }
+
+    /// A name typed in lower case is stored upper case, because that is
+    /// how a short name is stored and how every other reader will look
+    /// for it.
+    #[test]
+    fn a_name_is_stored_the_way_the_format_stores_it() {
+        let mut volume = volume();
+        let written = volume.write_file("lower.txt", b"x").unwrap();
+        assert_eq!(written.name(), "LOWER.TXT");
+
+        // And it is found whichever way it is asked for.
+        assert!(volume.find("LOWER.TXT").unwrap().is_some());
+        assert!(volume.find("lower.txt").unwrap().is_some());
+
+        // The bytes in the entry are upper case too, not only what the
+        // reader hands back.
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        let (slots, _) = bytes.as_chunks::<32>();
+        assert!(
+            slots.iter().any(|slot| &slot[..11] == b"LOWER   TXT"),
+            "the entry holds the name in upper case"
+        );
+    }
+
+    /// The top four bits of a table entry are not part of the cluster
+    /// number and belong to whatever put them there. Writing an entry
+    /// keeps them.
+    #[test]
+    fn writing_an_entry_keeps_the_bits_that_are_not_its_own() {
+        let mut volume = volume();
+        // Reach into the table and set the reserved bits of an entry that
+        // is free, then make a file that will take that cluster.
+        let table = volume.boot_sector().first_fat_sector();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), table, &mut bytes).unwrap();
+        // Cluster 20 is past everything the volume was formatted with.
+        let at = 20 * 4;
+        bytes[at..at + 4].copy_from_slice(&0xF000_0000u32.to_le_bytes());
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), table, &bytes).unwrap();
+        // It still reads as free: the reserved bits are not the number.
+        assert_eq!(
+            volume.next_cluster(20).unwrap(),
+            harlan_hal::fat::Entry::Free
+        );
+
+        volume.set_next_cluster(20, 21).unwrap();
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), table, &mut bytes).unwrap();
+        let entry = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        assert_eq!(
+            entry, 0xF000_0015,
+            "the number changed and the rest did not"
+        );
+    }
+
+    /// A cluster the volume has not got is refused rather than written
+    /// somewhere else in the table.
+    #[test]
+    fn an_entry_outside_the_volume_is_not_written() {
+        let mut volume = volume();
+        let past = harlan_hal::fat::FIRST_DATA_CLUSTER + volume.boot_sector().clusters;
+        for cluster in [0, 1, past, u32::MAX] {
+            assert!(
+                matches!(
+                    volume.set_next_cluster(cluster, 3),
+                    Err(harlan_hal::fat::WriteError::Reading(
+                        harlan_hal::fat::VolumeError::BadCluster { .. }
+                    ))
+                ),
+                "cluster {cluster}"
+            );
+        }
+    }
+
+    /// A volume with nothing free writes nothing at all: a file half
+    /// written because the disk filled up is worse than a file that is
+    /// not there.
+    #[test]
+    fn a_full_volume_is_left_as_it_was() {
+        let (mut image, geometry) = format(
+            SECTORS,
+            1,
+            "HARLAN",
+            &[File {
+                name: "ONE.TXT",
+                contents: b"one".to_vec(),
+            }],
+        )
+        .unwrap();
+        // Mark every cluster used, in both tables, by hand.
+        for table in 0..FAT_COUNT {
+            let first =
+                (RESERVED_SECTORS + table * geometry.sectors_per_fat) as usize * SECTOR_BYTES;
+            let bytes = geometry.sectors_per_fat as usize * SECTOR_BYTES;
+            let (entries, _) = image[first..first + bytes].as_chunks_mut::<4>();
+            for entry in entries {
+                *entry = 0x0FFF_FFFFu32.to_le_bytes();
+            }
+        }
+        let mut volume = harlan_hal::fat::Volume::mount(Image(image)).unwrap();
+
+        let before = root_bytes(&mut volume);
+        assert!(matches!(
+            volume.write_file("NEW.TXT", b"anything"),
+            Err(harlan_hal::fat::WriteError::Full { .. })
+        ));
+        assert_eq!(
+            root_bytes(&mut volume),
+            before,
+            "the directory was not touched"
+        );
+    }
+
+    fn root_bytes(volume: &mut harlan_hal::fat::Volume<Image>) -> [u8; 512] {
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// What a file does not fill is zeroed, not left as it was. Handing
+    /// back what used to be somebody else's file is how a disk leaks.
+    #[test]
+    fn the_rest_of_a_files_last_sector_is_not_somebody_elses() {
+        let mut volume = volume();
+        // Fill the cluster the next write will take with somebody else's
+        // bytes. Writing reserves before it frees, so a new file lands on
+        // the first free cluster rather than on the one it replaces —
+        // this is how a cluster with something in it gets reused.
+        let next_free = (harlan_hal::fat::FIRST_DATA_CLUSTER..)
+            .find(|cluster| volume.next_cluster(*cluster) == Ok(harlan_hal::fat::Entry::Free))
+            .expect("this volume has a free cluster");
+        let sector = volume.boot_sector().sector_of_cluster(next_free).unwrap();
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), sector, &[0xAB; 512]).unwrap();
+
+        let short = volume.write_file("LEAK.BIN", b"short").unwrap();
+        assert_eq!(short.first_cluster, next_free, "it took that one");
+
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), sector, &mut bytes).unwrap();
+        assert_eq!(&bytes[..5], b"short");
+        assert!(
+            bytes[5..].iter().all(|byte| *byte == 0),
+            "what was there before is gone, not handed on"
+        );
+    }
+
+    /// An entry written over an old one is written whole: the fields this
+    /// kernel does not use — the times, the reserved byte — are cleared
+    /// rather than left saying something about a file that is gone.
+    #[test]
+    fn an_entry_written_over_another_keeps_nothing_of_it() {
+        let mut volume = volume();
+        // Put junk in the fields nothing here writes.
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        // The first entry is the volume's label, so HELLO.TXT is the
+        // second. Bytes 12 to 20 of it are the reserved byte and the
+        // creation time, which nothing here writes.
+        const HELLO: usize = 32;
+        bytes[HELLO + 12..HELLO + 20].fill(0xEE);
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), root, &bytes).unwrap();
+
+        volume.write_file("HELLO.TXT", b"again").unwrap();
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        assert_eq!(&bytes[HELLO..HELLO + 11], b"HELLO   TXT", "the same entry");
+        assert!(
+            bytes[HELLO + 12..HELLO + 20].iter().all(|byte| *byte == 0),
+            "what the old entry said is gone"
+        );
     }
 }

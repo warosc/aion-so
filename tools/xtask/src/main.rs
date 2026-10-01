@@ -504,14 +504,29 @@ fn disk_contents(user_program: Vec<u8>) -> Vec<fat32::File> {
     ]
 }
 
-/// The disk QEMU attaches: a real FAT32 volume, written here rather than
-/// synthesised by QEMU — whose own FAT32 says it has never been tested,
-/// and a reader verified against an untested implementation is not
-/// verified at all (ADR 0025, point 4).
+/// Where the disk is. Running does not create it: it is an output of
+/// `build`, and recreating it before every boot would wipe whatever the
+/// kernel wrote last time — which is the thing persistence means
+/// (docs/adr/0027-fase4-fat32-write.md).
+fn disk_path(root: &Path) -> Result<PathBuf> {
+    let path = root.join("target").join("disk.img");
+    if !path.exists() {
+        bail!(
+            "there is no disk at {}; run `cargo xtask build` first",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Writes the disk QEMU attaches: a real FAT32 volume, laid out here
+/// rather than synthesised by QEMU — whose own FAT32 says it has never
+/// been tested, and a reader verified against an untested implementation
+/// is not verified at all (ADR 0025, point 4).
 ///
-/// It is written on every run. The image is the kernel's input, and an
-/// input that drifts because an earlier run wrote to it is an input that
-/// makes a passing test mean nothing.
+/// Written by `build` and by nothing else. Every boot after that reads and
+/// writes the same image, which is how a file written by one boot is there
+/// for the next.
 fn prepare_disk(root: &Path) -> Result<PathBuf> {
     let path = root.join("target").join("disk.img");
     let sectors = (DISK_BYTES / fat32::SECTOR_BYTES as u64) as u32;
@@ -545,7 +560,7 @@ fn prepare_qemu_config(
 ) -> Result<QemuConfig> {
     let (ovmf_code, ovmf_vars_template) = fetch_ovmf(root)?;
     let ovmf_vars = prepare_vars_copy(root, &ovmf_vars_template)?;
-    let disk = prepare_disk(root)?;
+    let disk = disk_path(root)?;
     Ok(QemuConfig {
         ovmf_code,
         ovmf_vars,
