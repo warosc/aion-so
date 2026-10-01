@@ -931,6 +931,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         );
                         check_backup_boot_sector(disk, reader, &volume, &boot_sector);
                         read_a_file(disk, reader);
+                        count_this_boot(disk, reader);
                     }
                     Ok(Err(err)) => {
                         error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
@@ -1224,6 +1225,91 @@ impl harlan_hal::fat::Sectors for DiskSectors<'_> {
         // when another starts, because this returns before the next call.
         unsafe { self.reader.read_sector(self.disk, u64::from(sector), into) }
     }
+
+    fn write_sector(&mut self, sector: u32, from: &[u8; 512]) -> Result<(), Self::Error> {
+        // SAFETY: as above.
+        unsafe { self.reader.write_sector(self.disk, u64::from(sector), from) }
+    }
+}
+
+/// Counts this boot in a file on the disk, and says what the file said
+/// before.
+///
+/// This is the phase's exit criterion in one function: a file created on
+/// one boot, read on the next, with nothing between them but the disk
+/// (docs/adr/0027-fase4-fat32-write.md). The number only grows because
+/// what was written survived; a disk that forgot would start again at one
+/// every time, and so would a reader that could not find what it wrote.
+fn count_this_boot(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_blk::Reader) {
+    const NAME: &str = "BOOTS.TXT";
+    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
+        Ok(volume) => volume,
+        Err(err) => {
+            error!("HARLAN: this boot cannot be counted: {err:?}");
+            return;
+        }
+    };
+
+    // What the last boot left, if there was one.
+    let before = match volume.find(NAME) {
+        Ok(Some(entry)) => {
+            let mut bytes = [0u8; 32];
+            match volume.read_file(&entry, &mut bytes) {
+                Ok(read) => core::str::from_utf8(&bytes[..read])
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok()),
+                Err(err) => {
+                    error!("HARLAN: {NAME} is there and could not be read ({err:?})");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+
+    let this = before.unwrap_or(0) + 1;
+    // Up to ten digits and a newline, which is more than a `u32` needs.
+    let mut text = [0u8; 11];
+    let written = write_number(&mut text, this);
+    match volume.write_file(NAME, &text[..written]) {
+        Ok(entry) => match before {
+            Some(before) => info!(
+                "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
+                entry.size, entry.first_cluster
+            ),
+            None => info!(
+                "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
+                entry.size, entry.first_cluster
+            ),
+        },
+        Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
+    }
+}
+
+/// Writes `number` into `text` as decimal with a newline, and answers how
+/// many bytes that took. There is no formatter in a `no_std` kernel that
+/// writes into a buffer without allocating, and this is four lines.
+fn write_number(text: &mut [u8; 11], number: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut left = number;
+    loop {
+        digits[count] = b'0' + (left % 10) as u8;
+        count += 1;
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    for (at, digit) in digits[..count].iter().rev().enumerate() {
+        text[at] = *digit;
+    }
+    text[count] = b'\n';
+    count + 1
 }
 
 /// How a process is to be started: from a page of bytes written by hand,
