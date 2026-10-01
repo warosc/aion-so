@@ -8,6 +8,106 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 29 — El disco con un sistema de ficheros de verdad
+
+`docs/adr/0025-fase4-fat32-read-only.md`. El kernel lee sectores; un sector
+no es un fichero. Este incremento decide el formato y, sobre todo, **contra
+qué se comprueba que lo leemos bien**.
+
+Esa segunda pregunta es la importante. Un analizador escrito y probado por
+la misma persona que escribió la imagen que lee pasa todas sus pruebas
+aunque los dos compartan el mismo malentendido. Eso no es verificación, es
+un eco.
+
+### Qué hace
+
+- **FAT32, empezando por solo lectura**, sin particiones y con nombres 8.3
+  —las entradas de nombre largo son un añadido que se puede ignorar para
+  leer un disco entero—.
+- **La imagen la construye `xtask`**, no el sintetizador `fat:` de QEMU,
+  que al pedirle FAT32 avisa: *"FAT32 has not been tested"*.
+- **Y la comprueban otros**: `fsck.vfat` en CI, y 7-Zip en local. Son
+  implementaciones escritas por otra gente que saben qué es una imagen
+  FAT32 válida.
+- **El BPB se valida, no se cree.** Es dato que viene de fuera del kernel y
+  cada número se usa para calcular una dirección: tamaño de sector,
+  sectores por cluster —cero divide por cero—, número y tamaño de las
+  tablas, cluster raíz, y que las tablas quepan en el volumen. La
+  aritmética que podría desbordar se hace en 64 bits.
+- **El disco crece a 64 MiB.** No es gusto: FAT32 exige más de 65 525
+  clusters y por debajo la especificación dice que el volumen es FAT16
+  diga lo que diga su BPB. Un disco pequeño con un BPB que dice FAT32 es
+  exactamente la imagen que un lector descuidado acepta y `fsck` rechaza.
+- **Los marcadores en crudo del Incremento 28 desaparecen**: el sector 0 es
+  ahora el BPB. Lo que demostraban —que el número de sector llega al
+  dispositivo— lo demuestra la copia de seguridad que FAT32 guarda en el
+  sector 6, y de paso comprueba que la imagen la tiene donde debe.
+
+### Dos fallos que encontraron las pruebas, y uno que encontró otro
+
+1. **El tamaño de la tabla oscilaba.** El número de clusters depende del
+   tamaño de la tabla y el tamaño de la tabla depende del número de
+   clusters. Perseguir eso como punto fijo **no converge**: alterna entre
+   dos tamaños, cada uno una entrada corto de lo que el otro implica, y se
+   queda en el que toque cuando se acaba el bucle. Lo destapó una prueba
+   escrita antes del código —"la tabla tiene que caber para los clusters
+   que describe"— y se arregló preguntándolo como un sí o un no: una tabla
+   de `n` sectores sirve o no sirve, y como crecer solo lo hace más fácil,
+   el menor que sirve se busca partiendo el rango por la mitad.
+2. **La prueba de clusters grandes estaba mal, no el código.** Con ocho
+   sectores por cluster el volumen de 64 MiB ya no llega al mínimo de
+   FAT32, y el analizador lo rechazó. Tenía razón.
+3. **Y el que importa: 7-Zip se negó a leer `EMPTY.BIN`.** Mi formateador
+   le daba un cluster a un fichero vacío. La especificación dice que un
+   fichero de longitud cero tiene primer cluster **0**: un cluster
+   asignado que no pertenece a nadie es lo que un comprobador llama cadena
+   perdida. Y mi propia prueba afirmaba lo contrario —"y un cluster de
+   todas formas"— porque el formateador y la prueba tenían el mismo
+   malentendido escrito dentro. Eso es exactamente lo que el punto 5 del
+   ADR 0025 existe para atrapar, y lo atrapó a la primera.
+
+### Verificación ejecutada
+
+- **7-Zip**, en local, sobre la imagen: `Type = FAT`, `File System = FAT32`,
+  `Label = HARLAN`, `Cluster Size = 512`, los tres ficheros con sus
+  tamaños (27, 2049, 0) y, al extraerlos, `Everything is Ok` y el contenido
+  correcto byte a byte.
+- **`fsck.vfat -n -V`** en CI, en su propio trabajo, sobre la imagen que
+  `cargo xtask build` produce.
+- QEMU, que es lo que demuestra que el kernel lo lee:
+
+  ```
+  the disk holds FAT32: 131072 sector(s) of 512 byte(s), 129022 cluster(s)
+  of 1 sector(s), 2 table(s) of 1009 sector(s) from sector 32, root at
+  cluster 2 (sector Some(2050)), data from sector 2050
+  sector 6 holds the same boot sector as sector 0, byte for byte
+  ```
+
+  Los números coinciden uno a uno con los que `xtask` dijo al formatear
+  —131072 sectores, 129022 clusters, 1009 sectores por tabla, raíz en el
+  cluster 2—, que es la comparación que importa: el que escribe y el que
+  lee coinciden, y un tercero dice que la imagen es válida.
+- **Pruebas negativas**: con un `sectors_per_cluster` de cero el kernel
+  dice `does not hold a FAT32 volume (SectorsPerCluster { found: 0 })` en
+  vez de dividir por cero; con el tamaño de tabla de 16 bits puesto,
+  `NotFat32 { sixteen_bit_fat_size: 256 }`. Las dos llegan al shell.
+- Host: 299 pruebas (285 + 14), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 25, las 25 detectadas.
+
+### Riesgos y límites
+
+- **Solo lectura**, y nada lee todavía un fichero: este incremento llega al
+  BPB. La cadena de clusters y el directorio raíz son el siguiente.
+- **Sin nombres largos**: 8.3 y nada más.
+- **Sin particiones**: el volumen empieza en el sector 0.
+- CI gana una dependencia, `dosfstools`, y un paso que puede fallar por
+  algo que no es el kernel. Es el precio de tener una segunda opinión.
+- La imagen se reescribe en cada `build`. Es deliberado —una entrada que
+  se mueve porque una ejecución anterior escribió en ella hace que una
+  prueba que pasa no signifique nada— y querrá revisarse cuando el kernel
+  escriba en el disco.
+
 ## Incremento 28 — Un sector, leído de verdad
 
 `docs/adr/0024-fase4-dma-and-the-queue.md`. El disco estaba negociado y sin

@@ -38,6 +38,24 @@ jobs:
       - run: cargo build -p harlan-kernel --target x86_64-unknown-none --release
       - run: cargo build -p harlan-boot --target x86_64-unknown-uefi --release
 
+  # A second opinion on the disk image, from an implementation nobody here
+  # wrote. A FAT32 reader and the formatter that made the image it reads
+  # pass each other's tests even when both are wrong; `fsck.vfat` does not
+  # share the misunderstanding (docs/adr/0025-fase4-fat32-read-only.md).
+  disk-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: Install dosfstools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools
+      - run: cargo xtask build
+      # `-n` is "no changes": report what is wrong and fix nothing. `-V`
+      # makes it verify by reading the whole volume back.
+      - run: fsck.vfat -n -V target/disk.img
+
   boot-smoke-test:
     needs: build-freestanding
     runs-on: ubuntu-latest
