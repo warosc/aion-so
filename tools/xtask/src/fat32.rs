@@ -609,4 +609,210 @@ mod tests {
         assert_eq!(read_u32(&image, table + 3 * 4), END_OF_CHAIN);
         assert_eq!(read_u32(&image, table + 4 * 4), 0, "nothing else is taken");
     }
+
+    // -----------------------------------------------------------------
+    // The round trip: what this writes, the kernel's own reader reads
+    // -----------------------------------------------------------------
+
+    /// The image in memory, handed out a sector at a time, which is all
+    /// the reader asks of a disk.
+    struct Image(Vec<u8>);
+
+    impl harlan_hal::fat::Sectors for Image {
+        type Error = u32;
+
+        fn read_sector(&mut self, sector: u32, into: &mut [u8; 512]) -> Result<(), u32> {
+            let at = sector as usize * SECTOR_BYTES;
+            let end = at + SECTOR_BYTES;
+            if end > self.0.len() {
+                // Off the end of the disk, which a reader should never ask
+                // for and which this reports rather than panicking.
+                return Err(sector);
+            }
+            into.copy_from_slice(&self.0[at..end]);
+            Ok(())
+        }
+    }
+
+    fn volume() -> harlan_hal::fat::Volume<Image> {
+        let (image, _) = format(
+            SECTORS,
+            1,
+            "HARLAN",
+            &[
+                File {
+                    name: "HELLO.TXT",
+                    contents: b"HARLAN reads its own disk.
+"
+                    .to_vec(),
+                },
+                File {
+                    name: "LONG.BIN",
+                    contents: (0..4 * 512 + 1).map(|n| (n % 251) as u8).collect(),
+                },
+                File {
+                    name: "EMPTY.BIN",
+                    contents: Vec::new(),
+                },
+            ],
+        )
+        .expect("a volume that fits");
+        harlan_hal::fat::Volume::mount(Image(image)).expect("a volume the kernel can read")
+    }
+
+    /// The whole path, in a host test: boot sector, root directory, the
+    /// table, and a file's bytes. Everything the kernel does with a disk
+    /// except asking the disk for the sectors.
+    #[test]
+    fn the_kernels_own_reader_reads_what_this_writes() {
+        let mut volume = volume();
+        let boot = *volume.boot_sector();
+        assert_eq!(boot.total_sectors, SECTORS);
+        assert_eq!(boot.sectors_per_cluster, 1);
+        assert_eq!(boot.root_cluster, 2);
+
+        let mut names = Vec::new();
+        volume
+            .read_root(|entry| {
+                names.push((entry.name().to_string(), entry.size, entry.first_cluster));
+                true
+            })
+            .expect("a root directory");
+        assert_eq!(
+            names,
+            vec![
+                ("HELLO.TXT".to_string(), 27, 3),
+                ("LONG.BIN".to_string(), 2049, 4),
+                ("EMPTY.BIN".to_string(), 0, 0),
+            ],
+            "the label is not a file, and the three that are come back"
+        );
+    }
+
+    /// A file that fits in one cluster, read through the directory.
+    #[test]
+    fn a_short_file_comes_back_byte_for_byte() {
+        let mut volume = volume();
+        let entry = volume
+            .find("hello.txt")
+            .expect("a readable volume")
+            .expect("the file is there");
+        let mut bytes = [0u8; 64];
+        let read = volume.read_file(&entry, &mut bytes).expect("its contents");
+        assert_eq!(read, 27);
+        assert_eq!(
+            &bytes[..read],
+            b"HARLAN reads its own disk.
+"
+        );
+        // And nothing past its length was written, even though the rest of
+        // the cluster was read.
+        assert!(bytes[read..].iter().all(|byte| *byte == 0));
+    }
+
+    /// A file of four clusters and a byte: the chain has to be walked, and
+    /// the read has to stop where the length says rather than where the
+    /// last cluster does.
+    #[test]
+    fn a_long_file_is_followed_through_its_chain() {
+        let mut volume = volume();
+        let entry = volume.find("LONG.BIN").unwrap().expect("the file is there");
+        assert_eq!(entry.size, 4 * 512 + 1);
+
+        let mut bytes = vec![0u8; 8192];
+        let read = volume.read_file(&entry, &mut bytes).expect("its contents");
+        assert_eq!(read, 2049);
+        let expected: Vec<u8> = (0..2049).map(|n| (n % 251) as u8).collect();
+        assert_eq!(&bytes[..read], &expected[..], "every byte, in order");
+        assert!(bytes[read..].iter().all(|byte| *byte == 0), "and no more");
+
+        // The chain really is five clusters long, ending where it should.
+        let mut cluster = entry.first_cluster;
+        let mut walked = 1;
+        while let harlan_hal::fat::Entry::Next(next) = volume.next_cluster(cluster).unwrap() {
+            cluster = next;
+            walked += 1;
+        }
+        assert_eq!(walked, 5, "four full clusters and one for the odd byte");
+        assert_eq!(
+            volume.next_cluster(cluster).unwrap(),
+            harlan_hal::fat::Entry::End
+        );
+    }
+
+    /// A file of no bytes owns no cluster, so reading it reads nothing —
+    /// and must not follow its first cluster of zero into the reserved
+    /// entries of the table.
+    #[test]
+    fn an_empty_file_reads_as_nothing() {
+        let mut volume = volume();
+        let entry = volume
+            .find("EMPTY.BIN")
+            .unwrap()
+            .expect("the file is there");
+        assert_eq!(entry.first_cluster, 0);
+        let mut bytes = [0xAAu8; 16];
+        assert_eq!(volume.read_file(&entry, &mut bytes), Ok(0));
+        assert_eq!(bytes, [0xAA; 16], "nothing was written");
+    }
+
+    /// A chain that ends before its file does. A reader that followed a
+    /// chain without looking at what each entry says would stop quietly
+    /// and report a file it had not read.
+    #[test]
+    fn a_chain_that_ends_early_is_not_a_file_that_is_all_there() {
+        let (mut image, geometry) = format(
+            SECTORS,
+            1,
+            "HARLAN",
+            &[File {
+                name: "LONG.BIN",
+                contents: vec![7; 4 * SECTOR_BYTES],
+            }],
+        )
+        .unwrap();
+        // Free the second cluster of its chain, in both tables, so that
+        // the chain ends where the file does not.
+        for table in 0..FAT_COUNT {
+            let at = (RESERVED_SECTORS + table * geometry.sectors_per_fat) as usize * SECTOR_BYTES;
+            write_u32(&mut image, at + 4 * 4, 0);
+        }
+
+        let mut volume =
+            harlan_hal::fat::Volume::mount(Image(image)).expect("the volume still mounts");
+        let entry = volume.find("LONG.BIN").unwrap().expect("the file is there");
+        let mut bytes = vec![0u8; 8192];
+        assert_eq!(
+            volume.read_file(&entry, &mut bytes),
+            Err(harlan_hal::fat::VolumeError::BrokenChain {
+                cluster: 4,
+                entry: harlan_hal::fat::Entry::Free
+            }),
+            "it says where the chain broke and what it found"
+        );
+    }
+
+    #[test]
+    fn what_the_reader_refuses() {
+        let mut volume = volume();
+        assert_eq!(volume.find("NOSUCH.TXT").unwrap(), None);
+
+        // A buffer smaller than the file is refused rather than filled
+        // with as much as fits.
+        let entry = volume.find("LONG.BIN").unwrap().unwrap();
+        let mut small = [0u8; 100];
+        assert_eq!(
+            volume.read_file(&entry, &mut small),
+            Err(harlan_hal::fat::VolumeError::TooBig { size: 2049 })
+        );
+        assert_eq!(small, [0u8; 100], "and nothing was written");
+
+        // Clusters 0 and 1 are the table's own entries and name no data.
+        for cluster in [0, 1] {
+            assert_eq!(
+                volume.next_cluster(cluster),
+                Err(harlan_hal::fat::VolumeError::BadCluster { cluster })
+            );
+        }
+    }
 }
