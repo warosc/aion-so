@@ -9,6 +9,158 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Revisión de Fase 4 — once hallazgos, todos arreglados
+
+Codex deja de revisar, así que esta pasada la hice yo sobre mi propio
+trabajo. Es peor que una revisión cruzada por construcción: los puntos
+ciegos que tenía al escribir el código son los mismos que tengo al leerlo.
+Lo que compensa en parte es el método —una prueba por afirmación, escrita
+**antes** de tocar nada— porque una prueba no comparte mis suposiciones:
+si pasa, el hallazgo era falso, y si falla, era real. Dos de los once los
+encontré así y no leyéndolos.
+
+Y una advertencia sobre la propia revisión: **una de sus afirmaciones era
+falsa**. Decía que `fsck.vfat` fallaba en CI. Fui al log: pasaba
+(`5 files, 20/129022 clusters`). El defecto de debajo —el FSInfo
+desactualizado— era real y se medía en los bytes de la imagen (129002
+frente a 129001), pero la consecuencia que le atribuía no. Una revisión
+que exagera el síntoma es una revisión en la que hay que comprobar cada
+cosa antes de arreglarla, que es lo que se hizo.
+
+### Los once
+
+En `hal/src/fat.rs`, siete:
+
+1. **Un nombre podía llevar un NUL.** Se comprobaba la longitud y que
+   fuera ASCII, nada más. Un NUL como primer byte de una entrada es lo que
+   marca **el final del directorio**: un fichero llamado `"\0BAD.TXT"`
+   habría cortado el raíz en seco y se habría llevado todos los ficheros
+   posteriores. Ahora `allowed_in_a_name` rechaza NUL, los códigos de
+   control, `0x7F`, los caracteres que FAT reserva, y un `0xE5` inicial.
+2. **Un volumen podía declarar más clusters que entradas tiene su tabla.**
+   Recorrerlo lee más allá del final de la tabla, y escribirlo escribe en
+   la región de datos, que es el fichero de alguien. `FatTooSmall`, en el
+   punto donde los dos números se encuentran por primera vez.
+3. **`directory_slot` comparaba el nombre byte a byte y `find` sin
+   mayúsculas.** Un volumen escrito por otra herramienta con un nombre
+   corto en minúsculas recibía una **segunda** entrada en vez de que se
+   reemplazara la primera. Los dos comparan igual ahora.
+4. **Un directorio se podía sobrescribir como fichero**, dejando huérfano
+   todo lo que tuviera dentro: `IsADirectory`.
+5. **El recorrido que busca hueco en el directorio no tenía tope.** Una
+   cadena de raíz que se apunta a sí misma colgaba el kernel. Acotado por
+   el número de clusters, como todos los demás recorridos.
+6. **`free_chain` liberaba clusters que ya estaban libres.** Tras una
+   sobrescritura interrumpida —el estado que el orden del ADR 0027
+   *permite*— eso podía liberar el primer cluster del fichero **nuevo**,
+   porque a esas alturas ya se había entregado. Ahora recibe los clusters
+   que hay que conservar y se para en una entrada libre.
+7. **El FSInfo quedaba diciendo lo que era verdad antes de escribir.** Se
+   reescribe al final, **contado de las tablas** en vez de llevado en un
+   contador: un total acumulado es estado que puede acabar en desacuerdo
+   con el disco.
+
+En `hal/src/elf.rs`, dos agujeros de aritmética:
+
+8. **`e_phoff + count * entry_size` sin guardia.** Una cabecera con un
+   desplazamiento cerca de `u64::MAX` da la vuelta, cae otra vez dentro del
+   fichero, y el analizador recorre cabeceras que se ha inventado.
+   `saturating_add` hace que la comparación con el tamaño del fichero sea
+   la que decide.
+9. **Un segmento con `p_memsz == 0` se aceptaba.** El cargador resta uno
+   del final de un segmento para encontrar su última página, así que un
+   segmento vacío en la dirección cero es una resta por debajo de cero —y
+   este kernel se compila con comprobación de desbordamiento, o sea un
+   pánico al arrancar, provocado por un fichero que vino del disco.
+   `SegmentOfNothing` lo rechaza al analizar, donde todavía hay un error
+   que devolver.
+
+Y dos más:
+
+10. **`spawn_elf` perdía marcos.** Un fichero cuyo tercer segmento está mal
+    dejaba asignados e inalcanzables los marcos de los dos primeros: el
+    ayudante `Building` conocía los rangos pero no los marcos ya tomados
+    para ellos. Ahora la carga es una función y `Building::give_back`
+    devuelve lo que tomó por cualquier salida de error. Un programa que no
+    carga no cuesta nada, que es lo que permite seguir arrancando después
+    de rechazar uno.
+11. **`fsck.vfat` comprobaba la imagen equivocada en CI.** Corría al final
+    del trabajo de arranque, **después** de la prueba de estrés de heap,
+    que rehace y reformatea el disco. Estaba comprobando una imagen recién
+    formateada en la que ningún kernel había escrito: habría pasado por
+    mal que los diez arranques hubieran dejado el disco. Corre justo
+    después de los diez arranques, sobre la imagen que ellos escribieron.
+
+### Dos de mis propias pruebas afirmaban cosas falsas
+
+Al escribir las pruebas de verificación me equivoqué dos veces, y conviene
+anotarlo porque es el mismo error de siempre: la prueba y el código
+comparten mi malentendido.
+
+- La primera entrada del directorio raíz es **la etiqueta del volumen**, no
+  un fichero. Una prueba que daba por hecho lo contrario pasaba por la
+  razón equivocada.
+- `write_file` **reserva antes de liberar**, así que un fichero reemplazado
+  no cae en el cluster del que ocupaba. Mi prueba daba por hecho que sí.
+- Y una tercera dejaba un hueco libre en el primer cluster del raíz, así
+  que la cadena que pretendía hacer bucle no se seguía nunca.
+
+Es exactamente el patrón de `EMPTY.BIN` del Incremento 29, donde
+formateador y prueba compartían el mismo malentendido y hizo falta 7-Zip
+para romperlo. La conclusión no cambia: **una prueba propia que confirma lo
+que esperaba no es evidencia**; la evidencia es una implementación de fuera.
+
+### El arreglo del FSInfo costó ocho segundos de arranque
+
+Vale la pena contarlo porque lo encontró la medición y no la lectura. Con
+los once arreglos puestos, `boot-test --repeat 10` pasó 10/10 —y tardando
+13,3–13,5 s por arranque, donde el mismo kernel antes tardaba 5,2–5,5 s—.
+
+La causa era mía y estaba en el arreglo nº 7. `update_fs_info` recorría la
+tabla **entrada por entrada** llamando a `next_cluster`, y `next_cluster`
+lee un sector entero de 512 bytes para mirar cuatro de ellos. Para un
+volumen de 129 022 clusters son 129 022 viajes al disco para leer los
+mismos mil sectores una y otra vez.
+
+Leyendo cada sector de la tabla una vez y mirando sus 128 entradas, el
+arranque vuelve a 4,9–5,3 s y la respuesta es el mismo número: 129 001
+libres, el primero el 23, medido en los bytes de la imagen.
+
+Convertir una posición dentro de un sector en un número de cluster es justo
+la aritmética que se equivoca en uno y sigue pareciendo razonable, así que
+la sujetan dos pruebas: una contra la misma cuenta hecha con
+`next_cluster`, que lee una sola entrada y no tiene dónde equivocarse, y
+otra de que no se cuentan ni las dos entradas reservadas ni el relleno
+posterior al último cluster. Las dos detectan un desplazamiento
+deliberado de uno y la eliminación del límite.
+
+La lección es la de siempre y no la había aplicado aquí: **un arreglo de
+corrección es un cambio de rendimiento hasta que se mide**. Los diez
+arranques estaban en verde; sin mirar el tiempo, esto se habría ido con
+ellos.
+
+### Verificación ejecutada
+
+- 341 pruebas de host, `fmt-lint` limpio.
+- Ronda de mutación sobre la escritura: 17 mutaciones, 6 supervivientes en
+  la primera pasada. Las seis eran pruebas mías flojas, no código malo —la
+  escritura feliz estaba cubierta y los casos cuidadosos no—. Una
+  (la comprobación de límites de `set_next_cluster`) era **inalcanzable
+  desde dentro del módulo**, porque todas las llamadas internas acotan el
+  cluster antes. Se resolvió haciendo pública la operación, no borrando la
+  guardia: la guardia está para quien llama. 17/17 tras cerrar los huecos.
+- La imagen después de los arranques, por fuera: 7-Zip extrae los cinco
+  ficheros sin queja, y FSInfo cuadra con la tabla medido en los bytes
+  (`libres=129001 siguiente=23` en los dos sitios).
+
+### Lo que sigue
+
+El ADR 0028 fija el ABI de ficheros para que un programa en ring 3 pueda
+hacer lo que hasta ahora solo hace el kernel: **descriptores para leer, el
+fichero entero para escribir**. Es lo que necesita la shell de esta fase, y
+el descriptor se diseña desde ahora como lo que será una capacidad en
+Fase 6.
+
 ## Incremento 32 — Escribir, y que lo escrito siga ahí
 
 `docs/adr/0027-fase4-fat32-write.md`. **La salida de Fase 4**: *crear, leer
