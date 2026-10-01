@@ -19,6 +19,7 @@ use harlan_hal::addr::VirtAddr;
 use harlan_hal::{error, info};
 
 use crate::ipc::{self, TakeError};
+use crate::process::OpenFile;
 use crate::process::Process;
 use crate::scheduler::{self, Running, SendError};
 
@@ -44,6 +45,12 @@ pub enum Call {
     /// Takes the message waiting for this process, waiting until there is
     /// one.
     Recv = 4,
+    /// The file calls (docs/adr/0028-fase4-file-abi-v0.md): descriptors
+    /// for reading, the whole file for writing.
+    Open = 5,
+    Read = 6,
+    Close = 7,
+    WriteFile = 8,
 }
 
 impl Call {
@@ -54,6 +61,10 @@ impl Call {
             2 => Some(Call::Yield),
             3 => Some(Call::Send),
             4 => Some(Call::Recv),
+            5 => Some(Call::Open),
+            6 => Some(Call::Read),
+            7 => Some(Call::Close),
+            8 => Some(Call::WriteFile),
             _ => None,
         }
     }
@@ -71,6 +82,37 @@ pub const ERR_NO_SUCH_PROCESS: i64 = -5;
 /// Nothing is waiting and nobody is left who could ever send anything, so
 /// waiting would be waiting for ever (ADR 0019, point 7).
 pub const ERR_WOULD_WAIT_FOR_EVER: i64 = -6;
+
+// The file ABI's own (docs/adr/0028-fase4-file-abi-v0.md, point 13),
+// continuing the numbering rather than starting a scheme of their own.
+
+/// Not a descriptor this process has open. Out of range and closed are the
+/// same answer: a program learns nothing by guessing.
+pub const ERR_BAD_DESCRIPTOR: i64 = -7;
+/// All four slots are taken (`process::MAX_OPEN`).
+pub const ERR_TOO_MANY_OPEN: i64 = -8;
+/// No file of that name in the root directory.
+pub const ERR_NO_SUCH_FILE: i64 = -9;
+/// Somebody has that file open, so writing it would change what they are
+/// in the middle of reading (ADR 0028, point 12).
+pub const ERR_FILE_IS_OPEN: i64 = -10;
+/// There is no room on the volume for it.
+pub const ERR_VOLUME_FULL: i64 = -11;
+/// The disk, or the volume on it, said no. **Not** fatal to the process:
+/// it asked for something legitimate and the medium failed, which is a
+/// different thing from a fault (ADR 0020, and ADR 0028 point 14).
+pub const ERR_DISK: i64 = -12;
+
+/// The longest name this filesystem holds: eight, a dot, and three.
+pub const MAX_NAME: u64 = 12;
+
+/// The most one `read` will move in a single call.
+///
+/// A limit so that a program cannot ask the kernel for an unbounded amount
+/// of work inside one syscall, which with interrupts off is an unbounded
+/// amount of time with the clock stopped (ADR 0028, last consequence). A
+/// program that wants more calls again; that is what a descriptor is for.
+pub const MAX_READ: u64 = 4096;
 
 // ---------------------------------------------------------------------
 // The programs
@@ -582,9 +624,235 @@ fn serve(frame: &mut SyscallFrame, running: Running) {
                 }
             }
         }
+        Some(Call::Open) => {
+            let (ptr, len) = (frame.rdi, frame.rsi);
+            if !running.owns(ptr, len) || len > MAX_NAME {
+                error!("HARLAN: syscall open({ptr:#x}, {len}) is not a name this process owns");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: the range was just checked to be inside the pages
+            // this process was given, which are mapped in the space that
+            // is active and stay mapped while it runs.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
+            };
+            let Ok(name) = core::str::from_utf8(bytes) else {
+                error!("HARLAN: syscall open() was handed something that is not text");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            };
+            let entry = match crate::fs::find(name) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    frame.rax = number_for(&err) as u64;
+                    return;
+                }
+            };
+            // SAFETY: this runs in the syscall handler with interrupts
+            // off, and the closure neither switches nor exits.
+            let opened = unsafe {
+                scheduler::with_running(|process| {
+                    process.open_file(OpenFile { entry, position: 0 })
+                })
+            };
+            match opened.flatten() {
+                Some(descriptor) => {
+                    info!(
+                        "HARLAN: slot {} opened {} ({} byte(s)) as descriptor {}",
+                        running.slot,
+                        entry.name(),
+                        entry.size,
+                        descriptor
+                    );
+                    frame.rax = descriptor as u64;
+                }
+                None => {
+                    error!(
+                        "HARLAN: slot {} has no free descriptor for {}",
+                        running.slot,
+                        entry.name()
+                    );
+                    frame.rax = ERR_TOO_MANY_OPEN as u64;
+                }
+            }
+        }
+        Some(Call::Read) => {
+            let (descriptor, ptr, len) = (frame.rdi, frame.rsi, frame.rdx);
+            // A buffer the kernel is about to **fill**, so owning it is not
+            // enough: it has to be writable by the program too
+            // (ADR 0028, point 9).
+            if !running.owns_writable(ptr, len) || len > MAX_READ {
+                error!(
+                    "HARLAN: syscall read({descriptor}, {ptr:#x}, {len}) is not a buffer this process may be given"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // What to read, taken from the process's table before the disk
+            // is touched: the entry and the position, copied out.
+            // SAFETY: as in `open`.
+            let open = unsafe {
+                scheduler::with_running(|process| {
+                    process.open_at(descriptor as usize).map(|file| *file)
+                })
+            };
+            let Some(open) = open.flatten() else {
+                error!(
+                    "HARLAN: slot {} has no descriptor {descriptor}",
+                    running.slot
+                );
+                frame.rax = ERR_BAD_DESCRIPTOR as u64;
+                return;
+            };
+            // SAFETY: the range was checked to be inside this process's
+            // writable pages, which are mapped in the active space.
+            let into = unsafe {
+                core::slice::from_raw_parts_mut(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
+            };
+            match crate::fs::read_at(&open.entry, open.position, into) {
+                Ok(read) => {
+                    // The position moves by exactly what was read, and
+                    // only after it has been read: a read that failed
+                    // leaves the descriptor where it was, so asking again
+                    // asks for the same bytes.
+                    // SAFETY: as in `open`.
+                    unsafe {
+                        scheduler::with_running(|process| {
+                            if let Some(file) = process.open_at(descriptor as usize) {
+                                file.position = file.position.saturating_add(read as u32);
+                            }
+                        })
+                    };
+                    frame.rax = read as u64;
+                }
+                Err(err) => frame.rax = number_for(&err) as u64,
+            }
+        }
+        Some(Call::Close) => {
+            let descriptor = frame.rdi;
+            // SAFETY: as in `open`.
+            let closed = unsafe {
+                scheduler::with_running(|process| process.close_file(descriptor as usize))
+            };
+            if closed == Some(true) {
+                frame.rax = 0;
+            } else {
+                error!(
+                    "HARLAN: slot {} closed descriptor {descriptor}, which was not open",
+                    running.slot
+                );
+                frame.rax = ERR_BAD_DESCRIPTOR as u64;
+            }
+        }
+        Some(Call::WriteFile) => {
+            let (name_ptr, name_len, data_ptr, data_len) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            if !running.owns(name_ptr, name_len) || name_len > MAX_NAME {
+                error!(
+                    "HARLAN: syscall write_file({name_ptr:#x}, {name_len}, ..) is not a name this process owns"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            if !running.owns(data_ptr, data_len) || data_len > MAX_WRITE {
+                error!(
+                    "HARLAN: syscall write_file(.., {data_ptr:#x}, {data_len}) is not bytes this process owns"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: both ranges were just checked to be inside the pages
+            // this process was given, which are mapped in the active
+            // space. Read only, so a read-only page is fine here.
+            let (name, contents) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        VirtAddr::new(name_ptr).as_ptr::<u8>(),
+                        name_len as usize,
+                    ),
+                    core::slice::from_raw_parts(
+                        VirtAddr::new(data_ptr).as_ptr::<u8>(),
+                        data_len as usize,
+                    ),
+                )
+            };
+            let Ok(name) = core::str::from_utf8(name) else {
+                error!("HARLAN: syscall write_file() was handed a name that is not text");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            };
+            match crate::fs::write_file(name, contents) {
+                Ok(entry) => {
+                    info!(
+                        "HARLAN: slot {} wrote {} ({} byte(s))",
+                        running.slot,
+                        entry.name(),
+                        entry.size
+                    );
+                    frame.rax = data_len;
+                }
+                Err(err) => frame.rax = number_for(&err) as u64,
+            }
+        }
         None => {
             error!("HARLAN: unknown syscall {}", frame.rax);
             frame.rax = ERR_UNKNOWN_CALL as u64;
+        }
+    }
+}
+
+/// The most one `write_file` will take in a single call.
+///
+/// What `MAX_FILE_CLUSTERS` allows, which is the writer's own limit
+/// (ADR 0027): asking for more is refused here, with a number, rather than
+/// part way through the write.
+pub const MAX_WRITE: u64 =
+    harlan_hal::fat::MAX_FILE_CLUSTERS as u64 * harlan_hal::fat::SECTOR_BYTES as u64;
+
+/// A limit of zero would refuse every write, which is a way of having no
+/// `write_file` at all. Checked at compile time, because at runtime the
+/// assertion is a constant one and says nothing a build could not.
+const _: () = assert!(MAX_WRITE > 0);
+
+/// Which number a program sees for something that went wrong on the disk.
+///
+/// The translation lives here and not in `fs`, so that what happened and
+/// what a program is told about it stay separable: the log says the first
+/// and `rax` carries the second.
+fn number_for(err: &crate::fs::FileError) -> i64 {
+    use crate::fs::FileError;
+    use harlan_hal::fat::WriteError;
+    match err {
+        FileError::NoDisk => {
+            error!("HARLAN: a file was asked for and there is no disk");
+            ERR_DISK
+        }
+        FileError::BadName => ERR_BAD_ARGUMENT,
+        FileError::NoSuchFile => ERR_NO_SUCH_FILE,
+        // A directory is not a file, and a program that asked for one by
+        // name asked for something that is there and is not what it wants.
+        FileError::IsADirectory => ERR_NO_SUCH_FILE,
+        FileError::Open => ERR_FILE_IS_OPEN,
+        FileError::Reading(why) => {
+            error!("HARLAN: the disk could not be read: {why:?}");
+            ERR_DISK
+        }
+        FileError::Writing(WriteError::Full { needed, free }) => {
+            error!("HARLAN: the volume has {free} free cluster(s) and {needed} are needed");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(WriteError::TooManyClusters { needed }) => {
+            error!("HARLAN: a file of {needed} cluster(s) is more than this kernel writes");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(WriteError::DirectoryFull) => {
+            error!("HARLAN: the root directory has no slot left");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(why) => {
+            error!("HARLAN: the disk could not be written: {why:?}");
+            ERR_DISK
         }
     }
 }
@@ -873,12 +1141,13 @@ mod tests {
     /// A process whose memory is this test's own, so that a pointer the
     /// kernel accepts can actually be read on the host.
     fn running_on(buffer: &mut [u8]) -> Running {
+        let range = PhysRange::new(PhysAddr::new(buffer.as_ptr() as u64), buffer.len() as u64);
         Running {
             slot: 0,
-            ranges: filled_with(PhysRange::new(
-                PhysAddr::new(buffer.as_ptr() as u64),
-                buffer.len() as u64,
-            )),
+            ranges: filled_with(range),
+            // The test's buffer is the test's to write. A process whose
+            // code is not writable is the subject of its own tests.
+            writable: filled_with(range),
         }
     }
 
@@ -911,8 +1180,19 @@ mod tests {
         assert_eq!(Call::from(2), Some(Call::Yield));
         assert_eq!(Call::from(3), Some(Call::Send));
         assert_eq!(Call::from(4), Some(Call::Recv));
-        assert_eq!(Call::from(5), None);
+        assert_eq!(Call::from(5), Some(Call::Open));
+        assert_eq!(Call::from(6), Some(Call::Read));
+        assert_eq!(Call::from(7), Some(Call::Close));
+        assert_eq!(Call::from(8), Some(Call::WriteFile));
+        assert_eq!(Call::from(9), None);
         assert_eq!(Call::from(u64::MAX), None);
+        // The numbers are the ABI (ADR 0028, point 3), so they are
+        // asserted and not derived: a renumbering that a program does not
+        // hear about is a program calling something else.
+        assert_eq!(Call::Open as u64, 5);
+        assert_eq!(Call::Read as u64, 6);
+        assert_eq!(Call::Close as u64, 7);
+        assert_eq!(Call::WriteFile as u64, 8);
     }
 
     /// Every pointer that arrives from ring 3 is refused before a byte of
@@ -992,5 +1272,119 @@ mod tests {
         let mut frame = frame_for(Call::Recv, buffer.as_ptr() as u64, ipc::CAPACITY as u64, 0);
         serve(&mut frame, running);
         assert_eq!(frame.rax as i64, ERR_WOULD_WAIT_FOR_EVER);
+    }
+
+    // -----------------------------------------------------------------
+    // What a program is told about a file (ADR 0028, point 13)
+    // -----------------------------------------------------------------
+
+    /// Every way a file operation can fail maps to a number, each number
+    /// is negative, and the ones that mean different things are different.
+    ///
+    /// Asserted rather than derived: these numbers are the ABI, and a
+    /// program compiled against one of them and served another is a program
+    /// that mistakes "no such file" for "the disk is broken".
+    #[test]
+    fn every_file_failure_has_its_own_number() {
+        use crate::fs::FileError;
+        use harlan_hal::fat::{VolumeError, WriteError};
+
+        assert_eq!(number_for(&FileError::BadName), ERR_BAD_ARGUMENT);
+        assert_eq!(number_for(&FileError::NoSuchFile), ERR_NO_SUCH_FILE);
+        assert_eq!(number_for(&FileError::Open), ERR_FILE_IS_OPEN);
+        assert_eq!(number_for(&FileError::NoDisk), ERR_DISK);
+        // A directory is something that is there and is not what was
+        // asked for, which from a program's side is the same as absent.
+        assert_eq!(number_for(&FileError::IsADirectory), ERR_NO_SUCH_FILE);
+        // Running out of room is its own answer, not a broken disk: a
+        // program can do something about one and not the other.
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::Full { needed: 4, free: 1 })),
+            ERR_VOLUME_FULL
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::TooManyClusters {
+                needed: 999
+            })),
+            ERR_VOLUME_FULL
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::DirectoryFull)),
+            ERR_VOLUME_FULL
+        );
+        // Anything the medium did is a disk error.
+        assert_eq!(
+            number_for(&FileError::Reading(VolumeError::ChainLoops)),
+            ERR_DISK
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::Reading(
+                VolumeError::BadCluster { cluster: 7 }
+            ))),
+            ERR_DISK
+        );
+    }
+
+    /// Nothing an error maps to is mistakable for a result.
+    ///
+    /// `rax` carries both: a count of bytes, or a negative number. A
+    /// failure that mapped to zero or more would be read as "no bytes" or
+    /// as a descriptor, and a program would carry on with it.
+    #[test]
+    fn no_file_error_can_be_mistaken_for_an_answer() {
+        for number in [
+            ERR_BAD_DESCRIPTOR,
+            ERR_TOO_MANY_OPEN,
+            ERR_NO_SUCH_FILE,
+            ERR_FILE_IS_OPEN,
+            ERR_VOLUME_FULL,
+            ERR_DISK,
+        ] {
+            assert!(number < 0, "{number} would be read as a result");
+        }
+        // And none of them is any of the others, nor any of the five that
+        // came before: the whole set is distinct.
+        let all = [
+            ERR_UNKNOWN_CALL,
+            ERR_BAD_ARGUMENT,
+            ERR_MAILBOX_FULL,
+            ERR_NO_SUCH_PROCESS,
+            ERR_WOULD_WAIT_FOR_EVER,
+            ERR_BAD_DESCRIPTOR,
+            ERR_TOO_MANY_OPEN,
+            ERR_NO_SUCH_FILE,
+            ERR_FILE_IS_OPEN,
+            ERR_VOLUME_FULL,
+            ERR_DISK,
+        ];
+        for (at, one) in all.iter().enumerate() {
+            for other in &all[at + 1..] {
+                assert_ne!(one, other, "two errors share a number");
+            }
+        }
+    }
+
+    /// The limits a file call refuses before it does any work.
+    ///
+    /// A name longer than the format can hold, and a read or write bigger
+    /// than this kernel will do inside one syscall. Each is a number a
+    /// program can be told rather than a surprise part of the way through.
+    #[test]
+    fn the_limits_of_a_file_call_are_what_the_format_and_the_writer_allow() {
+        // Eight, a dot and three.
+        assert_eq!(MAX_NAME, 12);
+        assert!(harlan_hal::fat::encode_name("ABCDEFGH.IJK").is_some());
+        assert!(
+            harlan_hal::fat::encode_name("ABCDEFGHI.JKL").is_none(),
+            "one longer than MAX_NAME is not a name the format holds"
+        );
+        // A read fits in a page, so one call is bounded work.
+        assert_eq!(MAX_READ, 4096);
+        // And a write is what the writer itself allows, not a number
+        // invented here (ADR 0027).
+        assert_eq!(
+            MAX_WRITE,
+            harlan_hal::fat::MAX_FILE_CLUSTERS as u64 * harlan_hal::fat::SECTOR_BYTES as u64
+        );
     }
 }

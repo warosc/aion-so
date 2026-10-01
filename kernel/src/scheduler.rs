@@ -130,9 +130,19 @@ impl Scheduler {
     }
 
     /// Marks one process as gone, wherever it is.
+    ///
+    /// The one place a process becomes dead, whether it exited or faulted,
+    /// which is why its open files are closed here and not in : a
+    /// process that faulted has ended too, and a descriptor it left open
+    /// would keep a file unwritable for ever (ADR 0028, points 8 and 12).
+    ///
+    /// Nothing is written on the way out. A descriptor holds no unwritten
+    /// bytes, because writing is whole-file and finishes inside the one
+    /// syscall that started it.
     pub fn kill(&mut self, index: usize) {
         if let Some(slot) = self.slots.get_mut(index).and_then(Option::as_mut) {
             slot.state = State::Dead;
+            slot.process.close_everything();
         }
     }
 
@@ -496,6 +506,32 @@ pub unsafe fn dead_processes() -> impl Iterator<Item = &'static mut Process> {
         })
 }
 
+/// Whether any process, running or not, has `name` open.
+///
+/// What makes ADR 0028 point 12 structural rather than a note: writing a
+/// whole file reuses the chain the old one had (ADR 0027, point 9), so a
+/// descriptor opened on that file would start reading the new bytes among
+/// the old. `fs::write_file` asks this before it writes anything, so the
+/// rule holds for the kernel's own writes too — at boot nothing is open,
+/// so it answers `false` and the boot writes as it always did.
+///
+/// Sixteen slots of four descriptors is sixty-four name comparisons, which
+/// is nothing beside the sector reads a write is about to do.
+///
+/// # Safety
+///
+/// As `the_scheduler`: one caller at a time, and not from an interrupt
+/// that could have preempted a change to the table.
+pub unsafe fn anyone_has_open(name: &str) -> bool {
+    // SAFETY: forwarded from this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    scheduler
+        .slots
+        .iter()
+        .flatten()
+        .any(|slot| slot.process.has_open(name))
+}
+
 /// Where a process runs for the first time: straight into ring 3.
 ///
 /// # Safety
@@ -532,6 +568,9 @@ unsafe extern "C" fn run_first(_argument: *mut u8) -> ! {
 pub struct Running {
     pub slot: usize,
     pub ranges: [PhysRange; crate::process::MAX_RANGES],
+    /// The ones it may write. A syscall that fills a buffer asks this
+    /// instead (ADR 0028, point 9).
+    pub writable: [PhysRange; crate::process::MAX_RANGES],
 }
 
 impl Running {
@@ -539,6 +578,18 @@ impl Running {
     /// point 9).
     pub fn owns(&self, ptr: u64, len: u64) -> bool {
         crate::process::owned_by(&self.ranges, ptr, len)
+    }
+
+    /// Whether `[ptr, ptr + len)` is memory this process owns **and** may
+    /// write.
+    ///
+    /// For a syscall that fills a buffer. A program that hands over the
+    /// address of its own code is refused here rather than served: the
+    /// page is read-only, and the kernel writing it anyway is a ring-0
+    /// page fault, which is a program turning its own bad argument into a
+    /// kernel panic.
+    pub fn owns_writable(&self, ptr: u64, len: u64) -> bool {
+        crate::process::owned_by(&self.writable, ptr, len)
     }
 }
 
@@ -562,7 +613,36 @@ pub unsafe fn running() -> Option<Running> {
     Some(Running {
         slot,
         ranges: held.process.ranges(),
+        writable: held.process.writable_ranges(),
     })
+}
+
+/// Runs `operation` over the process that has the CPU.
+///
+/// For what cannot be copied out of it: its open files. A borrow rather
+/// than a copy, and one that ends with the call — a descriptor table read
+/// into a local would go stale the moment another process closed
+/// something.
+///
+/// `None` when nobody has the CPU, which is every call before the
+/// scheduler hands it over.
+///
+/// # Safety
+///
+/// As `the_scheduler`, and `operation` must not switch processes or exit
+/// one: it holds a `&mut` to the process that is running.
+pub unsafe fn with_running<R>(operation: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    // SAFETY: forwarded from this function's contract.
+    let scheduler = unsafe { the_scheduler() };
+    if !scheduler.handed_over {
+        return None;
+    }
+    let slot = scheduler.current;
+    let held = scheduler.slots[slot].as_mut()?;
+    if held.state == State::Dead {
+        return None;
+    }
+    Some(operation(held.process))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -786,8 +866,28 @@ mod tests {
         let mut ranges = [PhysRange::new(PhysAddr::new(0), 0); crate::process::MAX_RANGES];
         ranges[0] = PhysRange::new(PhysAddr::new(0x0040_0000), PAGE_SIZE);
         ranges[1] = PhysRange::new(PhysAddr::new(0x0050_0000), PAGE_SIZE);
-        let running = Running { slot: 1, ranges };
+        // Its stack is writable and its code is not, which is what a
+        // syscall that fills a buffer has to be able to tell apart.
+        let mut writable = [PhysRange::new(PhysAddr::new(0), 0); crate::process::MAX_RANGES];
+        writable[1] = ranges[1];
+        let running = Running {
+            slot: 1,
+            ranges,
+            writable,
+        };
         assert!(running.owns(0x0040_0000, 8), "its code");
+        assert!(
+            !running.owns_writable(0x0040_0000, 8),
+            "its code is its, and it may not write it"
+        );
+        assert!(
+            running.owns_writable(0x0050_0000, PAGE_SIZE),
+            "its stack is its to write"
+        );
+        assert!(
+            !running.owns_writable(0x0045_0000, 8),
+            "the gap is nobody's to write"
+        );
         assert!(running.owns(0x0050_0000, PAGE_SIZE), "its whole stack");
         assert!(!running.owns(0x0040_0000, PAGE_SIZE + 1), "past the page");
         assert!(!running.owns(0x0045_0000, 8), "the gap between the two");

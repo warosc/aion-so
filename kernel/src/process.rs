@@ -11,6 +11,7 @@
 
 use harlan_arch_x86_64::paging::AddressSpace;
 use harlan_hal::addr::{PhysAddr, VirtAddr};
+use harlan_hal::fat::DirectoryEntry;
 use harlan_hal::frame::{PhysFrame, PhysRange};
 use harlan_hal::info;
 use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags};
@@ -62,6 +63,16 @@ pub struct Process {
     /// against (ADR 0014, point 9). A flat program owns two ranges, its
     /// code and its stack; an ELF owns one per segment and its stack.
     pub owned: [Option<PhysRange>; MAX_RANGES],
+    /// Which of `owned` the program may write, which is not the same
+    /// question (ADR 0028, point 9).
+    ///
+    /// A syscall that **fills** a buffer has to ask this one. A page that
+    /// is read-only for the user is still writable by the kernel unless
+    /// CR0.WP says otherwise — and it does say otherwise, which turns a
+    /// program handing over the address of its own code into a page fault
+    /// in ring 0: a bad argument becoming a kernel panic. The fix is to
+    /// refuse the argument, which needs the kernel to know.
+    pub writable: [Option<PhysRange>; MAX_RANGES],
     /// The frames behind that memory, and what each was taken for, so
     /// that they can be given back when it exits.
     pub frames: [Option<(PhysFrame, FramePurpose)>; MAX_FRAMES],
@@ -71,6 +82,105 @@ pub struct Process {
     /// Where it enters the kernel: its own stack, with guard pages
     /// (docs/adr/0018-fase3-context-switch.md).
     pub kernel_stack: Stack,
+    /// The files it has open (docs/adr/0028-fase4-file-abi-v0.md).
+    ///
+    /// The third resource a process owns, and the first that is not
+    /// memory. Its own type, so that what a descriptor is can be tested
+    /// without a process — which needs page tables, which need a machine.
+    pub open: OpenFiles,
+}
+
+/// How many files one process may hold open at a time (ADR 0028, point 5).
+///
+/// Four, and fixed, so the table lives inside `Process` and opening a file
+/// allocates nothing. A program that needs a fifth in Fase 4 is doing
+/// something this phase does not have to support.
+pub const MAX_OPEN: usize = 4;
+
+/// A file a process has open, and how far through it that process is.
+///
+/// The directory entry as it was when the file was opened, not a pointer
+/// into the volume: enough to make the next read from nothing, so the
+/// kernel never lends a process anything that belongs to the filesystem
+/// (ADR 0028, point 6).
+#[derive(Clone, Copy, Debug)]
+pub struct OpenFile {
+    pub entry: DirectoryEntry,
+    /// Where the next `read` starts. Only ever moved forward, by exactly
+    /// what a read returned: there is no `seek` in v0, so a descriptor
+    /// cannot be pointed anywhere a read has not already reached.
+    pub position: u32,
+}
+
+/// What one process has open: a fixed table, where a descriptor is an
+/// index (ADR 0028, points 4 and 5).
+///
+/// Fixed and small so that opening a file allocates nothing, and an index
+/// rather than a pointer or a global number so that a program cannot
+/// invent a valid descriptor or name another process's: the numbers mean
+/// nothing outside this table.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenFiles([Option<OpenFile>; MAX_OPEN]);
+
+impl OpenFiles {
+    pub const fn new() -> Self {
+        Self([None; MAX_OPEN])
+    }
+
+    /// Puts `file` in the first free slot and answers its descriptor.
+    ///
+    /// `None` when all four are taken, which a program sees as
+    /// `ERR_TOO_MANY_OPEN`. The **first free** slot rather than the next
+    /// number: a descriptor that was closed is handed out again, so a
+    /// program that opens and closes in a loop does not run out.
+    pub fn open(&mut self, file: OpenFile) -> Option<usize> {
+        let at = self.0.iter().position(Option::is_none)?;
+        self.0[at] = Some(file);
+        Some(at)
+    }
+
+    /// The file a descriptor names, if it is open.
+    ///
+    /// A number from ring 3 is an index into this table and nothing else:
+    /// out of range and closed are the same answer, which is why a program
+    /// learns nothing by guessing.
+    pub fn at(&mut self, descriptor: usize) -> Option<&mut OpenFile> {
+        self.0.get_mut(descriptor)?.as_mut()
+    }
+
+    /// Closes a descriptor, answering whether it was open.
+    pub fn close(&mut self, descriptor: usize) -> bool {
+        match self.0.get_mut(descriptor) {
+            Some(slot) => slot.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Whether this table holds that name.
+    ///
+    /// Compared without case, as every other name comparison is: a short
+    /// name is stored upper case and nobody types it that way.
+    pub fn holds(&self, name: &str) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .any(|file| file.entry.is_named(name))
+    }
+
+    /// Closes everything.
+    ///
+    /// Nothing is written: a descriptor holds no unwritten bytes, because
+    /// writing is whole-file and finishes inside the one syscall that
+    /// started it (ADR 0028, point 1).
+    pub fn close_everything(&mut self) {
+        self.0 = [None; MAX_OPEN];
+    }
+
+    /// How many are open. For the log, and for a test that wants to say
+    /// what it expects without reaching inside.
+    pub fn count(&self) -> usize {
+        self.0.iter().flatten().count()
+    }
 }
 
 /// What a process is being built out of, while it is being built.
@@ -81,6 +191,7 @@ pub struct Process {
 struct Building {
     space: AddressSpace,
     owned: [Option<PhysRange>; MAX_RANGES],
+    writable: [Option<PhysRange>; MAX_RANGES],
     frames: [Option<(PhysFrame, FramePurpose)>; MAX_FRAMES],
     ranges: usize,
     taken: usize,
@@ -91,17 +202,26 @@ impl Building {
         Self {
             space,
             owned: [None; MAX_RANGES],
+            writable: [None; MAX_RANGES],
             frames: [None; MAX_FRAMES],
             ranges: 0,
             taken: 0,
         }
     }
 
-    fn own(&mut self, range: PhysRange) -> Result<(), SpawnError> {
+    /// Records a range as this process's, and whether it may write it.
+    ///
+    /// Both at once, from one call, so that there is no way to add a range
+    /// and forget to say which it is — the two arrays cannot drift apart
+    /// because nothing else writes them.
+    fn own(&mut self, range: PhysRange, writable: bool) -> Result<(), SpawnError> {
         if self.ranges == MAX_RANGES {
             return Err(SpawnError::TooManyRanges);
         }
         self.owned[self.ranges] = Some(range);
+        if writable {
+            self.writable[self.ranges] = Some(range);
+        }
         self.ranges += 1;
         Ok(())
     }
@@ -130,11 +250,26 @@ impl Building {
         Process {
             space: self.space,
             owned: self.owned,
+            writable: self.writable,
             frames: self.frames,
             entry,
             kernel_stack,
+            open: OpenFiles::new(),
         }
     }
+}
+
+/// The same ranges in a fixed array, with the empty slots as ranges of
+/// no bytes — which `owned_by` can never match, because it refuses a
+/// length of zero.
+fn fixed(ranges: &[Option<PhysRange>; MAX_RANGES]) -> [PhysRange; MAX_RANGES] {
+    let mut out = [PhysRange::new(PhysAddr::new(0), 0); MAX_RANGES];
+    for (at, range) in ranges.iter().enumerate() {
+        if let Some(range) = range {
+            out[at] = *range;
+        }
+    }
+    out
 }
 
 /// Whether `[ptr, ptr + len)` falls inside one of `ranges`.
@@ -165,13 +300,42 @@ impl Process {
     /// The ranges it owns, in a fixed array so that the syscall handler
     /// can copy them out without borrowing the scheduler.
     pub fn ranges(&self) -> [PhysRange; MAX_RANGES] {
-        let mut ranges = [PhysRange::new(PhysAddr::new(0), 0); MAX_RANGES];
-        for (at, owned) in self.owned.iter().enumerate() {
-            if let Some(range) = owned {
-                ranges[at] = *range;
-            }
-        }
-        ranges
+        fixed(&self.owned)
+    }
+
+    /// The ranges it owns **and** may write, in the same shape.
+    pub fn writable_ranges(&self) -> [PhysRange; MAX_RANGES] {
+        fixed(&self.writable)
+    }
+
+    /// Puts `file` in the first free slot and answers its descriptor.
+    pub fn open_file(&mut self, file: OpenFile) -> Option<usize> {
+        self.open.open(file)
+    }
+
+    /// The file a descriptor names, if this process opened it and has not
+    /// closed it.
+    pub fn open_at(&mut self, descriptor: usize) -> Option<&mut OpenFile> {
+        self.open.at(descriptor)
+    }
+
+    /// Closes a descriptor, answering whether it was open.
+    pub fn close_file(&mut self, descriptor: usize) -> bool {
+        self.open.close(descriptor)
+    }
+
+    /// Whether this process has that name open.
+    pub fn has_open(&self, name: &str) -> bool {
+        self.open.holds(name)
+    }
+
+    /// Closes everything this process had open.
+    ///
+    /// Called when it ends, like giving its frames back
+    /// (docs/adr/0021-fase3-reclaiming-a-dead-space.md): a process that
+    /// has ended keeps nothing.
+    pub fn close_everything(&mut self) {
+        self.open.close_everything();
     }
 
     /// Where the CPU starts it.
@@ -266,11 +430,16 @@ pub unsafe fn spawn(
     let mut building = Building::new(space);
     building.took(code_frame, FramePurpose::Kernel)?;
     building.took(stack_frame, FramePurpose::Stack)?;
-    building.own(PhysRange::new(PhysAddr::new(CODE_BASE.as_u64()), PAGE_SIZE))?;
-    building.own(PhysRange::new(
-        PhysAddr::new(STACK_BASE.as_u64()),
-        PAGE_SIZE,
-    ))?;
+    // Its code is not writable by it — that is what W^X means for a
+    // program (ADR 0008) — and its stack is.
+    building.own(
+        PhysRange::new(PhysAddr::new(CODE_BASE.as_u64()), PAGE_SIZE),
+        false,
+    )?;
+    building.own(
+        PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
+        true,
+    )?;
     Ok(building.finish(CODE_BASE, kernel_stack))
 }
 
@@ -387,10 +556,10 @@ unsafe fn load(
             }
             page_at += PAGE_SIZE;
         }
-        building.own(PhysRange::new(
-            PhysAddr::new(segment.at.as_u64()),
-            segment.memory_size,
-        ))?;
+        building.own(
+            PhysRange::new(PhysAddr::new(segment.at.as_u64()), segment.memory_size),
+            segment.writable(),
+        )?;
     }
 
     // And a stack, which the file says nothing about: it is the kernel's
@@ -411,10 +580,10 @@ unsafe fn load(
             )
             .map_err(SpawnError::Mapping)?;
     }
-    building.own(PhysRange::new(
-        PhysAddr::new(STACK_BASE.as_u64()),
-        PAGE_SIZE,
-    ))?;
+    building.own(
+        PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
+        true,
+    )?;
 
     Ok(())
 }
@@ -495,5 +664,171 @@ mod tests {
         let other = [PhysRange::new(PhysAddr::new(0x0080_0000), PAGE_SIZE)];
         assert!(!owned_by(&mine, 0x0080_0000, 8));
         assert!(!owned_by(&other, CODE_BASE.as_u64(), 8));
+    }
+
+    // -----------------------------------------------------------------
+    // The descriptor table (docs/adr/0028-fase4-file-abi-v0.md)
+    // -----------------------------------------------------------------
+
+    /// An entry for a file of `size` bytes, named `name`.
+    fn entry_named(name: &str, size: u32) -> DirectoryEntry {
+        let mut bytes = [b' '; 12];
+        let mut at = 0;
+        for byte in name.bytes() {
+            bytes[at] = byte;
+            at += 1;
+        }
+        DirectoryEntry {
+            name: bytes,
+            name_len: at,
+            attributes: 0x20,
+            first_cluster: 3,
+            size,
+        }
+    }
+
+    fn open_file(name: &str) -> OpenFile {
+        OpenFile {
+            entry: entry_named(name, 100),
+            position: 0,
+        }
+    }
+
+    /// Descriptors are handed out from the lowest free slot, which is what
+    /// makes a program that opens and closes in a loop not run out.
+    #[test]
+    fn a_closed_descriptor_is_handed_out_again() {
+        let mut open = OpenFiles::new();
+        assert_eq!(open.open(open_file("A.TXT")), Some(0));
+        assert_eq!(open.open(open_file("B.TXT")), Some(1));
+        assert_eq!(open.open(open_file("C.TXT")), Some(2));
+        assert_eq!(open.count(), 3);
+
+        assert!(open.close(1), "it was open");
+        assert_eq!(open.count(), 2);
+        assert_eq!(
+            open.open(open_file("D.TXT")),
+            Some(1),
+            "the slot that was freed, not the next number"
+        );
+
+        // And a loop of open-then-close never runs out.
+        for _ in 0..1000 {
+            let at = open.open(open_file("E.TXT")).expect("a slot");
+            assert!(open.close(at));
+        }
+    }
+
+    /// Four, and the fifth is refused rather than taking somebody's slot.
+    #[test]
+    fn a_fifth_file_is_refused() {
+        let mut open = OpenFiles::new();
+        for at in 0..MAX_OPEN {
+            assert_eq!(open.open(open_file("A.TXT")), Some(at));
+        }
+        assert_eq!(open.open(open_file("B.TXT")), None, "the fifth");
+        // And nothing was lost: the four that were there are still there.
+        assert_eq!(open.count(), MAX_OPEN);
+        for at in 0..MAX_OPEN {
+            assert!(open.at(at).is_some(), "descriptor {at}");
+        }
+    }
+
+    /// A descriptor that was never opened, one that was closed, and one
+    /// past the end of the table are the same answer. A program that
+    /// guesses learns nothing from the difference, because there is none.
+    #[test]
+    fn a_descriptor_that_is_not_open_answers_nothing() {
+        let mut open = OpenFiles::new();
+        assert!(open.at(0).is_none(), "never opened");
+        assert!(open.at(MAX_OPEN).is_none(), "past the table");
+        assert!(open.at(usize::MAX).is_none(), "far past the table");
+        assert!(!open.close(0), "closing one that is not open");
+        assert!(!open.close(usize::MAX), "closing one that cannot exist");
+
+        // With the table **full**, which is the case that matters: an
+        // out-of-range descriptor must not be clamped into a real one.
+        // Asked of an empty table, a clamped index lands on an empty slot
+        // and answers `None` for the wrong reason — a mutation that
+        // clamped survived until this was here.
+        let mut full = OpenFiles::new();
+        for _ in 0..MAX_OPEN {
+            full.open(open_file("A.TXT")).expect("a slot");
+        }
+        assert!(
+            full.at(MAX_OPEN).is_none(),
+            "one past the last descriptor is not the last descriptor"
+        );
+        assert!(full.at(usize::MAX).is_none(), "nor is the largest number");
+        assert!(!full.close(MAX_OPEN), "and it cannot be closed either");
+        assert_eq!(full.count(), MAX_OPEN, "closing it closed nothing");
+
+        let at = open.open(open_file("A.TXT")).expect("a slot");
+        assert!(open.at(at).is_some());
+        assert!(open.close(at));
+        assert!(
+            open.at(at).is_none(),
+            "a closed descriptor is as absent as one that never was"
+        );
+        assert!(!open.close(at), "closed twice is closed once");
+    }
+
+    /// A position moves where a read put it, and nothing else moves it:
+    /// there is no `seek` in v0.
+    #[test]
+    fn a_position_is_where_the_table_says() {
+        let mut open = OpenFiles::new();
+        let at = open.open(open_file("A.TXT")).expect("a slot");
+        assert_eq!(
+            open.at(at).expect("open").position,
+            0,
+            "starts at the start"
+        );
+
+        open.at(at).expect("open").position = 40;
+        assert_eq!(open.at(at).expect("open").position, 40);
+
+        // A second descriptor on the same file has its own position: two
+        // readers of one file do not move each other along.
+        let second = open.open(open_file("A.TXT")).expect("a slot");
+        assert_eq!(open.at(second).expect("open").position, 0);
+        assert_eq!(open.at(at).expect("open").position, 40);
+    }
+
+    /// Whether a name is open is asked without case, because that is how
+    /// every other name comparison here works — and because the question
+    /// is asked by `write_file`, where getting it wrong means writing over
+    /// a file somebody is reading (ADR 0028, point 12).
+    #[test]
+    fn a_name_is_held_whichever_way_it_is_asked_for() {
+        let mut open = OpenFiles::new();
+        open.open(open_file("HELLO.TXT")).expect("a slot");
+        assert!(open.holds("HELLO.TXT"));
+        assert!(open.holds("hello.txt"), "without case");
+        assert!(open.holds("Hello.Txt"), "without case");
+        assert!(!open.holds("HELLO.BIN"), "a different file");
+        assert!(!open.holds("HELLO"), "not a prefix of it");
+        assert!(!open.holds(""), "nothing at all");
+    }
+
+    /// A process that ends keeps nothing, which includes the files it had
+    /// open — otherwise a descriptor it left behind would keep that file
+    /// unwritable for ever.
+    #[test]
+    fn ending_closes_everything() {
+        let mut open = OpenFiles::new();
+        for _ in 0..MAX_OPEN {
+            open.open(open_file("A.TXT")).expect("a slot");
+        }
+        assert!(open.holds("A.TXT"));
+
+        open.close_everything();
+        assert_eq!(open.count(), 0);
+        assert!(!open.holds("A.TXT"), "nothing keeps that file open now");
+        assert_eq!(
+            open.open(open_file("B.TXT")),
+            Some(0),
+            "and the table is free again"
+        );
     }
 }
