@@ -115,6 +115,17 @@ impl Building {
         Ok(())
     }
 
+    /// Gives back every frame taken so far. For a process that will not
+    /// exist: its page tables go with its space, which nothing has
+    /// activated, and the allocator ends where it started.
+    fn give_back(&mut self, frames: &mut KernelFrames<'_>) {
+        for (frame, purpose) in self.frames.iter().flatten() {
+            let _ = frames.deallocate_as(*frame, *purpose);
+        }
+        self.frames = [None; MAX_FRAMES];
+        self.taken = 0;
+    }
+
     fn finish(self, entry: VirtAddr, kernel_stack: Stack) -> Process {
         Process {
             space: self.space,
@@ -285,7 +296,39 @@ pub unsafe fn spawn_elf(
     // SAFETY: forwarded from this function's contract.
     let space = unsafe { mapper.new_address_space(frames) }.map_err(SpawnError::Space)?;
     let mut building = Building::new(space);
+    // A load that stops half way has still taken frames. Giving them back
+    // is what keeps the boot's own count — free before any process existed,
+    // free again once they are all gone — meaning what it says.
+    // SAFETY: as this function's contract.
+    if let Err(err) = unsafe { load(&mut building, program, file, frames) } {
+        building.give_back(frames);
+        return Err(err);
+    }
 
+    info!(
+        "HARLAN: a process from an ELF: space at {:#x}, {} segment(s), entry {:#x}, a stack at {:#x}",
+        building.space.root(),
+        program.segment_count(),
+        program.entry,
+        STACK_BASE
+    );
+    Ok(building.finish(program.entry, kernel_stack))
+}
+
+/// Maps a program's segments and its stack into `building`.
+///
+/// Separate from `spawn_elf` so that there is exactly one place that knows
+/// what to do when any of this fails: everything taken goes back.
+///
+/// # Safety
+///
+/// As `spawn_elf`.
+unsafe fn load(
+    building: &mut Building,
+    program: &harlan_hal::elf::Program,
+    file: &[u8],
+    frames: &mut KernelFrames<'_>,
+) -> Result<(), SpawnError> {
     for segment in program.segments() {
         let first = segment.at.as_u64() & !(PAGE_SIZE - 1);
         let last = (segment.end() - 1) & !(PAGE_SIZE - 1);
@@ -373,14 +416,7 @@ pub unsafe fn spawn_elf(
         PAGE_SIZE,
     ))?;
 
-    info!(
-        "HARLAN: a process from an ELF: space at {:#x}, {} segment(s), entry {:#x}, a stack at {:#x}",
-        building.space.root(),
-        program.segment_count(),
-        program.entry,
-        STACK_BASE
-    );
-    Ok(building.finish(program.entry, kernel_stack))
+    Ok(())
 }
 
 /// Gives back everything a process that has ended was using: its memory,
