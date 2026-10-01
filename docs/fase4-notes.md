@@ -2,12 +2,175 @@
 
 Lo más reciente arriba. Salida de la fase (ROADMAP.md): **crear, leer y
 persistir un archivo entre reinicios** — cumplida en el Incremento 32, con
-diez arranques seguidos sobre el mismo disco contando cuántos van.
+diez arranques seguidos sobre el mismo disco contando cuántos van. Desde el
+Incremento 33 eso lo puede hacer también un programa en ring 3, por el ABI
+del ADR 0028.
 
 Decisiones de alcance tomadas al abrir la fase: **virtio-blk** como primer
 driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
+
+## Incremento 33 — Un programa que abre, lee y escribe ficheros
+
+`docs/adr/0028-fase4-file-abi-v0.md`. Lo que el kernel hacía por dentro
+pasa a poder hacerlo un programa en ring 3.
+
+### La decisión: la asimetría
+
+**Descriptores para leer, el fichero entero para escribir.** No es una
+simetría rota por descuido, son dos problemas distintos:
+
+- leer a trozos hace falta porque un fichero es más grande que un buffer, y
+  un descriptor es lo mínimo que lo resuelve: recuerda por dónde iba;
+- escribir a trozos significaría asignar un cluster en medio de una cadena
+  con el directorio diciendo todavía el tamaño viejo, que es exactamente lo
+  que el ADR 0027 punto 2 se negó a prometer. Un `write` con posición sería
+  un ABI prometiendo lo que el escritor de debajo no cumple.
+
+El coste se asume y se nombra: cambiar tres bytes de un fichero obliga a
+leerlo entero, cambiarlos y escribirlo entero. Para una shell y sus
+ficheros de configuración basta; para un editor no, y ese es el día en que
+el ADR sube de versión.
+
+### Qué hace
+
+- **Cuatro llamadas**, tras las cinco que había: `open` (5), `read` (6),
+  `close` (7), `write_file` (8). Y seis errores nuevos, del `-7` al `-12`,
+  siguiendo la numeración en vez de inventar un esquema.
+- **Un descriptor es un entero pequeño**, índice en una tabla fija de
+  cuatro dentro de `Process`. Opaco, por proceso, no transferible, cerrado
+  por `exit`. Un programa no puede inventarse uno válido ni nombrar el de
+  otro: fuera de esa tabla los números no significan nada.
+- **Se reparten desde el hueco más bajo**, no desde el siguiente número, así
+  que abrir y cerrar en bucle no se queda sin descriptores.
+- **Fuera de rango, nunca abierto y cerrado son la misma respuesta.** Un
+  programa que adivina no aprende nada de la diferencia porque no hay
+  diferencia.
+- **`kill` cierra la tabla**, no `exit`: un proceso que falló también ha
+  terminado, y un descriptor que dejara abierto mantendría ese fichero
+  imposible de escribir para siempre.
+- **El disco deja de ser una variable local del arranque.** `kernel/src/fs.rs`
+  lo sujeta tras un `IrqLock` con su lector y su sector de arranque. El
+  volumen **no** se guarda: se reconstruye en cada operación, así que no hay
+  cadena en caché, ni cuenta de clusters libres, ni estado de ficheros
+  abiertos que pueda quedar en desacuerdo con el disco.
+- Y una vez alcanzable, el arranque deja de tener un segundo camino: las
+  cuatro funciones que montaban su propio volumen pasan por `fs`. Un camino
+  al disco en vez de cinco, y el arranque ejercita el mismo que un `open`.
+
+### `write_file` se niega si alguien tiene ese nombre abierto
+
+Un descriptor guarda la cadena con la que se abrió, y sobrescribir
+reutiliza esa cadena (ADR 0027, punto 9): quien estuviera leyendo pasaría a
+ver los bytes nuevos entre los viejos. Recorrer cuatro descriptores por
+proceso son 64 comparaciones de nombre, nada al lado de los sectores que
+una escritura va a escribir. Elimina la clase entera de problema en vez de
+documentarla, y vive en `fs::write_file`, así que vale también para las
+escrituras del propio kernel —al arrancar no hay nada abierto y responde
+que no—.
+
+### La memoria de un proceso pasa a decir cuál puede escribir
+
+Esto no estaba previsto y es el hallazgo del incremento.
+
+`read` **rellena** un buffer, así que que sea suyo no basta. Un programa que
+entregue la dirección de su propio código haría que el kernel escribiera
+una página de solo lectura, y con `CR0.WP` puesto eso es un fallo de página
+**en anillo 0**: un argumento malo convertido en pánico del kernel.
+
+`Building::own` registra ahora si el rango es escribible junto con el rango,
+en una sola llamada para que los dos arrays no puedan separarse, y
+`Running::owns_writable` es lo que `read` pregunta.
+
+Quitar esa comprobación **no rompe ninguna prueba de host**. Rompe el
+arranque:
+
+```
+[ERROR]: HARLAN: #PF accessing 0x4021e0, error_code=0x3, rip=0xffff818000045730
+boot-test: marker "HARLAN-PHASE1-SHELL-READY" NOT observed within 30s
+```
+
+`rip` en espacio de kernel y `error_code=0x3` —escritura a una página
+presente de solo lectura—. Por eso el programa de ring 3 la prueba: es la
+única forma de que esa línea tenga una prueba que la defienda.
+
+### El programa de ring 3 prueba siete cosas
+
+Tres que puede hacer y cuatro que no:
+
+```
+HARLAN: ring3-file OK: read a file off the disk in eight-byte pieces
+HARLAN: ring3-file OK: wrote a file from ring 3
+HARLAN: ring3-file OK: read back what it had written
+HARLAN: ring3-file OK: refused a descriptor it never opened
+HARLAN: ring3-file OK: refused a file that is not there
+HARLAN: ring3-file OK: refused a name with a slash in it
+HARLAN: ring3-file OK: refused a buffer inside its own code
+HARLAN: ring3-file ALL OK
+```
+
+Lee en trozos de **ocho** bytes un fichero de 27: si el descriptor no
+recordara la posición, leería los mismos ocho para siempre. La barra es la
+única forma en que este ABI podría salir del directorio raíz, y se rechaza
+antes de llegar al volumen.
+
+### Dos cosas que solo se vieron midiendo
+
+- **El programa compilaba a 757 KB**, de los cuales 750 KB eran DWARF y
+  2 937 bytes eran código. El kernel lee el fichero entero en un buffer fijo
+  antes de analizarlo, así que lo rechazó por grande y arrancó sin programa
+  de usuario —correctamente, y en silencio desde el punto de vista de la
+  prueba de arranque—. `-C strip=debuginfo` lo deja en 16 KB. El cargador
+  usa los segmentos `PT_LOAD`; la información de depuración son 750 KB de
+  algo que nada en esta máquina lee.
+- **`boot-test` aceptaba un arranque que llegara a la shell.** La shell sube
+  pase lo que pase con los ficheros: las siete comprobaciones podían fallar
+  todas y el arranque seguía verde. Ahora exige `ring3-file ALL OK` y falla
+  con `ring3-file FAILED`, nombrando cuál falló. Hacen falta las dos
+  mitades, porque la ausencia de FAILED no es evidencia —un programa que
+  muere antes de su última comprobación no imprime veredicto ninguno—.
+
+  Comprobado rompiendo a propósito uno de los números de error que el
+  programa espera: el arranque llegó a la shell y `boot-test` falló de todas
+  formas, diciendo cuál.
+
+### Verificación ejecutada
+
+- 358 pruebas de host (341 + 17: la tabla de descriptores, los números que
+  un programa ve, y `read_at` desde cualquier offset).
+- `fmt-lint` limpio. `boot-test --repeat 10` 10/10 **sobre el mismo disco**,
+  con las siete comprobaciones en verde en cada uno, el contador de
+  arranques llegando a 10 y 93 marcos devueltos cada vez.
+- Mutación: 13 sobre el ABI, 13 detectadas. Doce por pruebas de host; la de
+  `owns_writable` solo por el arranque, que queda anotado en vez de
+  implícito. Una superviviente real salió al principio —recortar un
+  descriptor fuera de rango al último de la tabla— y era un hueco de mi
+  prueba: solo preguntaba con la tabla **vacía**, donde recortar también da
+  `None`. Con la tabla llena, muere.
+- Y 11 mutaciones sobre la aritmética de `read_at`, 11 detectadas, de las
+  cuales una necesitó una **cadena fragmentada** para morir: con cadenas
+  contiguas, leer más allá de un cluster sin seguir la cadena cae en el
+  cluster físico siguiente, que es justo el que se quería.
+- Por fuera: 7-Zip extrae los seis ficheros sin queja, `RING3.TXT` entre
+  ellos con `written from ring 3` exacto, y FSInfo cuadra con las dos tablas
+  medido en los bytes de la imagen.
+
+### Lo que hay que saber para el siguiente incremento
+
+- **Una llamada de fichero es larga.** El manejador corre con las
+  interrupciones desactivadas (ADR 0014, punto 2) y una lectura gira sobre
+  la virtqueue, así que `read` retrasa el reloj de forma medible. Se acepta
+  en Fase 4; E/S que bloquea y devuelve el control al scheduler es trabajo
+  de Fase 5, y ésta es la deuda que lo justifica.
+- **No hay `list`.** El directorio raíz se lista desde el kernel
+  (`fs::each_name`), no desde ring 3. La shell lo necesitará, y es una
+  llamada con sus propios casos raros —cuántas entradas caben en un buffer,
+  qué pasa si el directorio cambia a mitad del recorrido—.
+- **El descriptor es lo que será una capacidad en Fase 6.** Lo que se diseñó
+  ahora es la parte que no cambia: opaco, por proceso, revocable
+  cerrándolo. Hacerlo transferible es exactamente lo que lo convierte en
+  capacidad, y por eso el ADR dice explícitamente que en v0 no lo es.
 
 ## Revisión de Fase 4 — once hallazgos, todos arreglados
 
