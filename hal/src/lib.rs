@@ -3,6 +3,7 @@
 pub mod addr;
 mod console;
 mod cpu;
+pub mod fat;
 pub mod frame;
 pub mod framebuffer;
 mod interrupts;

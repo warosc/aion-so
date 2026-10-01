@@ -899,30 +899,38 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             devices::virtio_blk::start_queue(disk, &mut context.mapper, &mut context.frames)
         } {
             Ok(mut reader) => {
-                // Two sectors, not one. Reading only sector 0 cannot
-                // tell a driver that asks for sector 0 from one whose
-                // sector number never reaches the device: both give the
-                // same bytes. The second marker is what tells them apart.
-                for (which, expected) in [(0u64, "HARLAN-DISK-0"), (8, "HARLAN-SECTOR-8")] {
-                    let mut sector = [0u8; 512];
-                    // SAFETY: the reader owns its queue and its request
-                    // frame, and nothing else has a request in flight.
-                    match unsafe { reader.read_sector(disk, which, &mut sector) } {
-                        Ok(()) => {
-                            let read = core::str::from_utf8(&sector[..expected.len()])
-                                .unwrap_or("not text");
-                            if read == expected {
-                                info!(
-                                    "HARLAN: sector {which} of the disk reads {read:?}, which is what is there"
-                                );
-                            } else {
-                                error!(
-                                    "HARLAN: sector {which} reads {read:?}, and {expected:?} is what is there"
-                                );
-                            }
+                // The boot sector, and the copy FAT32 keeps at sector 6.
+                // Reading both checks three things at once: that the BPB
+                // parses, that the sector number reaches the device — six
+                // is not zero — and that the image really has its backup
+                // where it belongs
+                // (docs/adr/0025-fase4-fat32-read-only.md).
+                let mut boot_sector = [0u8; 512];
+                // SAFETY: the reader owns its queue and its request frame,
+                // and nothing else has a request in flight.
+                match unsafe { reader.read_sector(disk, 0, &mut boot_sector) } {
+                    Ok(()) => match harlan_hal::fat::BootSector::parse(&boot_sector) {
+                        Ok(volume) => {
+                            info!(
+                                "HARLAN: the disk holds FAT32: {} sector(s) of {} byte(s), {} cluster(s) of {} sector(s), {} table(s) of {} sector(s) from sector {}, root at cluster {} (sector {:?}), data from sector {}",
+                                volume.total_sectors,
+                                volume.bytes_per_sector,
+                                volume.clusters,
+                                volume.sectors_per_cluster,
+                                volume.fat_count,
+                                volume.sectors_per_fat,
+                                volume.first_fat_sector(),
+                                volume.root_cluster,
+                                volume.sector_of_cluster(volume.root_cluster),
+                                volume.first_data_sector()
+                            );
+                            check_backup_boot_sector(disk, &mut reader, &volume, &boot_sector);
                         }
-                        Err(err) => error!("HARLAN: sector {which} could not be read ({err:?})"),
-                    }
+                        Err(err) => {
+                            error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
+                        }
+                    },
+                    Err(err) => error!("HARLAN: the boot sector could not be read ({err:?})"),
                 }
             }
             Err(err) => error!("HARLAN: the disk's queue could not be started ({err:?})"),
@@ -1130,4 +1138,35 @@ fn banner(console: &mut dyn Console) {
     console.write_str(ARCH_NAME);
     console.write_str("\n");
     console.write_str("Kernel.......... READY\n\n");
+}
+
+/// Reads the copy of the boot sector FAT32 keeps further in, and checks it
+/// against the one already read.
+///
+/// A volume where the two differ is one where something has been written
+/// to by two readers that disagree; saying so is cheap, and it is also the
+/// only check in this boot that the sector number really travels — the
+/// backup is at sector 6, and a driver that always read sector 0 would be
+/// comparing a sector with itself.
+fn check_backup_boot_sector(
+    disk: &devices::virtio_blk::Disk,
+    reader: &mut devices::virtio_blk::Reader,
+    volume: &harlan_hal::fat::BootSector,
+    first: &[u8; 512],
+) {
+    let backup = u64::from(volume.backup_boot_sector);
+    if backup == 0 {
+        warn!("HARLAN: this volume keeps no backup boot sector");
+        return;
+    }
+    let mut copy = [0u8; 512];
+    // SAFETY: the reader owns its queue and its request frame, and nothing
+    // else has a request in flight.
+    match unsafe { reader.read_sector(disk, backup, &mut copy) } {
+        Ok(()) if copy == *first => {
+            info!("HARLAN: sector {backup} holds the same boot sector as sector 0, byte for byte")
+        }
+        Ok(()) => error!("HARLAN: sector {backup} should be a copy of the boot sector and is not"),
+        Err(err) => error!("HARLAN: the backup boot sector could not be read ({err:?})"),
+    }
 }
