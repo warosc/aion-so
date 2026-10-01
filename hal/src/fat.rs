@@ -52,6 +52,10 @@ pub enum BootSectorError {
     NoDataRegion,
     /// Fewer clusters than FAT32 is allowed to have.
     TooFewClusters { found: u32 },
+    /// The tables are too small to hold an entry for every cluster the
+    /// volume says it has. Walking one would read — and writing one would
+    /// write — past the end of the table and into the data.
+    FatTooSmall { entries: u64, clusters: u32 },
 }
 
 /// What a FAT32 volume's boot sector says, once it has been believed.
@@ -168,6 +172,14 @@ impl BootSector {
             ((u64::from(total_sectors) - before_data) / u64::from(sectors_per_cluster)) as u32;
         if clusters < FAT32_MINIMUM_CLUSTERS {
             return Err(BootSectorError::TooFewClusters { found: clusters });
+        }
+        // Every cluster needs an entry, and the two reserved ones as well.
+        // Without this, a volume can claim more clusters than its tables
+        // describe, and the entry for one of them lands past the table —
+        // in the data region, which is somebody's file.
+        let entries = u64::from(sectors_per_fat) * u64::from(bytes_per_sector) / 4;
+        if entries < u64::from(clusters) + u64::from(FIRST_DATA_CLUSTER) {
+            return Err(BootSectorError::FatTooSmall { entries, clusters });
         }
 
         Ok(Self {
@@ -597,18 +609,33 @@ pub fn encode_name(name: &str) -> Option<[u8; 11]> {
     }
     let mut encoded = [b' '; 11];
     for (at, byte) in base.bytes().enumerate() {
-        if !byte.is_ascii() || byte == b' ' {
-            return None;
-        }
-        encoded[at] = byte.to_ascii_uppercase();
+        encoded[at] = allowed_in_a_name(byte)?;
     }
     for (at, byte) in extension.bytes().enumerate() {
-        if !byte.is_ascii() || byte == b' ' {
-            return None;
-        }
-        encoded[8 + at] = byte.to_ascii_uppercase();
+        encoded[8 + at] = allowed_in_a_name(byte)?;
+    }
+    // A first byte of `0xE5` means the entry was deleted, and one of zero
+    // means the directory ends here. The format has a convention for a
+    // name that really starts with `0xE5`; this refuses it instead of
+    // carrying a convention nothing else here knows about.
+    if encoded[0] == ENTRY_DELETED {
+        return None;
     }
     Some(encoded)
+}
+
+/// What a short name may hold, upper-cased.
+///
+/// `None` for anything the format reserves. The dangerous one is a NUL:
+/// written as the first byte of an entry it means *the directory ends
+/// here*, so a name carrying one would cut the root directory short and
+/// take every file after it with it.
+fn allowed_in_a_name(byte: u8) -> Option<u8> {
+    const RESERVED: &[u8] = b"\"*/:<>?\\|+,;=[] ";
+    if !byte.is_ascii() || byte < 0x20 || byte == 0x7F || RESERVED.contains(&byte) {
+        return None;
+    }
+    Some(byte.to_ascii_uppercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,6 +652,10 @@ pub enum WriteError<E> {
     Full { needed: usize, free: usize },
     /// The root directory has no slot left for another file.
     DirectoryFull,
+    /// That name belongs to a directory. Writing a file over it would
+    /// orphan everything inside it, which is a worse outcome than
+    /// refusing.
+    IsADirectory,
 }
 
 impl<E> From<VolumeError<E>> for WriteError<E> {
@@ -755,6 +786,7 @@ impl<S: Sectors> Volume<S> {
     ) -> Result<(u32, usize, Option<DirectoryEntry>), WriteError<S::Error>> {
         let mut cluster = self.boot.root_cluster;
         let mut free = None;
+        let mut seen = 0;
         loop {
             let first = self
                 .boot
@@ -770,7 +802,17 @@ impl<S: Sectors> Volume<S> {
                 for (index, slot) in slots.iter().enumerate() {
                     let at = index * DIRECTORY_ENTRY_BYTES;
                     match decode_slot(slot) {
-                        Slot::Entry(entry) if slot[..11] == name[..] => {
+                        // Without case, because that is how `find`
+                        // matches: a volume written by another tool may
+                        // hold a short name in lower case, and the two
+                        // disagreeing means a second entry for a file
+                        // that is already there.
+                        Slot::Entry(entry)
+                            if slot[..11]
+                                .iter()
+                                .zip(name.iter())
+                                .all(|(a, b)| a.eq_ignore_ascii_case(b)) =>
+                        {
                             return Ok((sector, at, Some(entry)));
                         }
                         Slot::Entry(_) => {}
@@ -790,6 +832,12 @@ impl<S: Sectors> Volume<S> {
                         }
                     }
                 }
+            }
+            // A directory is a chain like any other, and one that
+            // points back at itself would be walked for ever.
+            seen += 1;
+            if seen > self.boot.clusters {
+                return Err(VolumeError::ChainLoops.into());
             }
             match self.next_cluster(cluster)? {
                 Entry::Next(next) => cluster = next,
@@ -824,6 +872,9 @@ impl<S: Sectors> Volume<S> {
         // Where it will go, before anything is written. A file half
         // written because the disk filled up is worse than no file.
         let (sector, offset, existing) = self.directory_slot(&encoded)?;
+        if existing.is_some_and(|entry| entry.is_directory()) {
+            return Err(WriteError::IsADirectory);
+        }
         let chain = self.free_clusters(needed)?;
         let chain = &chain[..needed];
 
@@ -858,8 +909,14 @@ impl<S: Sectors> Volume<S> {
         if let Some(existing) = existing
             && existing.first_cluster != 0
         {
-            self.free_chain(existing.first_cluster)?;
+            self.free_chain(existing.first_cluster, chain)?;
         }
+
+        // And the hint, last of all. The specification says a reader must
+        // not believe it, and a checker compares it against the tables —
+        // so leaving it saying something that was true before the write is
+        // leaving a false trail (ADR 0027, point 6).
+        self.update_fs_info()?;
 
         let written = decode_slot(
             bytes[offset..offset + DIRECTORY_ENTRY_BYTES]
@@ -872,15 +929,72 @@ impl<S: Sectors> Volume<S> {
         }
     }
 
-    /// Marks a chain's clusters free, from `first` to its end.
+    /// Rewrites the FSInfo sector from what the tables actually say.
+    ///
+    /// Counted rather than tracked: a running total is state that has to
+    /// be kept in step with the disk and would be wrong after any write
+    /// that did not finish. Reading the tables is slower and cannot
+    /// disagree with them.
+    ///
+    /// A volume whose FSInfo sector is not where the boot sector says, or
+    /// does not carry its signatures, is left alone: it is a hint, and
+    /// writing one over something else would be worse than not having it.
+    fn update_fs_info(&mut self) -> Result<(), WriteError<S::Error>> {
+        let sector = u32::from(self.boot.fs_info_sector);
+        if sector == 0 || sector >= u32::from(self.boot.reserved_sectors) {
+            return Ok(());
+        }
+        let mut bytes = [0u8; 512];
+        self.sectors
+            .read_sector(sector, &mut bytes)
+            .map_err(VolumeError::Device)?;
+        let lead = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let structure = u32::from_le_bytes([bytes[484], bytes[485], bytes[486], bytes[487]]);
+        if lead != FS_INFO_LEAD || structure != FS_INFO_STRUCTURE {
+            return Ok(());
+        }
+
+        let mut free: u32 = 0;
+        let mut first_free: u32 = 0;
+        for cluster in FIRST_DATA_CLUSTER..FIRST_DATA_CLUSTER + self.boot.clusters {
+            if self.next_cluster(cluster)? == Entry::Free {
+                free += 1;
+                if first_free == 0 {
+                    first_free = cluster;
+                }
+            }
+        }
+        bytes[488..492].copy_from_slice(&free.to_le_bytes());
+        bytes[492..496].copy_from_slice(&first_free.to_le_bytes());
+        self.sectors
+            .write_sector(sector, &bytes)
+            .map_err(WriteError::Device)?;
+        Ok(())
+    }
+
+    /// Marks the clusters of the chain starting at `first` free, except
+    /// any that `keep` is using.
     ///
     /// Stops at anything that is not another cluster: a chain that was
     /// already broken is not made worse by walking off it.
-    fn free_chain(&mut self, first: u32) -> Result<(), WriteError<S::Error>> {
+    ///
+    /// `keep` is there for one case, and it is a case the format's own
+    /// rules allow. A write that was interrupted between its directory
+    /// entry and this step leaves clusters that are marked used and that
+    /// the directory no longer names. The next write to that name finds
+    /// them free, takes them, and then arrives here with an old first
+    /// cluster that is now **the new file's**. Without `keep`, it frees
+    /// the file it has just written.
+    fn free_chain(&mut self, first: u32, keep: &[u32]) -> Result<(), WriteError<S::Error>> {
         let mut cluster = first;
         let mut seen = 0;
         loop {
             let next = self.next_cluster(cluster)?;
+            // A cluster that is already free is not this chain's to give
+            // back, and one the new file is using is not either.
+            if next == Entry::Free || keep.contains(&cluster) {
+                return Ok(());
+            }
             self.set_next_cluster(cluster, 0)?;
             seen += 1;
             if seen > self.boot.clusters {
@@ -896,6 +1010,9 @@ impl<S: Sectors> Volume<S> {
 
 /// What a file is marked as. Nothing here makes directories.
 const ATTR_ARCHIVE: u8 = 0x20;
+/// The two signatures that say a sector really is an FSInfo one.
+const FS_INFO_LEAD: u32 = 0x4161_5252;
+const FS_INFO_STRUCTURE: u32 = 0x6141_7272;
 /// What ends a chain. Only the low 28 bits are the number, so this is the
 /// value a formatter writes; anything from `0x0FFFFFF8` up means the same.
 const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
@@ -979,11 +1096,15 @@ mod tests {
     fn bigger_clusters_are_further_apart() {
         let mut sector = good();
         sector[13] = 8;
-        // Eight sectors to a cluster means a eighth as many clusters, so
+        // Eight sectors to a cluster means an eighth as many clusters, so
         // the volume has to grow to stay FAT32 at all — which the parser
         // insisted on, correctly, when this test first tried it at the
         // same size as the one above.
         sector[32..36].copy_from_slice(&1_048_576u32.to_le_bytes());
+        // And the tables have to be able to describe those clusters. The
+        // parser insisted on that too, the second time, which is the
+        // check this volume was quietly failing.
+        sector[36..40].copy_from_slice(&1100u32.to_le_bytes());
         let boot = BootSector::parse(&sector).unwrap();
         assert_eq!(boot.cluster_bytes(), 4096);
         assert_eq!(boot.sector_of_cluster(2), Some(boot.first_data_sector()));
@@ -1218,5 +1339,46 @@ mod tests {
         assert!(!entry.is_named("HELLO.TX"), "not a prefix");
         assert!(!entry.is_named("HELLO.TXTX"), "and not a longer one");
         assert!(!entry.is_named("OTHER.TXT"));
+    }
+
+    // -----------------------------------------------------------------
+    // What a review of this code turned up, each measured before it was
+    // believed and each left here as the test it should have had
+    // -----------------------------------------------------------------
+
+    /// A volume whose tables cannot hold an entry per cluster. Walking
+    /// one reads past the end of the table, and writing one writes past
+    /// it — into the data region, which is somebody's file.
+    #[test]
+    fn a_volume_whose_tables_cannot_describe_its_clusters_is_refused() {
+        let mut sector = good();
+        // One sector of table holds 128 entries; this volume says it has
+        // 129 022 clusters.
+        sector[36..40].copy_from_slice(&1u32.to_le_bytes());
+        let parsed = BootSector::parse(&sector);
+        assert!(
+            parsed.is_err(),
+            "a table of one sector cannot describe {} clusters, and this was accepted: {parsed:?}",
+            parsed.map(|boot| boot.clusters).unwrap_or(0)
+        );
+    }
+
+    /// A NUL as the first byte of a directory entry means *the
+    /// directory ends here*, so a name carrying one would cut the root
+    /// short and take every file after it. Nor may a name hold the
+    /// characters the format reserves for itself.
+    #[test]
+    fn a_name_may_not_hold_what_the_format_reserves() {
+        assert_eq!(encode_name("\0BAD.TXT"), None, "a NUL is not a name");
+        assert_eq!(encode_name("A\u{1}B.TXT"), None, "nor is a control code");
+        // And the characters FAT reserves for itself.
+        for bad in [
+            "A\"B.TXT", "A*B.TXT", "A?B.TXT", "A/B.TXT", "A\\B.TXT", "A:B.TXT",
+        ] {
+            assert_eq!(encode_name(bad), None, "{bad}");
+        }
+        // What is a name still is one.
+        assert_eq!(encode_name("hello.txt"), Some(*b"HELLO   TXT"));
+        assert_eq!(encode_name("README"), Some(*b"README     "));
     }
 }

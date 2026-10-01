@@ -1171,4 +1171,150 @@ mod tests {
             "what the old entry said is gone"
         );
     }
+
+    // -----------------------------------------------------------------
+    // What a review of this code turned up, each measured before it was
+    // believed and each left here as the test it should have had
+    // -----------------------------------------------------------------
+
+    /// Some tools store a short name in lower case. Looking a name up
+    /// and looking for its slot have to agree about that, or a file that
+    /// is already there gets a second entry.
+    #[test]
+    fn a_lower_case_stored_name_is_the_same_file() {
+        let mut volume = volume();
+        // Store a name the way some tools do, in lower case.
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        bytes[32..43].copy_from_slice(b"hello   txt");
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), root, &bytes).unwrap();
+
+        volume.write_file("HELLO.TXT", b"replaced").unwrap();
+        let mut seen = 0;
+        volume
+            .read_root(|entry| {
+                if entry.is_named("HELLO.TXT") {
+                    seen += 1;
+                }
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, 1, "one file called that, not two");
+    }
+
+    /// A directory is not a file to be written over: doing it frees its
+    /// chain and orphans everything inside.
+    #[test]
+    fn a_directory_is_not_written_over_as_a_file() {
+        let mut volume = volume();
+        // Turn EMPTY.BIN's entry into a directory with a cluster.
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        harlan_hal::fat::Sectors::read_sector(volume.sectors_mut(), root, &mut bytes).unwrap();
+        const THIRD: usize = 3 * 32;
+        bytes[THIRD..THIRD + 11].copy_from_slice(b"SUBDIR     ");
+        bytes[THIRD + 11] = 0x10;
+        bytes[THIRD + 26..THIRD + 28].copy_from_slice(&9u16.to_le_bytes());
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), root, &bytes).unwrap();
+
+        let written = volume.write_file("SUBDIR", b"not a directory");
+        assert!(
+            written.is_err(),
+            "a directory is not a file to be written over: {written:?}"
+        );
+    }
+
+    /// A root directory with no room left in its first cluster and a
+    /// chain that points back at itself. The walk has to follow the
+    /// chain, and following it for ever is the kernel never coming back.
+    ///
+    /// The first version of this test left a free slot in the first
+    /// cluster, so the walk stopped there and never followed anything —
+    /// it was asserting against a path it did not take.
+    #[test]
+    fn a_looping_root_chain_is_refused_rather_than_walked_for_ever() {
+        let mut volume = volume();
+        // Fill every slot of the root's one cluster, so that a write has
+        // to look further.
+        let root = volume.boot_sector().sector_of_cluster(2).unwrap();
+        let mut bytes = [0u8; 512];
+        for slot in 0..512 / 32 {
+            let at = slot * 32;
+            bytes[at..at + 11].copy_from_slice(b"FULL    BIN");
+            bytes[at + 11] = 0x20;
+            bytes[at + 26..at + 28].copy_from_slice(&3u16.to_le_bytes());
+        }
+        harlan_hal::fat::Sectors::write_sector(volume.sectors_mut(), root, &bytes).unwrap();
+        volume.set_next_cluster(2, 2).unwrap();
+
+        assert_eq!(
+            volume.write_file("NEW.TXT", b"x"),
+            Err(harlan_hal::fat::WriteError::Reading(
+                harlan_hal::fat::VolumeError::ChainLoops
+            )),
+            "a root that points at itself is a volume to refuse"
+        );
+    }
+
+    /// A write interrupted between its directory entry and freeing the
+    /// old chain leaves clusters marked used that nothing names. The next
+    /// write to that name takes them — and must not then free them as if
+    /// they were still the old file's.
+    #[test]
+    fn freeing_an_old_chain_never_takes_the_new_file_with_it() {
+        let mut volume = volume();
+        let first = volume.write_file("SAME.TXT", &[1u8; 1500]).unwrap();
+        // The state an interrupted overwrite leaves: the directory has
+        // been written and the old chain not yet freed. Simulate the
+        // other half — free the old chain's head by hand — and then write
+        // over the file again.
+        volume.set_next_cluster(first.first_cluster, 0).unwrap();
+
+        let second = volume.write_file("SAME.TXT", b"short").unwrap();
+        let mut bytes = [0u8; 32];
+        let read = volume.read_file(&second, &mut bytes).unwrap();
+        assert_eq!(&bytes[..read], b"short");
+        assert_ne!(
+            volume.next_cluster(second.first_cluster).unwrap(),
+            harlan_hal::fat::Entry::Free,
+            "the new file's own first cluster was freed under it"
+        );
+    }
+
+    /// A loadable segment that occupies nothing never reaches the
+    /// loader, which would take one from its end to find its last page.
+    #[test]
+    fn a_segment_of_no_memory_never_reaches_the_loader() {
+        // Built here rather than in the loader, which needs page tables.
+        let mut file = vec![0u8; 0x2000];
+        file[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        file[4] = 2;
+        file[5] = 1;
+        file[6] = 1;
+        file[16..18].copy_from_slice(&2u16.to_le_bytes());
+        file[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        file[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes());
+        file[32..40].copy_from_slice(&64u64.to_le_bytes());
+        file[54..56].copy_from_slice(&56u16.to_le_bytes());
+        file[56..58].copy_from_slice(&2u16.to_le_bytes());
+        // A real segment, so the entry point is inside something.
+        let one = 64;
+        file[one..one + 4].copy_from_slice(&1u32.to_le_bytes());
+        file[one + 4..one + 8].copy_from_slice(&5u32.to_le_bytes());
+        file[one + 8..one + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        file[one + 16..one + 24].copy_from_slice(&0x40_0000u64.to_le_bytes());
+        file[one + 32..one + 40].copy_from_slice(&0x100u64.to_le_bytes());
+        file[one + 40..one + 48].copy_from_slice(&0x100u64.to_le_bytes());
+        // And one of no size at all, at address zero.
+        let two = 64 + 56;
+        file[two..two + 4].copy_from_slice(&1u32.to_le_bytes());
+        file[two + 4..two + 8].copy_from_slice(&4u32.to_le_bytes());
+
+        assert_eq!(
+            harlan_hal::elf::parse(&file, 0x0000_8000_0000_0000),
+            Err(harlan_hal::elf::ElfError::SegmentOfNothing { at: 0 }),
+            "refused here, so the loader is never asked to find its last page"
+        );
+    }
 }
