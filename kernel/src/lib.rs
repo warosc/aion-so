@@ -892,13 +892,18 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
 
     // And one sector off it, which is the whole point of the phase
     // (docs/adr/0024-fase4-dma-and-the-queue.md).
+    // The reader outlives this block: the program the kernel runs comes
+    // off the same disk, further down
+    // (docs/adr/0026-fase4-elf-user-programs.md).
+    let mut disk_reader = None;
     if let Some(disk) = &disk {
         // SAFETY: the disk is negotiated and not started, the kernel owns
         // its tables, and `frames` reaches frames through its window.
         match unsafe {
             devices::virtio_blk::start_queue(disk, &mut context.mapper, &mut context.frames)
         } {
-            Ok(mut reader) => {
+            Ok(reader) => {
+                let reader = disk_reader.insert(reader);
                 // The boot sector, and the copy FAT32 keeps at sector 6.
                 // Reading both checks three things at once: that the BPB
                 // parses, that the sector number reaches the device — six
@@ -924,7 +929,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                             volume.sector_of_cluster(volume.root_cluster),
                             volume.first_data_sector()
                         );
-                        check_backup_boot_sector(disk, &mut reader, &volume, &boot_sector);
+                        check_backup_boot_sector(disk, reader, &volume, &boot_sector);
                         read_a_file(disk, reader);
                     }
                     Ok(Err(err)) => {
@@ -956,6 +961,46 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
+        // The program that comes off the disk, if there is a disk. Read
+        // before anything is started, because one of the processes is it
+        // (docs/adr/0026-fase4-elf-user-programs.md).
+        let mut elf_bytes = alloc::vec![0u8; 64 * 1024];
+        let elf = disk
+            .as_ref()
+            .zip(disk_reader.as_mut())
+            .and_then(|(disk, reader)| read_user_program(disk, reader, &mut elf_bytes))
+            .and_then(|read| {
+                match harlan_hal::elf::parse(
+                    &elf_bytes[..read],
+                    harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
+                ) {
+                    Ok(program) => {
+                        info!(
+                            "HARLAN: it is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
+                            program.segment_count(),
+                            program.entry,
+                            program.highest_address()
+                        );
+                        for segment in program.segments() {
+                            info!(
+                                "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
+                                segment.at,
+                                segment.file_size,
+                                segment.memory_size,
+                                if segment.readable() { "r" } else { "-" },
+                                if segment.writable() { "w" } else { "-" },
+                                if segment.executable() { "x" } else { "-" }
+                            );
+                        }
+                        Some(program)
+                    }
+                    Err(err) => {
+                        error!("HARLAN: what came off the disk is not a program this kernel loads ({err:?})");
+                        None
+                    }
+                }
+            });
+
         // Eight processes, each with a space of its own and a kernel
         // stack of its own.
         //
@@ -994,16 +1039,22 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         let writing_its_code = user::writes_its_own_code();
         let running_its_stack = user::runs_its_own_stack();
         let lying = user::lies_about_a_pointer(kernel_address);
-        let programs: [&[u8]; 8] = [
-            &talking_one,
-            &talking_two,
-            &receiving,
-            &sending,
-            &reading_the_kernel,
-            &writing_its_code,
-            &running_its_stack,
-            &lying,
+        // The eight written by hand, and then the one that was compiled.
+        // The order matters: the sender was built naming a slot, so the
+        // new one goes last (docs/adr/0026-fase4-elf-user-programs.md).
+        let mut programs: alloc::vec::Vec<ToStart> = alloc::vec![
+            ToStart::Flat(&talking_one),
+            ToStart::Flat(&talking_two),
+            ToStart::Flat(&receiving),
+            ToStart::Flat(&sending),
+            ToStart::Flat(&reading_the_kernel),
+            ToStart::Flat(&writing_its_code),
+            ToStart::Flat(&running_its_stack),
+            ToStart::Flat(&lying),
         ];
+        if let Some(program) = &elf {
+            programs.push(ToStart::Elf(program, &elf_bytes));
+        }
 
         // What the allocator has before any process exists. Everything
         // taken from here on belongs to a process, and once they are all
@@ -1027,8 +1078,20 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             next_stack = stack.top();
             // SAFETY: the kernel owns its tables and reaches frames
             // through its own window; nothing else uses what this takes.
-            let spawned =
-                unsafe { process::spawn(&mut context.mapper, &mut context.frames, program, stack) };
+            let spawned = unsafe {
+                match program {
+                    ToStart::Flat(bytes) => {
+                        process::spawn(&mut context.mapper, &mut context.frames, bytes, stack)
+                    }
+                    ToStart::Elf(program, file) => process::spawn_elf(
+                        &mut context.mapper,
+                        &mut context.frames,
+                        program,
+                        file,
+                        stack,
+                    ),
+                }
+            };
             match spawned {
                 Ok(process) => {
                     let entry = process.entry();
@@ -1147,7 +1210,9 @@ fn banner(console: &mut dyn Console) {
 /// code be tested in host against an image in memory.
 struct DiskSectors<'a> {
     disk: &'a devices::virtio_blk::Disk,
-    reader: devices::virtio_blk::Reader,
+    /// Borrowed, so that the disk can be read again once the filesystem
+    /// built over it is done with.
+    reader: &'a mut devices::virtio_blk::Reader,
 }
 
 impl harlan_hal::fat::Sectors for DiskSectors<'_> {
@@ -1161,9 +1226,62 @@ impl harlan_hal::fat::Sectors for DiskSectors<'_> {
     }
 }
 
+/// How a process is to be started: from a page of bytes written by hand,
+/// or from a program that was compiled and read off the disk.
+///
+/// Both still exist because they demonstrate different things. A compiler
+/// does not produce a program that writes to its own code (ADR 0020), and
+/// a program written by hand in hexadecimal is not how a shell gets
+/// written (ADR 0026).
+enum ToStart<'a> {
+    Flat(&'a [u8]),
+    Elf(&'a harlan_hal::elf::Program, &'a [u8]),
+}
+
+/// Reads the user program off the disk, as bytes.
+///
+/// Answers `None` and says why if it is not there or cannot be read: a
+/// kernel whose disk failed has no user program, and that has to be a line
+/// in the log rather than a boot that carries on as if it had one.
+fn read_user_program(
+    disk: &devices::virtio_blk::Disk,
+    reader: &mut devices::virtio_blk::Reader,
+    into: &mut [u8],
+) -> Option<usize> {
+    const NAME: &str = "HELLO.ELF";
+    let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
+        Ok(volume) => volume,
+        Err(err) => {
+            error!("HARLAN: no program can be loaded: the volume would not mount ({err:?})");
+            return None;
+        }
+    };
+    let entry = match volume.find(NAME) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            error!("HARLAN: there is no {NAME} on the disk");
+            return None;
+        }
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return None;
+        }
+    };
+    match volume.read_file(&entry, into) {
+        Ok(read) => {
+            info!("HARLAN: {NAME} is {read} byte(s), read off the disk");
+            Some(read)
+        }
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be read ({err:?})");
+            None
+        }
+    }
+}
+
 /// Lists the root directory and reads one file off it, which is as far as
 /// a filesystem has to work before a shell can use it.
-fn read_a_file(disk: &devices::virtio_blk::Disk, reader: devices::virtio_blk::Reader) {
+fn read_a_file(disk: &devices::virtio_blk::Disk, reader: &mut devices::virtio_blk::Reader) {
     let mut volume = match harlan_hal::fat::Volume::mount(DiskSectors { disk, reader }) {
         Ok(volume) => volume,
         Err(err) => {

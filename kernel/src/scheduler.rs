@@ -531,7 +531,7 @@ unsafe extern "C" fn run_first(_argument: *mut u8) -> ! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Running {
     pub slot: usize,
-    pub ranges: [PhysRange; 2],
+    pub ranges: [PhysRange; crate::process::MAX_RANGES],
 }
 
 impl Running {
@@ -561,7 +561,7 @@ pub unsafe fn running() -> Option<Running> {
     }
     Some(Running {
         slot,
-        ranges: [held.process.code, held.process.stack],
+        ranges: held.process.ranges(),
     })
 }
 
@@ -781,13 +781,12 @@ mod tests {
     /// process — which would need page tables.
     #[test]
     fn the_handler_only_trusts_the_running_process_s_own_memory() {
-        let running = Running {
-            slot: 1,
-            ranges: [
-                PhysRange::new(PhysAddr::new(0x0040_0000), PAGE_SIZE),
-                PhysRange::new(PhysAddr::new(0x0050_0000), PAGE_SIZE),
-            ],
-        };
+        // As many as a process may own; the two it really has, and
+        // empty ranges after them, which own nothing.
+        let mut ranges = [PhysRange::new(PhysAddr::new(0), 0); crate::process::MAX_RANGES];
+        ranges[0] = PhysRange::new(PhysAddr::new(0x0040_0000), PAGE_SIZE);
+        ranges[1] = PhysRange::new(PhysAddr::new(0x0050_0000), PAGE_SIZE);
+        let running = Running { slot: 1, ranges };
         assert!(running.owns(0x0040_0000, 8), "its code");
         assert!(running.owns(0x0050_0000, PAGE_SIZE), "its whole stack");
         assert!(!running.owns(0x0040_0000, PAGE_SIZE + 1), "past the page");

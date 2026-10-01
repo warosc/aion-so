@@ -185,6 +185,47 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
     })
 }
 
+/// The user program's own target and the flags that make it loadable.
+///
+/// The toolchain's default for a bare target is a position-independent
+/// executable, which needs relocating at load time. This kernel loads
+/// static ones (docs/adr/0026-fase4-elf-user-programs.md), so the
+/// relocation model and the linker are told so, and the image is based
+/// where a user program lives.
+const USER_PACKAGE: &str = "harlan-hello";
+const USER_BINARY: &str = "hello";
+const USER_RUSTFLAGS: &str =
+    "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000";
+/// What it is called on the disk. Eight and three, like everything else
+/// there (ADR 0025).
+const USER_ON_DISK: &str = "HELLO.ELF";
+
+/// Builds the user program and answers its bytes.
+///
+/// Its own cargo invocation, because the flags above must not reach the
+/// kernel: it is built for the same target and is not an ELF anybody
+/// loads this way.
+fn build_user_program(root: &Path) -> Result<Vec<u8>> {
+    let manifest_path = root.join("Cargo.toml");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .args(["-p", USER_PACKAGE, "--target", KERNEL_TARGET])
+        .env("RUSTFLAGS", USER_RUSTFLAGS)
+        .status()
+        .context("failed to spawn cargo for the user program")?;
+    if !status.success() {
+        bail!("building {USER_PACKAGE} failed with {status}");
+    }
+    let built = root
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join(USER_BINARY);
+    fs::read(&built).with_context(|| format!("failed to read {}", built.display()))
+}
+
 fn assemble_esp(root: &Path) -> Result<()> {
     let efi_src = root
         .join("target")
@@ -271,6 +312,22 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "harlan-boot",
             "--target",
             UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // The user program is held to the same standard as the kernel, even
+    // though it is not part of it
+    // (docs/adr/0026-fase4-elf-user-programs.md).
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            USER_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
             "--",
             "-D",
             "warnings",
@@ -418,8 +475,15 @@ const DISK_LABEL: &str = "HARLAN";
 /// What goes on it. Three files: one to read, one long enough to be a
 /// chain of clusters rather than a single one, and one empty, because a
 /// directory entry has to name a cluster even when there is nothing in it.
-fn disk_contents() -> Vec<fat32::File> {
+fn disk_contents(user_program: Vec<u8>) -> Vec<fat32::File> {
     vec![
+        fat32::File {
+            name: USER_ON_DISK,
+            // The program the kernel runs, compiled by the toolchain
+            // rather than written out by hand
+            // (docs/adr/0026-fase4-elf-user-programs.md).
+            contents: user_program,
+        },
         fat32::File {
             name: "HELLO.TXT",
             contents: b"HARLAN reads its own disk.
@@ -451,7 +515,12 @@ fn disk_contents() -> Vec<fat32::File> {
 fn prepare_disk(root: &Path) -> Result<PathBuf> {
     let path = root.join("target").join("disk.img");
     let sectors = (DISK_BYTES / fat32::SECTOR_BYTES as u64) as u32;
-    let (image, geometry) = fat32::format(sectors, 1, DISK_LABEL, &disk_contents())
+    let user_program = build_user_program(root)?;
+    println!(
+        "disk: {USER_ON_DISK} is {} byte(s) of ELF",
+        user_program.len()
+    );
+    let (image, geometry) = fat32::format(sectors, 1, DISK_LABEL, &disk_contents(user_program))
         .map_err(|err| anyhow::anyhow!("the disk image could not be laid out: {err:?}"))?;
     fs::create_dir_all(path.parent().expect("target has a parent"))
         .context("failed to create the target directory for the disk")?;

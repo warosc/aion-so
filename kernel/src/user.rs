@@ -850,6 +850,12 @@ mod tests {
         }
     }
 
+    /// A `Running`'s ranges are as many as a process may own; a test that
+    /// cares about one fills them all with it.
+    fn filled_with(range: PhysRange) -> [PhysRange; crate::process::MAX_RANGES] {
+        [range; crate::process::MAX_RANGES]
+    }
+
     fn frame_for(call: Call, rdi: u64, rsi: u64, rdx: u64) -> SyscallFrame {
         SyscallFrame {
             rax: call as u64,
@@ -869,10 +875,10 @@ mod tests {
     fn running_on(buffer: &mut [u8]) -> Running {
         Running {
             slot: 0,
-            ranges: [
-                PhysRange::new(PhysAddr::new(buffer.as_ptr() as u64), buffer.len() as u64),
-                PhysRange::new(PhysAddr::new(buffer.as_ptr() as u64), buffer.len() as u64),
-            ],
+            ranges: filled_with(PhysRange::new(
+                PhysAddr::new(buffer.as_ptr() as u64),
+                buffer.len() as u64,
+            )),
         }
     }
 

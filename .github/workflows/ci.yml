@@ -22,6 +22,7 @@ jobs:
       - run: cargo clippy -p harlan-hal -p harlan-arch-x86_64 -p harlan-fbcon -p harlan-kernel -p xtask --all-targets -- -D warnings
       - run: cargo clippy -p harlan-kernel --target x86_64-unknown-none -- -D warnings
       - run: cargo clippy -p harlan-boot --target x86_64-unknown-uefi -- -D warnings
+      - run: cargo clippy -p harlan-hello --target x86_64-unknown-none -- -D warnings
 
   host-tests:
     runs-on: ubuntu-latest
@@ -37,6 +38,7 @@ jobs:
       - run: rustup show
       - run: cargo build -p harlan-kernel --target x86_64-unknown-none --release
       - run: cargo build -p harlan-boot --target x86_64-unknown-uefi --release
+      - run: cargo build -p harlan-hello --target x86_64-unknown-none --release
 
   # A second opinion on the disk image, from an implementation nobody here
   # wrote. A FAT32 reader and the formatter that made the image it reads
