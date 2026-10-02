@@ -410,6 +410,9 @@ pub unsafe fn exit_current(code: u64) -> ! {
     let scheduler = unsafe { the_scheduler() };
     let current = scheduler.current;
     info!("HARLAN: the process in slot {current} exited with {code}");
+    // What a process did is what an audit asks about, so the slot and the
+    // code both go in the line (ADR 0031, point 9).
+    crate::events::record_two(crate::events::What::Exited, current as u64, code);
     // SAFETY: as above.
     unsafe { end_current(scheduler) }
 }

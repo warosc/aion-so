@@ -170,7 +170,17 @@ pub fn write_file(name: &str, contents: &[u8]) -> Result<DirectoryEntry, FileErr
         return Err(FileError::Open);
     }
     match with(|volume| volume.write_file(name, contents))? {
-        Ok(entry) => Ok(entry),
+        Ok(entry) => {
+            // Every write is recorded, including the one that writes the
+            // record itself — which lands in the next flush rather than
+            // this one, because the lines were copied out before it.
+            crate::events::record_with(
+                crate::events::What::Wrote,
+                u64::from(entry.size),
+                entry.name(),
+            );
+            Ok(entry)
+        }
         Err(WriteError::IsADirectory) => Err(FileError::IsADirectory),
         Err(err) => Err(FileError::Writing(err)),
     }
@@ -208,4 +218,35 @@ pub fn boot_sector() -> Option<BootSector> {
 /// the rest of this module.
 pub fn each_name(mut each: impl FnMut(&DirectoryEntry) -> bool) -> Result<(), FileError> {
     with(|volume| volume.read_root(|entry| each(&entry)))?.map_err(FileError::Reading)
+}
+
+/// The entry at position `index` in the root directory.
+///
+/// One entry per call, found by walking from the start (ADR 0029, point 2).
+/// `NoSuchFile` for an index past the end, which is what a listing loop
+/// stops on.
+///
+/// Walking the whole directory to reach entry *n* means listing *n* files
+/// costs *n* walks. That is named rather than hidden (ADR 0029, point 3):
+/// FAT has no index, so reaching the *n*th entry is passing the *n-1*
+/// before it, and for a root directory of a handful of files it does not
+/// measure. What it buys is that **each call is true by itself** — a
+/// directory that changed between two calls gives a different answer to the
+/// second, rather than half of one answer spread across a buffer.
+pub fn entry_at(index: usize) -> Result<DirectoryEntry, FileError> {
+    let mut at = 0;
+    let mut found = None;
+    with(|volume| {
+        volume.read_root(|entry| {
+            if at == index {
+                found = Some(entry);
+                false
+            } else {
+                at += 1;
+                true
+            }
+        })
+    })?
+    .map_err(FileError::Reading)?;
+    found.ok_or(FileError::NoSuchFile)
 }

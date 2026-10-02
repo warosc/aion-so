@@ -1,0 +1,22 @@
+[package]
+name = "harlan-user-abi"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# The Rust side of the syscall ABI, for the programs that run in ring 3.
+#
+# One binding rather than one per program: the numbers, the registers and
+# the error codes are a contract (ADR 0014, ADR 0019, ADR 0028, ADR 0029),
+# and a second copy of a contract is a copy that drifts. The kernel's side
+# lives in `kernel/src/user.rs`; this is the other end of the same wire.
+#
+# Not part of the kernel, and it must never be: it is compiled for
+# `x86_64-unknown-none`, it executes `syscall`, and nothing in the kernel
+# links against it.
+
+[lib]
+name = "harlan_user_abi"
+path = "src/lib.rs"
+
+[dependencies]
