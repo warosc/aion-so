@@ -26,6 +26,12 @@ impl Write for Port {
             // memory is touched and no device state depends on it.
             unsafe { harlan_arch_x86_64::port::outb(DEBUGCON, *byte) };
         }
+        // And out of the serial port, if the machine has one
+        // (docs/adr/0032-fase5-serial-console.md). Both, not one or the
+        // other: every tool in this repo reads the debug port, and no real
+        // machine does. A line that went to only one of them is a line
+        // somebody cannot see.
+        harlan_arch_x86_64::serial::write_str(s);
         Ok(())
     }
 }
@@ -43,7 +49,22 @@ fn sink(level: Level, file: &str, line: u32, args: fmt::Arguments<'_>) {
     }
 }
 
-/// Sends log lines to the debug port, from wherever this code lives now.
+/// Sends log lines to the debug port and the serial port, from wherever
+/// this code lives now.
+///
+/// Called twice on purpose — once at boot and again once the kernel runs
+/// from its new address — so the serial port is set up in both, which also
+/// means it is set up again after the firmware has let go of it.
 pub fn install() {
+    // SAFETY: `serial::init` asks to be called early, before anything else
+    // uses COM1, and for COM1 to be this kernel's to program. Both hold at
+    // each of this function's two call sites: the first line of `efi_main`,
+    // and the moment the kernel takes over its own image. Running it twice
+    // is setting the same registers to the same values and asking the same
+    // question again.
+    let found = unsafe { harlan_arch_x86_64::serial::init() };
     klog::set_sink(sink);
+    if found {
+        harlan_hal::info!("HARLAN: a serial port at COM1; the log goes there too");
+    }
 }

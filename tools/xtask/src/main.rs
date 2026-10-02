@@ -20,7 +20,20 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// Not shared via a dependency edge because xtask is host tooling, not part
 /// of the freestanding boot chain. Override with `--marker` to check the
 /// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
+/// The kernel's own shell, which runs when there is no disk to load a
+/// program from. Still the default, because a boot without a disk has to
+/// stay checkable (ADR 0030).
 const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
+
+/// The shell in ring 3 (user/shell/src/main.rs), which is what comes up
+/// when there **is** a disk — and which does not end, so the kernel's own
+/// never runs and never prints its marker.
+///
+/// A separate marker and not the same one: if either meant "a shell came
+/// up", the regression worth catching would be the one that hides — the
+/// shell program failing to load, the kernel's coming up instead, and the
+/// boot staying green while nothing in ring 3 works.
+const RING3_SHELL_MARKER: &str = "HARLAN-RING3-SHELL-READY";
 
 /// What the program in ring 3 says when every one of its file checks
 /// passed (user/hello/src/main.rs, docs/adr/0028-fase4-file-abi-v0.md).
@@ -208,6 +221,11 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
 /// where a user program lives.
 const USER_PACKAGE: &str = "harlan-hello";
 const USER_BINARY: &str = "hello";
+/// The shell, the second program on the disk
+/// (docs/adr/0030-fase4-shell-in-ring-3.md).
+const SHELL_PACKAGE: &str = "harlan-shell";
+const SHELL_BINARY: &str = "shell";
+const SHELL_ON_DISK: &str = "SHELL.ELF";
 const USER_RUSTFLAGS: &str = concat!(
     "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000",
     // Without this, a program of 2.9 KB of code ships with 750 KB of
@@ -227,23 +245,34 @@ const USER_ON_DISK: &str = "HELLO.ELF";
 /// kernel: it is built for the same target and is not an ELF anybody
 /// loads this way.
 fn build_user_program(root: &Path) -> Result<Vec<u8>> {
+    build_program(root, USER_PACKAGE, USER_BINARY)
+}
+
+/// Builds one user program and answers its bytes.
+///
+/// One function for both, taking the names, rather than a copy per
+/// program: the flags are the contract with the loader — static
+/// relocation, no PIE, a fixed image base, and no debug info because the
+/// kernel reads the whole file into a fixed buffer before parsing it — and
+/// a second copy of a contract is one that drifts.
+fn build_program(root: &Path, package: &str, binary: &str) -> Result<Vec<u8>> {
     let manifest_path = root.join("Cargo.toml");
     let status = Command::new("cargo")
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest_path)
-        .args(["-p", USER_PACKAGE, "--target", KERNEL_TARGET])
+        .args(["-p", package, "--target", KERNEL_TARGET])
         .env("RUSTFLAGS", USER_RUSTFLAGS)
         .status()
-        .context("failed to spawn cargo for the user program")?;
+        .with_context(|| format!("failed to spawn cargo for {package}"))?;
     if !status.success() {
-        bail!("building {USER_PACKAGE} failed with {status}");
+        bail!("building {package} failed with {status}");
     }
     let built = root
         .join("target")
         .join(KERNEL_TARGET)
         .join("debug")
-        .join(USER_BINARY);
+        .join(binary);
     fs::read(&built).with_context(|| format!("failed to read {}", built.display()))
 }
 
@@ -282,8 +311,16 @@ fn test(root: &Path) -> Result<()> {
             "harlan-kernel",
             "-p",
             "xtask",
+            // The program's end of the directory record, which is the
+            // other end of the kernel's own `encode_entry`.
+            "-p",
+            "harlan-user-abi",
         ],
-    )
+    )?;
+    // The shell's library only. Its binary is `no_std` and `no_main`, and
+    // there is no way to build one of those for the host: it has no panic
+    // strategy. What is testable here is the half that is only logic.
+    run_cargo(root, &["test", "-p", "harlan-shell", "--lib"])
 }
 
 fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
@@ -306,7 +343,23 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "harlan-kernel",
             "-p",
             "xtask",
+            "-p",
+            "harlan-user-abi",
             "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // As above: the library, because the binary cannot be built for the
+    // host. The binary is linted below, for the target it runs on.
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            "harlan-shell",
+            "--lib",
             "--",
             "-D",
             "warnings",
@@ -347,6 +400,21 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "clippy",
             "-p",
             USER_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // And the shell, which is a user program like the other one
+    // (docs/adr/0030-fase4-shell-in-ring-3.md).
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            SHELL_PACKAGE,
             "--target",
             KERNEL_TARGET,
             "--",
@@ -396,6 +464,10 @@ struct QemuConfig {
     headless: bool,
     debug_stub: bool,
     debugcon_log: Option<PathBuf>,
+    /// Where COM1 goes. Separate from the debug port on purpose: the two
+    /// are different devices, and a test that reads one proves nothing
+    /// about the other (docs/adr/0032-fase5-serial-console.md).
+    serial_log: Option<PathBuf>,
     /// QEMU's own diagnostics (`-d guest_errors,cpu_reset`), for soak runs.
     qemu_log: Option<PathBuf>,
 }
@@ -459,6 +531,17 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
         }
     }
 
+    // COM1. Always attached, so that a build which stopped writing to it
+    // produces an empty file rather than no file — "nothing came out" and
+    // "nowhere to come out of" look the same otherwise.
+    if let Some(serial_path) = &cfg.serial_log {
+        args.push("-serial".to_string());
+        args.push(format!("file:{}", serial_path.display()));
+    } else {
+        args.push("-serial".to_string());
+        args.push("none".to_string());
+    }
+
     if cfg.headless {
         args.push("-display".to_string());
         args.push("none".to_string());
@@ -496,7 +579,7 @@ const DISK_LABEL: &str = "HARLAN";
 /// What goes on it. Three files: one to read, one long enough to be a
 /// chain of clusters rather than a single one, and one empty, because a
 /// directory entry has to name a cluster even when there is nothing in it.
-fn disk_contents(user_program: Vec<u8>) -> Vec<fat32::File> {
+fn disk_contents(user_program: Vec<u8>, shell: Vec<u8>) -> Vec<fat32::File> {
     vec![
         fat32::File {
             name: USER_ON_DISK,
@@ -504,6 +587,12 @@ fn disk_contents(user_program: Vec<u8>) -> Vec<fat32::File> {
             // rather than written out by hand
             // (docs/adr/0026-fase4-elf-user-programs.md).
             contents: user_program,
+        },
+        fat32::File {
+            name: SHELL_ON_DISK,
+            // The shell, which the kernel starts last and which does not
+            // end (docs/adr/0030-fase4-shell-in-ring-3.md).
+            contents: shell,
         },
         fat32::File {
             name: "HELLO.TXT",
@@ -556,8 +645,11 @@ fn prepare_disk(root: &Path) -> Result<PathBuf> {
         "disk: {USER_ON_DISK} is {} byte(s) of ELF",
         user_program.len()
     );
-    let (image, geometry) = fat32::format(sectors, 1, DISK_LABEL, &disk_contents(user_program))
-        .map_err(|err| anyhow::anyhow!("the disk image could not be laid out: {err:?}"))?;
+    let shell = build_program(root, SHELL_PACKAGE, SHELL_BINARY)?;
+    println!("disk: {SHELL_ON_DISK} is {} byte(s) of ELF", shell.len());
+    let (image, geometry) =
+        fat32::format(sectors, 1, DISK_LABEL, &disk_contents(user_program, shell))
+            .map_err(|err| anyhow::anyhow!("the disk image could not be laid out: {err:?}"))?;
     fs::create_dir_all(path.parent().expect("target has a parent"))
         .context("failed to create the target directory for the disk")?;
     fs::write(&path, &image)
@@ -591,6 +683,7 @@ fn prepare_qemu_config(
         headless,
         debug_stub,
         debugcon_log: None,
+        serial_log: None,
         qemu_log: None,
     })
 }
@@ -644,11 +737,15 @@ fn boot_test(
 fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) -> Result<()> {
     let mut cfg = prepare_qemu_config(root, true, false, memory)?;
     let log_path = root.join("target").join("boot-test.log");
+    let serial_path = root.join("target").join("boot-test-serial.log");
     let stderr_path = root.join("target").join("boot-test-qemu-stderr.log");
-    if log_path.exists() {
-        fs::remove_file(&log_path).context("failed to clear previous boot-test log")?;
+    for path in [&log_path, &serial_path] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
+        }
     }
     cfg.debugcon_log = Some(log_path.clone());
+    cfg.serial_log = Some(serial_path.clone());
     let args = build_qemu_args(&cfg);
 
     let stderr_file = fs::File::create(&stderr_path)
@@ -667,10 +764,27 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
 
     let start = Instant::now();
     let found = loop {
-        if log_path
-            .metadata()
-            .is_ok_and(|_| fs::read_to_string(&log_path).is_ok_and(|c| c.contains(marker)))
-        {
+        if log_path.metadata().is_ok_and(|_| {
+            fs::read_to_string(&log_path).is_ok_and(|log| {
+                if marker != DEFAULT_MARKER {
+                    // Somebody is testing one stage; wait for what they
+                    // asked for and nothing else.
+                    return log.contains(marker);
+                }
+                // A boot with a disk produces two things, and the wait
+                // ends when **both** have happened: the shell in ring 3
+                // says it is reading keys, and the program in ring 3
+                // finishes its checks.
+                //
+                // Waiting for either would end the boot at whichever came
+                // first and kill QEMU before the other. The shell comes up
+                // first, so waiting for it alone cut the program off part
+                // way through — a green boot that had checked nothing.
+                let shell = log.contains(RING3_SHELL_MARKER) || log.contains(DEFAULT_MARKER);
+                let program = log.contains(RING3_FILE_MARKER) || log.contains(RING3_FILE_FAILED);
+                shell && program
+            })
+        }) {
             break true;
         }
         if let Some(status) = child.try_wait().context("failed to poll qemu status")? {
@@ -687,15 +801,53 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
     let _ = child.wait();
 
     if found {
-        println!(
-            "boot-test: marker {marker:?} observed after {:?}",
-            start.elapsed()
-        );
+        if marker == DEFAULT_MARKER {
+            // Not the default marker's name: with a disk that one never
+            // appears, and printing it would be saying something untrue
+            // about what was waited for.
+            println!(
+                "boot-test: a shell and the program answered after {:?}",
+                start.elapsed()
+            );
+        } else {
+            println!(
+                "boot-test: marker {marker:?} observed after {:?}",
+                start.elapsed()
+            );
+        }
         // Only when the boot was not asked to look for something else:
         // a `--marker` of its own means somebody is testing one stage, and
         // the ring-3 program may not have run at all.
         if marker == DEFAULT_MARKER {
             let log = fs::read_to_string(&log_path).context("failed to re-read the boot log")?;
+            // With a disk — which `boot-test` always gives it — the shell
+            // is the program in ring 3. The kernel's own coming up instead
+            // means the program did not load, and that is the failure this
+            // check exists for: it would otherwise be a green boot with
+            // nothing running in ring 3.
+            if !log.contains(RING3_SHELL_MARKER) {
+                bail!(
+                    "boot-test: {RING3_SHELL_MARKER:?} is not in the log, so the shell in ring 3 did not come up (see {})",
+                    log_path.display()
+                );
+            }
+            println!("boot-test: the shell in ring 3 came up");
+
+            // And the same boot, out of the other device. A kernel that
+            // stopped writing to COM1 would still pass everything above,
+            // and would reach the target PC saying nothing at all
+            // (docs/adr/0032-fase5-serial-console.md).
+            let serial = fs::read_to_string(&serial_path).unwrap_or_default();
+            if !serial.contains(RING3_SHELL_MARKER) {
+                bail!(
+                    "boot-test: the boot did not come out of COM1 (see {}); the debug port is an emulator's, and a kernel that only writes there is silent on real hardware",
+                    serial_path.display()
+                );
+            }
+            println!(
+                "boot-test: {} byte(s) of the same boot came out of COM1",
+                serial.len()
+            );
             if log.contains(RING3_FILE_FAILED) {
                 let which: Vec<&str> = log
                     .lines()
@@ -717,7 +869,7 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
         Ok(())
     } else {
         bail!(
-            "boot-test: marker {marker:?} NOT observed within {timeout:?} (see {} and {})",
+            "boot-test: no shell came up within {timeout:?} (waiting for {marker:?} or {RING3_SHELL_MARKER:?}; see {} and {})",
             log_path.display(),
             stderr_path.display()
         );
@@ -988,6 +1140,7 @@ mod tests {
             headless: false,
             debug_stub: false,
             debugcon_log: None,
+            serial_log: None,
             qemu_log: None,
         }
     }

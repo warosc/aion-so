@@ -51,6 +51,11 @@ pub enum Call {
     Read = 6,
     Close = 7,
     WriteFile = 8,
+    /// The console and the directory, from ring 3
+    /// (docs/adr/0029-fase4-console-and-list-abi.md).
+    List = 9,
+    ConsoleWrite = 10,
+    ConsoleRead = 11,
 }
 
 impl Call {
@@ -65,6 +70,9 @@ impl Call {
             6 => Some(Call::Read),
             7 => Some(Call::Close),
             8 => Some(Call::WriteFile),
+            9 => Some(Call::List),
+            10 => Some(Call::ConsoleWrite),
+            11 => Some(Call::ConsoleRead),
             _ => None,
         }
     }
@@ -75,6 +83,9 @@ impl Call {
 /// that ADR and has nothing to refuse yet.
 pub const ERR_UNKNOWN_CALL: i64 = -1;
 pub const ERR_BAD_ARGUMENT: i64 = -2;
+/// Reserved by ADR 0014 point 6 with nothing to refuse. Its first use is
+/// ADR 0033: a write asked for on a disk this kernel did not make.
+pub const ERR_NO_PERMISSION: i64 = -3;
 /// The mailbox written to already holds a message nobody has read. The
 /// sender decides what to do; the demonstration yields and tries again.
 pub const ERR_MAILBOX_FULL: i64 = -4;
@@ -105,6 +116,25 @@ pub const ERR_DISK: i64 = -12;
 
 /// The longest name this filesystem holds: eight, a dot, and three.
 pub const MAX_NAME: u64 = 12;
+
+/// The most text one `log` or `console_write` will take.
+///
+/// One name for both, because ADR 0029 point 8 says they share it: two
+/// numbers that happened to be equal would stop being equal.
+pub const MAX_LOG: u64 = 4096;
+
+/// How big one directory entry is on the wire, and where its fields are
+/// (ADR 0029, point 5).
+///
+/// Fixed, with the size aligned to four, so that a program reads it without
+/// arithmetic. The attributes go across as FAT stores them rather than
+/// translated into flags of our own: translating would invent a vocabulary
+/// to maintain, and the bit that matters — directory — is one.
+pub const ENTRY_BYTES: u64 = 20;
+const ENTRY_NAME: usize = 0;
+const ENTRY_NAME_LEN: usize = 12;
+const ENTRY_ATTRIBUTES: usize = 12;
+const ENTRY_SIZE: usize = 16;
 
 /// The most one `read` will move in a single call.
 ///
@@ -487,7 +517,7 @@ fn serve(frame: &mut SyscallFrame, running: Running) {
     match Call::from(frame.rax) {
         Some(Call::Log) => {
             let (ptr, len) = (frame.rdi, frame.rsi);
-            if !running.owns(ptr, len) || len > 4096 {
+            if !running.owns(ptr, len) || len > MAX_LOG {
                 error!("HARLAN: syscall log({ptr:#x}, {len}) is not this process's memory");
                 frame.rax = ERR_BAD_ARGUMENT as u64;
                 return;
@@ -795,6 +825,79 @@ fn serve(frame: &mut SyscallFrame, running: Running) {
                 Err(err) => frame.rax = number_for(&err) as u64,
             }
         }
+        Some(Call::List) => {
+            let (index, ptr, len) = (frame.rdi, frame.rsi, frame.rdx);
+            // Filled by the kernel, so it has to be writable by the program
+            // (ADR 0029, point 14).
+            if !running.owns_writable(ptr, len) || len < ENTRY_BYTES {
+                error!(
+                    "HARLAN: syscall list({index}, {ptr:#x}, {len}) needs {ENTRY_BYTES} writable byte(s) of this process's own"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            let entry = match crate::fs::entry_at(index as usize) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    frame.rax = number_for(&err) as u64;
+                    return;
+                }
+            };
+
+            // Built whole and copied once, rather than written field by
+            // field into the program's memory: a record half written
+            // because something failed part way would be a name without its
+            // size.
+            let record = encode_entry(&entry);
+
+            // SAFETY: the range was checked to be inside this process's
+            // writable pages, which are mapped in the space that is active,
+            // and it is at least as long as the record.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    record.as_ptr(),
+                    VirtAddr::new(ptr).as_ptr::<u8>(),
+                    record.len(),
+                );
+            }
+            frame.rax = ENTRY_BYTES;
+        }
+        Some(Call::ConsoleWrite) => {
+            let (ptr, len) = (frame.rdi, frame.rsi);
+            // Only read, so this process's own is enough; it does not have
+            // to be writable.
+            if !running.owns(ptr, len) || len > MAX_LOG {
+                error!(
+                    "HARLAN: syscall console_write({ptr:#x}, {len}) is not text this process owns"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: the range was just checked to be inside the pages
+            // this process was given, which are mapped in the active space.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
+            };
+            match core::str::from_utf8(bytes) {
+                // A console with nowhere to draw answers zero rather than
+                // an error: text that went nowhere because nothing can
+                // display it is not the program's mistake, and the kernel's
+                // own output is dropped the same way.
+                Ok(text) => frame.rax = crate::console::write(text).unwrap_or(0) as u64,
+                Err(_) => {
+                    error!("HARLAN: syscall console_write() was handed something that is not text");
+                    frame.rax = ERR_BAD_ARGUMENT as u64;
+                }
+            }
+        }
+        Some(Call::ConsoleRead) => {
+            // Never waits. The handler runs with interrupts off and a key
+            // arrives on the keyboard's IRQ, so waiting here would wait for
+            // an interrupt that cannot arrive, with the clock stopped: the
+            // machine, not a process (ADR 0029, point 11). A program that
+            // wants to wait yields and asks again.
+            frame.rax = crate::console::encode(crate::console::read_key());
+        }
         None => {
             error!("HARLAN: unknown syscall {}", frame.rax);
             frame.rax = ERR_UNKNOWN_CALL as u64;
@@ -815,6 +918,35 @@ pub const MAX_WRITE: u64 =
 /// assertion is a constant one and says nothing a build could not.
 const _: () = assert!(MAX_WRITE > 0);
 
+/// One directory entry as the 20 bytes a program is given
+/// (ADR 0029, point 5).
+///
+/// Its own function because it is ABI: where the name sits, how it is
+/// padded, where the size is and which way round its bytes go. Built inside
+/// the handler none of that could be checked from a host test, and the only
+/// thing that would notice a field in the wrong place is a program reading
+/// it.
+fn encode_entry(entry: &harlan_hal::fat::DirectoryEntry) -> [u8; ENTRY_BYTES as usize] {
+    let mut record = [0u8; ENTRY_BYTES as usize];
+    let name = entry.name().as_bytes();
+    // A bound that cannot be crossed today: `DirectoryEntry::name` is
+    // `[u8; 12]`, so `name()` is never longer than the field it goes into.
+    // A mutation round could not kill the `min` for that reason — it is an
+    // equivalent mutant, not an untested branch. It stays because this is a
+    // slice index, and because the two twelves live in different crates
+    // where nothing makes them move together.
+    let taking = name.len().min(ENTRY_NAME_LEN);
+    record[ENTRY_NAME..ENTRY_NAME + taking].copy_from_slice(&name[..taking]);
+    // Space-padded on the right, which is what the format does and what a
+    // program printing a column of names expects.
+    for byte in &mut record[ENTRY_NAME + taking..ENTRY_NAME + ENTRY_NAME_LEN] {
+        *byte = b' ';
+    }
+    record[ENTRY_ATTRIBUTES] = entry.attributes;
+    record[ENTRY_SIZE..ENTRY_SIZE + 4].copy_from_slice(&entry.size.to_le_bytes());
+    record
+}
+
 /// Which number a program sees for something that went wrong on the disk.
 ///
 /// The translation lives here and not in `fs`, so that what happened and
@@ -834,6 +966,13 @@ fn number_for(err: &crate::fs::FileError) -> i64 {
         // name asked for something that is there and is not what it wants.
         FileError::IsADirectory => ERR_NO_SUCH_FILE,
         FileError::Open => ERR_FILE_IS_OPEN,
+        // The first thing this kernel has ever had to refuse on grounds of
+        // permission rather than of argument. ADR 0014 reserved `-3` and
+        // said it had nothing to refuse yet; this is what it was for.
+        FileError::NotOurDisk => {
+            error!("HARLAN: a write was asked for on a disk this kernel did not make");
+            ERR_NO_PERMISSION
+        }
         FileError::Reading(why) => {
             error!("HARLAN: the disk could not be read: {why:?}");
             ERR_DISK
@@ -881,6 +1020,13 @@ pub unsafe fn on_fault(fault: UserFault) -> ! {
     error!(
         "HARLAN: the process in slot {} caused {} at rip={:#x} (error_code={:#x}, address={:#x}); it does not run again",
         running.slot, fault.name, fault.rip, fault.error_code, fault.address
+    );
+    // A process that died of a fault is exactly what an audit is for, so
+    // the slot and what killed it both go in (ADR 0031, point 9).
+    crate::events::record_with(
+        crate::events::What::Faulted,
+        running.slot as u64,
+        fault.name,
     );
     // SAFETY: as this function's contract, and this process is the one
     // the scheduler has running.
@@ -1184,7 +1330,10 @@ mod tests {
         assert_eq!(Call::from(6), Some(Call::Read));
         assert_eq!(Call::from(7), Some(Call::Close));
         assert_eq!(Call::from(8), Some(Call::WriteFile));
-        assert_eq!(Call::from(9), None);
+        assert_eq!(Call::from(9), Some(Call::List));
+        assert_eq!(Call::from(10), Some(Call::ConsoleWrite));
+        assert_eq!(Call::from(11), Some(Call::ConsoleRead));
+        assert_eq!(Call::from(12), None);
         assert_eq!(Call::from(u64::MAX), None);
         // The numbers are the ABI (ADR 0028, point 3), so they are
         // asserted and not derived: a renumbering that a program does not
@@ -1193,6 +1342,9 @@ mod tests {
         assert_eq!(Call::Read as u64, 6);
         assert_eq!(Call::Close as u64, 7);
         assert_eq!(Call::WriteFile as u64, 8);
+        assert_eq!(Call::List as u64, 9);
+        assert_eq!(Call::ConsoleWrite as u64, 10);
+        assert_eq!(Call::ConsoleRead as u64, 11);
     }
 
     /// Every pointer that arrives from ring 3 is refused before a byte of
@@ -1385,6 +1537,94 @@ mod tests {
         assert_eq!(
             MAX_WRITE,
             harlan_hal::fat::MAX_FILE_CLUSTERS as u64 * harlan_hal::fat::SECTOR_BYTES as u64
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The directory record (ADR 0029, point 5)
+    // -----------------------------------------------------------------
+
+    fn an_entry(name: &str, size: u32, attributes: u8) -> harlan_hal::fat::DirectoryEntry {
+        let mut bytes = [b' '; 12];
+        let mut at = 0;
+        for byte in name.bytes() {
+            bytes[at] = byte;
+            at += 1;
+        }
+        harlan_hal::fat::DirectoryEntry {
+            name: bytes,
+            name_len: at,
+            attributes,
+            first_cluster: 3,
+            size,
+        }
+    }
+
+    /// Where every field of the record is, byte for byte.
+    ///
+    /// Asserted against literal offsets rather than against the constants
+    /// that built it: a record checked with the same arithmetic that wrote
+    /// it agrees with itself whatever it does. These are the numbers in the
+    /// ADR's table, and a program reading the record uses those.
+    #[test]
+    fn a_directory_record_is_laid_out_the_way_the_abi_says() {
+        let record = encode_entry(&an_entry("HELLO.TXT", 27, 0x20));
+        assert_eq!(record.len(), 20);
+        // 0..12 the name, space-padded on the right.
+        assert_eq!(&record[0..12], b"HELLO.TXT   ");
+        // 12 the attributes, as FAT stores them.
+        assert_eq!(record[12], 0x20);
+        // 13..16 reserved, zero.
+        assert_eq!(&record[13..16], &[0, 0, 0]);
+        // 16..20 the size, little-endian.
+        assert_eq!(&record[16..20], &27u32.to_le_bytes());
+    }
+
+    /// A name that fills all twelve bytes leaves no padding, and nothing
+    /// runs over into the attributes.
+    #[test]
+    fn the_longest_name_does_not_run_into_the_next_field() {
+        let record = encode_entry(&an_entry("ABCDEFGH.IJK", 1, 0x20));
+        assert_eq!(&record[0..12], b"ABCDEFGH.IJK");
+        assert_eq!(record[12], 0x20, "the attributes are still the attributes");
+        assert_eq!(&record[16..20], &1u32.to_le_bytes());
+    }
+
+    /// The directory bit survives, because it is the one bit a program
+    /// reading this has to act on.
+    #[test]
+    fn a_directory_says_it_is_one() {
+        const ATTR_DIRECTORY: u8 = 0x10;
+        let record = encode_entry(&an_entry("SUBDIR", 0, ATTR_DIRECTORY));
+        assert_eq!(record[12] & ATTR_DIRECTORY, ATTR_DIRECTORY);
+        let file = encode_entry(&an_entry("FILE.TXT", 9, 0x20));
+        assert_eq!(file[12] & ATTR_DIRECTORY, 0);
+    }
+
+    /// The size goes across little-endian and whole, including one that
+    /// uses every byte. Written the other way round, a 1 KB file would read
+    /// as 16 MB.
+    #[test]
+    fn a_size_crosses_whole_and_the_right_way_round() {
+        for size in [0u32, 1, 27, 512, 0x0100_0000, u32::MAX] {
+            let record = encode_entry(&an_entry("S.BIN", size, 0x20));
+            let read = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+            assert_eq!(read, size, "{size} did not survive the trip");
+        }
+        // And explicitly: the low byte comes first.
+        let record = encode_entry(&an_entry("S.BIN", 0x0403_0201, 0x20));
+        assert_eq!(&record[16..20], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// The record is exactly as long as the ABI says, and the limit a call
+    /// checks a buffer against is that same number — not a second copy of
+    /// it that could drift.
+    #[test]
+    fn the_record_is_as_long_as_the_limit_a_call_checks() {
+        assert_eq!(ENTRY_BYTES, 20);
+        assert_eq!(
+            encode_entry(&an_entry("A.TXT", 0, 0x20)).len() as u64,
+            ENTRY_BYTES
         );
     }
 }
