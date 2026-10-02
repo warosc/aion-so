@@ -9,6 +9,103 @@ dependen de este repositorio: saber qué lleva dentro el equipo objetivo, y
 arrancarlo. Lo que sí se puede hacer entre tanto es todo lo demás, y lo
 primero de todo es que cuando ese arranque ocurra, la máquina diga algo.
 
+## Incremento 38 — Solo nuestro disco
+
+`docs/adr/0033-fase5-only-our-disk.md`.
+
+### Por qué ahora y no después
+
+La salida de la fase lo dice con todas las letras: *"sin escribir en discos no
+seleccionados"*.
+
+Hoy el kernel coge el primer dispositivo virtio que encuentra y le escribe. En
+QEMU ese es el único disco y es nuestro. **En el PC objetivo hay discos con las
+cosas de alguien dentro.** Ahora mismo no llegaría a tocarlos porque no hay
+driver para NVMe ni SATA — pero el bullet siguiente de la fase es *drivers
+mínimos de almacenamiento*, y el día que exista, un kernel sin esta regla
+escribiría en el primer disco que supiera manejar.
+
+**La regla tiene que existir antes que los drivers**, porque después se escribe
+con un disco ya roto.
+
+### Qué es "nuestro"
+
+El serial que escribe el formateador de `xtask` —`HARL`, cuatro bytes ASCII
+leídos como número— **y** la etiqueta `HARLAN`. Las dos, no una. Un volumen que
+no lleva el bloque extendido del BPB no dice nada, y lo que no dice nada no es
+nuestro: negarse es la respuesta que es segura cuando se equivoca, porque
+equivocarse por ese lado cuesta un disco nuestro en el que no escribimos y por
+el otro cuesta los datos de alguien.
+
+**Y es una guarda contra escribir en el disco equivocado, no contra un
+adversario.** Ni el serial ni la etiqueta son secretos. Lo dice el ADR porque
+un documento que presentara esto como seguridad invitaría a apoyar encima algo
+que no aguanta.
+
+### Dos compuertas, y las dos hacen falta
+
+Una en `fs::write_file`, antes que nada —incluso antes de mirar si el nombre
+vale, porque "¿puedo escribir aquí?" no es una pregunta sobre los argumentos—,
+que da el error bueno. Y otra en `Sectors::write_sector`, que es el punto por
+donde pasa **cada byte** que llegaría a un plato, y esa es la que no se puede
+rodear.
+
+Medido, quitándolas una a una:
+
+| | el disco ajeno |
+|---|---|
+| las dos puestas | sin tocar |
+| sin la de `write_file` | sin tocar — la del dispositivo lo para |
+| sin la del dispositivo | sin tocar — la de `write_file` lo para |
+| **sin ninguna** | **1 860 bytes escritos** |
+
+Cada una basta sola, y quitando las dos el kernel escribe en el disco de otro.
+La defensa en profundidad es real, no decorativa.
+
+### La prueba que vale es la que compara bytes
+
+Un volumen FAT32 **bien formado** que no es nuestro —el mismo disco,
+reetiquetado `NOTYOURS` con serial `0xDEADBEEF`— puesto donde el kernel busca:
+
+```
+HARLAN: this disk says it is "NOTYOURS" with serial 0xdeadbeef, which is not
+        what this kernel's tooling writes; it will be read and never written
+HARLAN: BOOTS.TXT could not be written (NotOurDisk)
+HARLAN: EVENTS.LOG could not be written (NotOurDisk)
+```
+
+y **el mismo sha256 antes y después**. La línea del log es la palabra del
+kernel sobre sí mismo; la imagen sin cambiar es la evidencia.
+
+La máquina arranca hasta la shell en ring 3 igualmente: lee el programa y la
+shell, y falla solo lo que necesitaba escribir. Un primer arranque en una
+máquina desconocida no se queda a medias.
+
+### Un error de mi script que casi me cuela una prueba falsa
+
+La primera versión del script que prepara el disco ajeno escribía la identidad
+con `foreach ($base in @(0, 6 * 512))`. En PowerShell **la coma liga más fuerte
+que el `*`**, así que eso es `(0,6)` repetido 512 veces: escribió la identidad
+mil veces en sitios equivocados y dejó el volumen hecho un lío.
+
+La prueba **pasó igual** —un volumen destrozado tampoco es nuestro—, y casi la
+doy por buena. Lo que la delató fue que el kernel imprimió la etiqueta como
+`""` en vez de `"NOTYOURS"`. Una prueba que pasa por el motivo equivocado se
+parece mucho a una que vale; la diferencia estaba en una línea del log que no
+cuadraba.
+
+### Verificación ejecutada
+
+- 130 pruebas en `kernel` y 103 en `hal`, con la decisión probada por cada
+  forma de ser casi nuestro: el serial solo, la etiqueta sola, cualquiera de
+  las dos, un nombre que empieza igual, uno que es prefijo, otro en
+  minúsculas, y uno vacío.
+- Mutación: 11, 9 detectadas en host. Las 2 que no son las compuertas mismas,
+  que ninguna prueba de host alcanza porque necesitan un disco montado — las
+  caza el arranque con el disco ajeno, que es la tabla de arriba.
+- Y nuestro propio disco sigue siendo nuestro: `this disk is ours ("HARLAN",
+  serial 0x4841524c)`, y los arranques siguen contándose.
+
 ## Incremento 37 — La consola serie
 
 `docs/adr/0032-fase5-serial-console.md`.
