@@ -11,6 +11,161 @@ driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
 
+## Incremento 35 — La shell, en ring 3
+
+`docs/adr/0030-fase4-shell-in-ring-3.md`. El último bullet grande de Fase 4.
+
+No es una reorganización de código. Es la prueba de que el límite de
+privilegio sirve para algo: una shell es el primer programa que una persona
+conduce, y **una shell que necesitara privilegios que nadie más recibe sería
+un límite con un agujero con forma de shell**.
+
+### Qué sabe hacer
+
+Seis comandos, y todos salen de lo que el ABI ya permite: `help`, `ls`,
+`cat NAME`, `write NAME TEXT`, `echo TEXT` y `exit`. Ni `reboot` ni
+`shutdown`: apagar necesita una syscall que no existe, e inventarla aquí
+sería inventar ABI sin ADR.
+
+`cat` lee en trozos de 64 bytes, mucho menores que los ficheros del disco.
+Un descriptor existe precisamente para que un fichero no tenga que caber en
+un buffer (ADR 0028, punto 1); leerlo de golpe sería tener descriptores y no
+usarlos para nada.
+
+Los errores se dicen con palabras: `cat: nope.txt: no such file`, no `-9`.
+El número es el ABI y la frase es la interfaz.
+
+### Un binding del ABI, no dos
+
+Dos programas hacen ahora las mismas once llamadas. Dos juegos de envolturas
+son dos copias de un contrato, y una copia de un contrato es una copia que se
+separa — el mismo fallo que este kernel ya tuvo con un `CURRENT`
+desactualizado, con una cuenta de clusters libres llevada a mano, y con un
+formateador y una prueba que compartían un malentendido.
+
+`user/abi` es la única traducción. Lo que **no** entra ahí son las sondas de
+puntero crudo: existen para hacer lo que las envolturas tipadas hacen
+imposible —entregar al kernel una dirección que no es un slice que el
+programa pudiera prestar— y un binding que lo pusiera fácil sería un binding
+que pone fácil el error.
+
+### Dos cosas que solo se vieron conduciéndola
+
+**La consola es por orden de llegada entre procesos.** Hay una cola de teclas
+y no tiene dueño: el que pregunta primero se la lleva. Se encontró de la peor
+manera posible — en la primera sesión escrita a mano, el `help` salió como
+`elp` y la shell contestó `unknown command: elp`. La `h` se la había comido el
+programa de pruebas, que seguía sondeando el teclado desde su propia espera.
+
+No es un fallo de la shell; es una propiedad real del diseño, y está anotada
+en el ADR. Aquí se resolvió quitando esa sonda —que además costaba un segundo
+de cada arranque—; de verdad se resuelve cuando la consola sea algo que se
+entrega, que es la pregunta de Fase 6.
+
+**`boot-test` aceptaba un arranque a medias.** Mataba QEMU en cuanto veía un
+marcador, y la shell de ring 3 sube **antes** de que el programa de pruebas
+acabe sus trece comprobaciones. El resultado: un arranque verde en el que el
+programa se había cortado por la mitad. Ahora espera a las **dos** señales.
+
+### La shell arranca después de la comprobación de marcos, no a la vez
+
+Esto empezó como un fallo silencioso y acabó siendo la decisión más
+interesante del incremento.
+
+Un proceso que no termina nunca devuelve sus marcos, así que con la shell en
+la primera ronda `run_until_empty` no vuelve — y la línea que dice *"los
+procesos que terminaron devolvieron todo lo que tomaron"* **dejó de
+imprimirse en todos los arranques**. Esa comprobación ha cazado fugas reales
+(el Incremento 33 arregló una en `spawn_elf`), y perderla sin quererlo a
+cambio de una funcionalidad es el tipo de cambio que nadie decide hacer.
+
+Lo encontré porque el `grep` de verificación dejó de encontrar la línea, no
+porque nada fallara: el arranque seguía en verde.
+
+La solución son dos rondas. Las nueve demostraciones son un autotest: corren,
+terminan, y el balance se mide. Después arranca la shell, en una ronda suya,
+y esa no termina — porque eso es lo que una shell es.
+
+```
+HARLAN: 95 frame(s) back from the processes that ended; the allocator has the 62719 it started with
+HARLAN: the shell runs in slot 9
+```
+
+### Lo que se ve al conducirla
+
+```
+harlan$ help
+help            what you are reading
+ls              what is on the disk
+cat NAME        print a file
+write NAME TEXT write a file, replacing it
+echo TEXT       print TEXT
+exit            stop this shell
+harlan$ ls
+HELLO.ELF      24168
+SHELL.ELF      34808
+HELLO.TXT         27
+LONG.BIN        2049
+EMPTY.BIN          0
+BOOTS.TXT          2
+RING3.TXT         20
+harlan$ cat hello.txt
+HARLAN reads its own disk.
+harlan$ write ring3.txt typed at the shell
+wrote ring3.txt
+harlan$ cat ring3.txt
+typed at the shell
+harlan$ nosuch
+unknown command: nosuch
+harlan$ cat nope.txt
+cat: nope.txt: no such file
+```
+
+Escrito con `sendkey` por el monitor de QEMU y fotografiado con `screendump`,
+porque la pantalla es el único sitio donde salen las respuestas: la shell
+imprime por `console_write`, que dibuja en el framebuffer, no por `log`.
+
+### El camino de reserva, comprobado
+
+El kernel tiene que arrancar sin disco (CLAUDE.md), y sin disco no hay
+`SHELL.ELF`. Comprobado por el camino más barato —marcando la entrada de
+`SHELL.ELF` como borrada en una copia de la imagen— en vez de dando por hecho
+que funciona:
+
+```
+HARLAN: SHELL.ELF cannot be loaded (NoSuchFile)
+HARLAN: from ring 3: HARLAN: ring3-file ALL OK
+HARLAN-PHASE1-SHELL-READY
+```
+
+### Verificación ejecutada
+
+- 376 pruebas de host (365 + 11: el troceado de líneas de la shell y el lado
+  del programa del registro de directorio). Las dos mitades puras de los
+  programas de usuario pasan a comprobarse en host, lo que obligó a separar
+  la lógica de la shell en una librería: un binario `no_std` no se puede
+  construir para el host —no tiene estrategia de pánico— así que se comprueba
+  la librería en host y el binario en el objetivo donde corre.
+- `fmt-lint` limpio, `boot-test --repeat 10` 10/10 con las dos señales en
+  cada uno, contador de arranques a 10, 95 marcos devueltos cada vez y FSInfo
+  cuadrando con las dos tablas.
+- Sesión interactiva con siete comandos, y el camino de reserva.
+
+### Lo que queda de Fase 4
+
+Solo **registro de eventos del sistema**. Los otros tres bullets están.
+
+### Deuda que esto crea
+
+- **Una espera activa permanente** mientras nadie escribe: la shell pregunta,
+  cede y vuelve a preguntar, porque `console_read` no bloquea. Es la misma
+  deuda de Fase 5 que el ADR 0028 anotó para la E/S.
+- **La consola no tiene dueño.** Cualquier proceso puede llevarse una tecla
+  destinada a otro. Fase 6.
+- **No hay `exec`.** Una shell que no puede lanzar programas es media shell, y
+  lanzar uno necesita que un proceso cree otro, lo que necesita decidir qué
+  hereda — y ahí es donde el descriptor se convierte en capacidad.
+
 ## Incremento 34 — La consola y el directorio, desde ring 3
 
 `docs/adr/0029-fase4-console-and-list-abi.md`. Lo que le faltaba a un
