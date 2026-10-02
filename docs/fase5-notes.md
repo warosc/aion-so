@@ -9,6 +9,110 @@ dependen de este repositorio: saber qué lleva dentro el equipo objetivo, y
 arrancarlo. Lo que sí se puede hacer entre tanto es todo lo demás, y lo
 primero de todo es que cuando ese arranque ocurra, la máquina diga algo.
 
+## Incremento 40 — El inventario de hardware
+
+`docs/adr/0035-fase5-hardware-inventory.md`.
+
+### El bullet que no se puede escribir desde aquí
+
+*Inventario de hardware del equipo objetivo.* Nadie de este lado de la
+pantalla ha visto la máquina. Lo que sí se puede escribir es **la cosa que lo
+averigua**, y hace falta antes que lo que viene después: elegir qué drivers
+escribir sin saber qué hay dentro es escribir a ciegas.
+
+### La idea que lo hace útil
+
+Corre **en el cargador, bajo UEFI, antes de `ExitBootServices`**. Eso no es un
+detalle de implementación, es la razón entera de que funcione: mientras los
+servicios del firmware existen se puede **escribir un fichero en el stick del
+que arrancó** sin tener driver para el dispositivo en el que esté enchufado.
+El firmware ya sabe hablarle.
+
+Así que el flujo para quien tenga la máquina es: arrancar el stick, volver a
+enchufarlo a un ordenador normal, y leer `INVENTORY.TXT`. Sin fotografiar una
+pantalla, sin transcribir un `vendor:device` a mano —que es donde se pierden
+los datos que importan— y sin cable serie. También sale por pantalla y por el
+registro, para quien no pueda hacer eso.
+
+### Escribe en su propio volumen y en ninguno más
+
+El manejador sale del protocolo de imagen cargada: no es "un disco" ni "el
+primero que haya", es **el volumen del que este programa fue cargado**. Es el
+mismo cuidado del ADR 0033 por el único medio que hay a este lado de
+`ExitBootServices`.
+
+Medido: tras un arranque, **un byte cambiado dentro de la ESP y cero en la
+partición de datos**. Nada fuera de las dos.
+
+### Dos resúmenes de memoria que engañaban
+
+El primer informe decía `reserved 12298 MiB` en una máquina de 512 MiB. Pensé
+que eran ventanas de MMIO y las separé; siguió diciendo 12294.
+
+El error era resumir. El firmware marca el hueco por encima de la RAM como
+`EfiReservedMemoryType`, y cualquier reparto en dos categorías que yo invente
+va a mentir sobre algo. Ahora el informe **lista los tipos con los nombres que
+les da el firmware**:
+
+```
+  usable    505 MiB, largest piece 419 MiB
+  by kind (as the firmware names them):
+    conventional                457 MiB in 12 region(s)
+    boot services data           43 MiB in 41 region(s)
+    reserved                  12288 MiB in 2 region(s)
+    memory-mapped i/o             4 MiB in 1 region(s)
+```
+
+Se ve lo que es. **Adivinar qué tipos son memoria era el error**: el firmware
+sabe lo que quiere decir y el lector lo puede leer. Es un número que, mal
+puesto, manda a alguien a buscar una avería que no existe.
+
+### Lo que sale
+
+```
+[firmware]
+  uefi      2.70
+  vendor    EDK II
+[processor]
+  vendor    AuthenticAMD
+  name      QEMU Virtual CPU version 2.5+
+  features  nx=yes 1g-pages=no syscall=yes long-mode=yes
+            apic=yes x2apic=no invariant-tsc=no hypervisor=yes
+[pci]
+  00:03.0  1b36:000d  class 0c.03.30  USB controller
+  6 function(s)
+```
+
+`hypervisor=yes` es verdad y es una confirmación de que la decodificación de
+bits funciona: esto **es** una máquina virtual.
+
+Y si el escaneo PCI pierde funciones, lo dice en mayúsculas. Un inventario que
+se calla lo que no cupo manda a alguien a escribir un driver para un
+dispositivo que no es el suyo. El límite sube de 32 a 96 por lo mismo: 32 era
+suficiente para lo que QEMU emula y un escritorio de verdad tiene más.
+
+### Verificación ejecutada
+
+- Arranca desde el stick y escribe: `INVENTORY.TXT written to the volume this
+  booted from, 1604 byte(s)`.
+- **Y lo lee otro**: 7-Zip saca la ESP de la imagen y el fichero de dentro,
+  con el informe entero.
+- Un byte en la ESP, cero en los datos.
+- `cpuid` entra en `arch` con su decodificación probada en host contra lo que
+  dicen los manuales — incluido que las dos "hojas 1", la ordinaria y la
+  extendida, **no son intercambiables**, que es el error fácil porque en
+  conversación se llaman igual.
+
+### Cómo se usa
+
+```
+cargo xtask usb-image --inventory
+```
+
+da `target/harlan-inventory.img` — nombre distinto del stick normal, para que
+no se confundan encima de una mesa. Se escribe con `dd`, se arranca la
+máquina con él, y el informe queda en la raíz del stick.
+
 ## Incremento 39 — La imagen USB
 
 `docs/adr/0034-fase5-usb-image.md`.
