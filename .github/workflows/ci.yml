@@ -22,6 +22,7 @@ jobs:
       - run: cargo clippy -p harlan-hal -p harlan-arch-x86_64 -p harlan-fbcon -p harlan-kernel -p xtask --all-targets -- -D warnings
       - run: cargo clippy -p harlan-kernel --target x86_64-unknown-none -- -D warnings
       - run: cargo clippy -p harlan-boot --target x86_64-unknown-uefi -- -D warnings
+      - run: cargo clippy -p harlan-hello --target x86_64-unknown-none -- -D warnings
 
   host-tests:
     runs-on: ubuntu-latest
@@ -37,6 +38,25 @@ jobs:
       - run: rustup show
       - run: cargo build -p harlan-kernel --target x86_64-unknown-none --release
       - run: cargo build -p harlan-boot --target x86_64-unknown-uefi --release
+      - run: cargo build -p harlan-hello --target x86_64-unknown-none --release
+
+  # A second opinion on the disk image, from an implementation nobody here
+  # wrote. A FAT32 reader and the formatter that made the image it reads
+  # pass each other's tests even when both are wrong; `fsck.vfat` does not
+  # share the misunderstanding (docs/adr/0025-fase4-fat32-read-only.md).
+  disk-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: Install dosfstools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools
+      - run: cargo xtask build
+      # `-n` is "no changes": report what is wrong and fix nothing. `-V`
+      # makes it verify by reading the whole volume back.
+      - run: fsck.vfat -n -V target/disk.img
 
   boot-smoke-test:
     needs: build-freestanding
@@ -44,11 +64,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - name: Install QEMU
+      - name: Install QEMU and dosfstools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y qemu-system-x86 dosfstools
       - run: cargo xtask boot-test --timeout-secs 30 --repeat 10
+      # Straight after those ten boots and before anything else runs. Each
+      # `boot-test` builds first, and building lays the disk out again, so
+      # a check placed after the next one would see a single boot's writes
+      # and say so as if it had seen ten
+      # (docs/adr/0027-fase4-fat32-write.md, point 10).
+      - name: The disk the kernel wrote is still a FAT32 volume
+        run: fsck.vfat -n -V target/disk.img
       # Quoted: an unquoted ": " inside the marker would break the YAML.
       - run: 'cargo xtask boot-test --timeout-secs 120 --heap-stress --marker "HARLAN: heap stress complete, 200000 cycles"'
 

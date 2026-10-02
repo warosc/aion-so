@@ -428,11 +428,6 @@ pub unsafe fn start_queue(
 impl Reader {
     /// Reads one 512-byte sector into `into`.
     ///
-    /// Three descriptors: the header the device reads, the data it writes,
-    /// and one byte of status. They are separate descriptors because their
-    /// permissions are — a device that could write the header could change
-    /// what it was asked to do.
-    ///
     /// # Safety
     ///
     /// The queue and the request frame must be this reader's own and no
@@ -443,7 +438,60 @@ impl Reader {
         sector: u64,
         into: &mut [u8; 512],
     ) -> Result<(), ReadError> {
-        let header = virtio::block::header(virtio::block::TYPE_IN, sector);
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.request(disk, virtio::block::TYPE_IN, sector, |_| {}) }?;
+        // SAFETY: the device has finished with the frame, and the sector
+        // is 512 bytes inside it.
+        unsafe {
+            into.as_mut_ptr()
+                .copy_from_nonoverlapping(self.request.add(DATA_AT as usize), into.len())
+        };
+        Ok(())
+    }
+
+    /// Writes one 512-byte sector from `from`.
+    ///
+    /// # Safety
+    ///
+    /// As `read_sector`.
+    pub unsafe fn write_sector(
+        &mut self,
+        disk: &Disk,
+        sector: u64,
+        from: &[u8; 512],
+    ) -> Result<(), ReadError> {
+        // SAFETY: as above; the bytes are copied into the request frame
+        // before the device is told about it.
+        unsafe {
+            self.request(disk, virtio::block::TYPE_OUT, sector, |data| {
+                data.copy_from_nonoverlapping(from.as_ptr(), from.len())
+            })
+        }
+    }
+
+    /// One request, of either kind.
+    ///
+    /// Reading and writing differ in two things: the type in the header,
+    /// and which way the data descriptor points — the device writes the
+    /// data of a read and reads the data of a write. Everything else, and
+    /// in particular the order of the writes and the waiting, is the same,
+    /// so it is written once.
+    ///
+    /// `fill` puts the bytes in the request frame for a write, and does
+    /// nothing for a read.
+    ///
+    /// # Safety
+    ///
+    /// As `read_sector`.
+    unsafe fn request(
+        &mut self,
+        disk: &Disk,
+        kind: u32,
+        sector: u64,
+        fill: impl FnOnce(*mut u8),
+    ) -> Result<(), ReadError> {
+        let writing = kind == virtio::block::TYPE_OUT;
+        let header = virtio::block::header(kind, sector);
         // SAFETY: the request frame is this reader's, reachable through the
         // kernel's window, and nothing else writes it.
         unsafe {
@@ -454,6 +502,8 @@ impl Reader {
             // so that "it worked" cannot be read off memory that was
             // already zero.
             self.request.add(STATUS_AT as usize).write_volatile(0xFF);
+            // And for a write, the bytes the device is about to read.
+            fill(self.request.add(DATA_AT as usize));
         }
 
         // SAFETY: the queue is this reader's and no request is in flight.
@@ -472,7 +522,13 @@ impl Reader {
                 virtio::Descriptor {
                     address: self.request_phys + DATA_AT,
                     length: virtio::block::SECTOR_BYTES,
-                    flags: virtio::DESC_NEXT | virtio::DESC_WRITE,
+                    // The device writes the data of a read and reads the
+                    // data of a write, which is the whole difference.
+                    flags: if writing {
+                        virtio::DESC_NEXT
+                    } else {
+                        virtio::DESC_NEXT | virtio::DESC_WRITE
+                    },
                     next: STATUS,
                 },
             );
@@ -515,17 +571,19 @@ impl Reader {
         if status != virtio::block::STATUS_OK {
             return Err(ReadError::Failed { status });
         }
-        // The device counts the status byte it wrote as well as the data.
-        if done.written != virtio::block::SECTOR_BYTES + 1 {
+        // What the device says it wrote: for a read, the sector and the
+        // status byte; for a write, only the status byte, because the data
+        // went the other way.
+        let expected = if writing {
+            1
+        } else {
+            virtio::block::SECTOR_BYTES + 1
+        };
+        if done.written != expected {
             return Err(ReadError::ShortRead {
                 written: done.written,
             });
         }
-        // SAFETY: as above; the sector is 512 bytes inside the frame.
-        unsafe {
-            into.as_mut_ptr()
-                .copy_from_nonoverlapping(self.request.add(DATA_AT as usize), into.len())
-        };
         Ok(())
     }
 }

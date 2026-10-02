@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["boot", "kernel", "hal", "arch/x86_64", "drivers/fbcon", "tools/xtask"]
+members = ["boot", "kernel", "hal", "arch/x86_64", "drivers/fbcon", "tools/xtask", "user/hello"]
 default-members = ["tools/xtask"]
 
 [workspace.package]

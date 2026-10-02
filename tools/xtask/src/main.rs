@@ -3,11 +3,12 @@
 
 use std::{
     fs,
-    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+mod fat32;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -20,6 +21,20 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// of the freestanding boot chain. Override with `--marker` to check the
 /// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
 const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
+
+/// What the program in ring 3 says when every one of its file checks
+/// passed (user/hello/src/main.rs, docs/adr/0028-fase4-file-abi-v0.md).
+///
+/// Checked as well as the boot marker, because the shell comes up whether
+/// or not a program could read a file: a boot that only reaches the marker
+/// is a boot that proves the kernel got that far and nothing about the
+/// ABI.
+const RING3_FILE_MARKER: &str = "HARLAN: ring3-file ALL OK";
+
+/// What it says when one of them did not. Looked for because its absence
+/// is not evidence on its own — a program that dies before its last check
+/// prints no verdict at all — but its presence is proof of a failure.
+const RING3_FILE_FAILED: &str = "HARLAN: ring3-file FAILED";
 /// Guest RAM the frame allocator's fixed bitmap is sized for (see
 /// kernel::memory::FRAME_BITMAP_WORDS). More RAM boots too; the frames
 /// above the covered range are ignored and logged.
@@ -155,7 +170,13 @@ fn build(root: &Path, features: &[&str]) -> Result<()> {
         let args: Vec<&str> = command.iter().map(String::as_str).collect();
         run_cargo(root, &args)?;
     }
-    assemble_esp(root)
+    assemble_esp(root)?;
+    // Everything the machine boots with, not only the part that is
+    // compiled: the disk is as much an input as the image on the ESP, and
+    // CI checks it with `fsck.vfat` before anything is run
+    // (docs/adr/0025-fase4-fat32-read-only.md).
+    prepare_disk(root)?;
+    Ok(())
 }
 
 /// The cargo invocations `build` runs, with `features` enabled on both
@@ -176,6 +197,54 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
         }
         command
     })
+}
+
+/// The user program's own target and the flags that make it loadable.
+///
+/// The toolchain's default for a bare target is a position-independent
+/// executable, which needs relocating at load time. This kernel loads
+/// static ones (docs/adr/0026-fase4-elf-user-programs.md), so the
+/// relocation model and the linker are told so, and the image is based
+/// where a user program lives.
+const USER_PACKAGE: &str = "harlan-hello";
+const USER_BINARY: &str = "hello";
+const USER_RUSTFLAGS: &str = concat!(
+    "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000",
+    // Without this, a program of 2.9 KB of code ships with 750 KB of
+    // DWARF that nothing on this machine can read: the kernel loads the
+    // PT_LOAD segments and nothing else. It is the on-disk size that
+    // matters, because the kernel reads the whole file into a fixed buffer
+    // before parsing it, and refuses one that does not fit.
+    " -C strip=debuginfo",
+);
+/// What it is called on the disk. Eight and three, like everything else
+/// there (ADR 0025).
+const USER_ON_DISK: &str = "HELLO.ELF";
+
+/// Builds the user program and answers its bytes.
+///
+/// Its own cargo invocation, because the flags above must not reach the
+/// kernel: it is built for the same target and is not an ELF anybody
+/// loads this way.
+fn build_user_program(root: &Path) -> Result<Vec<u8>> {
+    let manifest_path = root.join("Cargo.toml");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .args(["-p", USER_PACKAGE, "--target", KERNEL_TARGET])
+        .env("RUSTFLAGS", USER_RUSTFLAGS)
+        .status()
+        .context("failed to spawn cargo for the user program")?;
+    if !status.success() {
+        bail!("building {USER_PACKAGE} failed with {status}");
+    }
+    let built = root
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join(USER_BINARY);
+    fs::read(&built).with_context(|| format!("failed to read {}", built.display()))
 }
 
 fn assemble_esp(root: &Path) -> Result<()> {
@@ -264,6 +333,22 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "harlan-boot",
             "--target",
             UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // The user program is held to the same standard as the kernel, even
+    // though it is not part of it
+    // (docs/adr/0026-fase4-elf-user-programs.md).
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            USER_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
             "--",
             "-D",
             "warnings",
@@ -400,57 +485,91 @@ fn qemu_binary() -> &'static str {
 
 /// How big the disk is. Small on purpose: it is written on every build and
 /// read one sector at a time.
-const DISK_BYTES: u64 = 8 * 1024 * 1024;
-/// What the first sector holds, so that a driver reading it can say
-/// whether it read the right thing rather than "something".
-const DISK_SIGNATURE: &[u8] = b"HARLAN-DISK-0\n";
-/// And a second marker, further in. Sector 0 alone cannot tell a driver
-/// that asks for sector 0 from one whose sector number never reaches the
-/// device: both give the same bytes. This one can.
-const DISK_FAR_SECTOR: u64 = 8;
-const DISK_FAR_SIGNATURE: &[u8] = b"HARLAN-SECTOR-8\n";
+/// How big the disk is. Sixty-four megabytes, and the size is not a taste:
+/// FAT32 needs more than 65 525 clusters, and below that the specification
+/// says the volume is FAT16 whatever its BPB claims. A disk too small with
+/// a BPB that says FAT32 is exactly the image a careless reader accepts
+/// and `fsck` rejects (docs/adr/0025-fase4-fat32-read-only.md).
+const DISK_BYTES: u64 = 64 * 1024 * 1024;
+const DISK_LABEL: &str = "HARLAN";
 
-/// The disk QEMU attaches: raw, and mostly zeroes until Fase 4 puts a
-/// filesystem on it. The two markers are what make a read verifiable — a
-/// driver that reads them can say whether it read the *right* thing rather
-/// than "something", and whether it read the right *place*.
+/// What goes on it. Three files: one to read, one long enough to be a
+/// chain of clusters rather than a single one, and one empty, because a
+/// directory entry has to name a cluster even when there is nothing in it.
+fn disk_contents(user_program: Vec<u8>) -> Vec<fat32::File> {
+    vec![
+        fat32::File {
+            name: USER_ON_DISK,
+            // The program the kernel runs, compiled by the toolchain
+            // rather than written out by hand
+            // (docs/adr/0026-fase4-elf-user-programs.md).
+            contents: user_program,
+        },
+        fat32::File {
+            name: "HELLO.TXT",
+            contents: b"HARLAN reads its own disk.
+"
+            .to_vec(),
+        },
+        fat32::File {
+            name: "LONG.BIN",
+            // Four clusters and a byte, so that reading it has to follow
+            // the chain and stop where the length says rather than where
+            // the clusters do.
+            contents: (0..4 * 512 + 1).map(|n| (n % 251) as u8).collect(),
+        },
+        fat32::File {
+            name: "EMPTY.BIN",
+            contents: Vec::new(),
+        },
+    ]
+}
+
+/// Where the disk is. Running does not create it: it is an output of
+/// `build`, and recreating it before every boot would wipe whatever the
+/// kernel wrote last time — which is the thing persistence means
+/// (docs/adr/0027-fase4-fat32-write.md).
+fn disk_path(root: &Path) -> Result<PathBuf> {
+    let path = root.join("target").join("disk.img");
+    if !path.exists() {
+        bail!(
+            "there is no disk at {}; run `cargo xtask build` first",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Writes the disk QEMU attaches: a real FAT32 volume, laid out here
+/// rather than synthesised by QEMU — whose own FAT32 says it has never
+/// been tested, and a reader verified against an untested implementation
+/// is not verified at all (ADR 0025, point 4).
 ///
-/// The file is created and sized only when it is missing or the wrong
-/// size, so whatever a later increment writes to the rest of it survives.
-/// The markers are written every time, because a run that corrupted one
-/// would otherwise leave every run after it quietly checking against
-/// rubbish.
+/// Written by `build` and by nothing else. Every boot after that reads and
+/// writes the same image, which is how a file written by one boot is there
+/// for the next.
 fn prepare_disk(root: &Path) -> Result<PathBuf> {
     let path = root.join("target").join("disk.img");
-    let right_size = fs::metadata(&path).is_ok_and(|disk| disk.len() == DISK_BYTES);
-    if !right_size {
-        fs::create_dir_all(path.parent().expect("target has a parent"))
-            .context("failed to create the target directory for the disk")?;
-        fs::File::create(&path)
-            .with_context(|| format!("failed to create the disk at {}", path.display()))?
-            .set_len(DISK_BYTES)
-            .context("failed to size the disk image")?;
-    }
-    let mut sector = [0u8; 512];
-    sector[..DISK_SIGNATURE.len()].copy_from_slice(DISK_SIGNATURE);
-    // The last two bytes of a boot sector, so that anything else looking
-    // at this image recognises the shape even though nothing boots from it.
-    sector[510] = 0x55;
-    sector[511] = 0xAA;
-    let mut far = [0u8; 512];
-    far[..DISK_FAR_SIGNATURE.len()].copy_from_slice(DISK_FAR_SIGNATURE);
-    let mut disk = fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .context("failed to open the disk image to write its markers")?;
-    disk.seek(SeekFrom::Start(DISK_FAR_SECTOR * 512))
-        .context("failed to seek to the far sector")?;
-    disk.write_all(&far)
-        .context("failed to write the far marker")?;
-    disk.rewind()
-        .context("failed to seek back to the first sector")?;
-    disk.write_all(&sector)
-        .context("failed to write the disk signature")?;
+    let sectors = (DISK_BYTES / fat32::SECTOR_BYTES as u64) as u32;
+    let user_program = build_user_program(root)?;
+    println!(
+        "disk: {USER_ON_DISK} is {} byte(s) of ELF",
+        user_program.len()
+    );
+    let (image, geometry) = fat32::format(sectors, 1, DISK_LABEL, &disk_contents(user_program))
+        .map_err(|err| anyhow::anyhow!("the disk image could not be laid out: {err:?}"))?;
+    fs::create_dir_all(path.parent().expect("target has a parent"))
+        .context("failed to create the target directory for the disk")?;
+    fs::write(&path, &image)
+        .with_context(|| format!("failed to write the disk at {}", path.display()))?;
+    println!(
+        "disk: FAT32, {} sectors, {} clusters of {} sector(s), {} sector(s) per table, root at cluster {}",
+        geometry.total_sectors,
+        geometry.clusters,
+        geometry.sectors_per_cluster,
+        geometry.sectors_per_fat,
+        geometry.root_cluster
+    );
     Ok(path)
 }
 
@@ -462,7 +581,7 @@ fn prepare_qemu_config(
 ) -> Result<QemuConfig> {
     let (ovmf_code, ovmf_vars_template) = fetch_ovmf(root)?;
     let ovmf_vars = prepare_vars_copy(root, &ovmf_vars_template)?;
-    let disk = prepare_disk(root)?;
+    let disk = disk_path(root)?;
     Ok(QemuConfig {
         ovmf_code,
         ovmf_vars,
@@ -572,6 +691,29 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
             "boot-test: marker {marker:?} observed after {:?}",
             start.elapsed()
         );
+        // Only when the boot was not asked to look for something else:
+        // a `--marker` of its own means somebody is testing one stage, and
+        // the ring-3 program may not have run at all.
+        if marker == DEFAULT_MARKER {
+            let log = fs::read_to_string(&log_path).context("failed to re-read the boot log")?;
+            if log.contains(RING3_FILE_FAILED) {
+                let which: Vec<&str> = log
+                    .lines()
+                    .filter(|line| line.contains(RING3_FILE_FAILED))
+                    .collect();
+                bail!(
+                    "boot-test: the program in ring 3 failed a file check:\n  {}",
+                    which.join("\n  ")
+                );
+            }
+            if !log.contains(RING3_FILE_MARKER) {
+                bail!(
+                    "boot-test: {RING3_FILE_MARKER:?} is not in the log, so the program in ring 3 did not finish its file checks (see {})",
+                    log_path.display()
+                );
+            }
+            println!("boot-test: the program in ring 3 passed every file check");
+        }
         Ok(())
     } else {
         bail!(

@@ -290,6 +290,10 @@ name = "harlan-hal"
 version = "0.0.1"
 
 [[package]]
+name = "harlan-hello"
+version = "0.0.1"
+
+[[package]]
 name = "harlan-kernel"
 version = "0.0.1"
 dependencies = [
@@ -791,6 +795,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "harlan-hal",
  "ovmf-prebuilt",
 ]
 
