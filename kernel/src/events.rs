@@ -43,6 +43,8 @@ pub enum What {
     Boot,
     Disk,
     NoDisk,
+    /// A disk was found and is not one this kernel writes to (ADR 0033).
+    NotOurs,
     Loaded,
     Started,
     Exited,
@@ -64,6 +66,7 @@ impl What {
             What::Boot => "boot      ",
             What::Disk => "disk      ",
             What::NoDisk => "no-disk   ",
+            What::NotOurs => "not-ours  ",
             What::Loaded => "loaded    ",
             What::Started => "started   ",
             What::Exited => "exited    ",

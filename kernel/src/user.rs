@@ -83,6 +83,9 @@ impl Call {
 /// that ADR and has nothing to refuse yet.
 pub const ERR_UNKNOWN_CALL: i64 = -1;
 pub const ERR_BAD_ARGUMENT: i64 = -2;
+/// Reserved by ADR 0014 point 6 with nothing to refuse. Its first use is
+/// ADR 0033: a write asked for on a disk this kernel did not make.
+pub const ERR_NO_PERMISSION: i64 = -3;
 /// The mailbox written to already holds a message nobody has read. The
 /// sender decides what to do; the demonstration yields and tries again.
 pub const ERR_MAILBOX_FULL: i64 = -4;
@@ -963,6 +966,13 @@ fn number_for(err: &crate::fs::FileError) -> i64 {
         // name asked for something that is there and is not what it wants.
         FileError::IsADirectory => ERR_NO_SUCH_FILE,
         FileError::Open => ERR_FILE_IS_OPEN,
+        // The first thing this kernel has ever had to refuse on grounds of
+        // permission rather than of argument. ADR 0014 reserved `-3` and
+        // said it had nothing to refuse yet; this is what it was for.
+        FileError::NotOurDisk => {
+            error!("HARLAN: a write was asked for on a disk this kernel did not make");
+            ERR_NO_PERMISSION
+        }
         FileError::Reading(why) => {
             error!("HARLAN: the disk could not be read: {why:?}");
             ERR_DISK

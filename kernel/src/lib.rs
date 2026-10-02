@@ -951,8 +951,35 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         // (docs/adr/0028-fase4-file-abi-v0.md). The boot
                         // reads the rest of its files through the same
                         // path a program's `open` takes.
-                        fs::adopt(disk, reader, volume);
+                        let ours = fs::adopt(disk, reader, volume);
                         events::record(events::What::Disk, u64::from(volume.clusters));
+                        // Said out loud, both ways, and recorded. A kernel
+                        // that quietly declined to write would look exactly
+                        // like one whose disk was broken; a kernel that
+                        // quietly wrote to somebody's disk is the thing
+                        // Fase 5 exists to not do
+                        // (docs/adr/0033-fase5-only-our-disk.md).
+                        match volume.volume_id {
+                            Some(id) if ours => info!(
+                                "HARLAN: this disk is ours ({:?}, serial {:#010x}); it may be written to",
+                                id.label(),
+                                id.serial
+                            ),
+                            Some(id) => {
+                                events::record_with(events::What::NotOurs, 0, id.label());
+                                warn!(
+                                    "HARLAN: this disk says it is {:?} with serial {:#010x}, which is not what this kernel's tooling writes; it will be read and never written",
+                                    id.label(),
+                                    id.serial
+                                )
+                            }
+                            None => {
+                                events::record_with(events::What::NotOurs, 0, "unnamed");
+                                warn!(
+                                    "HARLAN: this disk does not say who it is; it will be read and never written"
+                                )
+                            }
+                        }
                         check_backup_boot_sector(&volume, &boot_sector);
                         read_a_file();
                         count_this_boot();
