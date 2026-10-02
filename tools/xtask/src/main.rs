@@ -9,6 +9,7 @@ use std::{
 };
 
 mod fat32;
+mod gpt;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -64,6 +65,10 @@ struct Cli {
 enum XtaskCommand {
     /// Build the kernel and the UEFI boot application, and assemble the ESP directory.
     Build,
+    /// Build the bootable USB image: one file, GPT-partitioned, with the
+    /// bootloader on an EFI System Partition and the HARLAN volume beside
+    /// it (docs/adr/0034-fase5-usb-image.md).
+    UsbImage,
     /// Build and run HARLAN OS interactively in QEMU (opens a window).
     Run,
     /// Run host-runnable unit tests (every crate except `harlan-boot`, which
@@ -122,6 +127,7 @@ fn main() -> Result<()> {
         XtaskCommand::Test => test(&root),
         XtaskCommand::FmtLint { fix } => fmt_lint(&root, fix),
         XtaskCommand::Debug => debug(&root),
+        XtaskCommand::UsbImage => usb_image(&root).map(|_| ()),
         XtaskCommand::BootTest {
             timeout_secs,
             marker,
@@ -637,6 +643,54 @@ fn disk_path(root: &Path) -> Result<PathBuf> {
 /// Written by `build` and by nothing else. Every boot after that reads and
 /// writes the same image, which is how a file written by one boot is there
 /// for the next.
+/// How big the EFI System Partition is.
+///
+/// FAT32 needs 65 525 clusters to be FAT32 at all, so a 512-byte-cluster
+/// volume cannot be smaller than about 33 MB however little is in it. The
+/// bootloader is a few hundred kilobytes; the rest is the price of using
+/// one formatter for both partitions rather than two.
+const ESP_SECTORS: u32 = 70_000;
+
+/// Builds the bootable USB image and answers where it is.
+///
+/// One file. Everything before this — a directory QEMU pretends is a FAT
+/// volume, and a second raw file beside it — is something only an emulator
+/// can boot (docs/adr/0034-fase5-usb-image.md).
+fn usb_image(root: &Path) -> Result<PathBuf> {
+    build(root, &[])?;
+
+    let efi = root
+        .join("target")
+        .join(UEFI_TARGET)
+        .join("debug")
+        .join("harlan-boot.efi");
+    let bootloader = fs::read(&efi).with_context(|| format!("failed to read {}", efi.display()))?;
+    let disk = prepare_disk(root)?;
+    let data = fs::read(&disk).with_context(|| format!("failed to read {}", disk.display()))?;
+
+    println!(
+        "usb: the bootloader is {} byte(s), the HARLAN volume {} byte(s)",
+        bootloader.len(),
+        data.len()
+    );
+    let image = gpt::usb_image(bootloader, data, ESP_SECTORS)?;
+
+    let path = root.join("target").join("harlan-usb.img");
+    fs::write(&path, &image).with_context(|| format!("failed to write {}", path.display()))?;
+    println!(
+        "usb: {} is {} byte(s) ({} MiB)",
+        path.display(),
+        image.len(),
+        image.len() / (1024 * 1024)
+    );
+    println!(
+        "usb: write it to a stick with `dd if={} of=/dev/sdX bs=4M status=progress conv=fsync` \
+         — and be certain of which device `sdX` is, because this overwrites it",
+        path.display()
+    );
+    Ok(path)
+}
+
 fn prepare_disk(root: &Path) -> Result<PathBuf> {
     let path = root.join("target").join("disk.img");
     let sectors = (DISK_BYTES / fat32::SECTOR_BYTES as u64) as u32;
