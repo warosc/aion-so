@@ -6,10 +6,176 @@ diez arranques seguidos sobre el mismo disco contando cuántos van. Desde el
 Incremento 33 eso lo puede hacer también un programa en ring 3, por el ABI
 del ADR 0028.
 
+**Los cuatro bullets de la fase están cerrados** en el Incremento 36.
+
 Decisiones de alcance tomadas al abrir la fase: **virtio-blk** como primer
 driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
+
+## Incremento 36 — El registro de eventos del sistema
+
+`docs/adr/0031-fase4-system-event-log.md`. El último bullet de Fase 4.
+
+### Lo que decide su forma no está en el ROADMAP
+
+Está en `ARCHITECTURE.md`:
+
+> Las operaciones destructivas o de alto impacto exigen confirmación y deben
+> dejar **auditoría**.
+
+Eso no describe un log de depuración. Describe un rastro que alguien va a
+mirar **después**, para saber qué hizo la máquina, y que por tanto tiene que
+sobrevivir a que la máquina se pare.
+
+`klog` no es eso, y no por estar mal hecho: se va con la máquina —existe
+porque un emulador copia el puerto 0xE9 a un fichero—, no lo puede leer el
+sistema, y es prosa libre escrita para quien esté depurando ahora. Un
+registro de auditoría tiene que ser las tres cosas que `klog` no es. Son dos
+herramientas distintas: una es el microscopio y la otra es el acta.
+
+### Qué es
+
+Un anillo de líneas de tamaño fijo en `.bss`, sin asignar nada. Cuando se
+llena se pierde lo más viejo: parar de registrar escondería lo que acaba de
+pasar, que es normalmente lo que importa.
+
+**Líneas de texto, no registros binarios**, y eso es una decisión. La regla
+de verificación de este proyecto (ADR 0025, punto 5) es que lo que
+escribimos lo lee otro: un fichero de texto lo lee `cat` desde la shell, lo
+extrae 7-Zip, y lo lee una persona. Un formato propio solo lo lee nuestro
+propio analizador, que es exactamente la posición que `EMPTY.BIN` enseñó a
+desconfiar en el Incremento 29.
+
+Acaba en `EVENTS.LOG`, y **se acumula entre arranques**: el kernel lee lo que
+hay, le añade lo de este arranque y lo escribe entero. Es lo único que el ADR
+0027 permite —no hay escritura parcial— y además es lo que hace que el
+fichero sea la historia de la máquina y no la del último arranque.
+
+### Sin syscall nueva
+
+La shell lo lee con el `cat` que ya tiene, porque es un fichero de texto en
+el directorio raíz. Un ABI nuevo para leer algo que ya se puede leer sería
+ABI de más, y el ADR 0014 punto 8 avisa de que cada llamada añadida es una
+que habrá que mantener o romper.
+
+### Dos defectos que solo enseñó el registro de verdad
+
+Ninguna prueba los había pedido porque no se me había ocurrido pedirlos.
+
+**`exited 12884901888`.** Había empaquetado el slot y el código de salida en
+un `u64` con un desplazamiento. Compila, va y vuelve sin perder nada, y **no
+significa nada para quien lo lee** — que es la razón entera de que este
+registro sea texto. Dos números, dos columnas: `exited 3 0` es el slot 3 con
+código 0.
+
+**Las primeras líneas de cada arranque decían `0`.** El número de arranque
+sale del disco, así que el disco tiene que montarse primero, así que las
+líneas más tempranas se escriben cuando todavía no se sabe. El anillo está
+vacío al principio de cada arranque, así que **todo lo que hay en él es de
+este arranque**: cuando el número llega, se rellena en las líneas ya
+escritas. No es reescribir la historia, es terminar un campo que aún no se
+sabía.
+
+Los dos están ahora sujetos por una prueba cada uno, con la línea exacta que
+salió mal en el comentario.
+
+### Y un tercero que solo enseñó un número
+
+El registro se escribe dos veces por arranque: una cuando acaba la ronda de
+autotest, y otra en cuanto arranca la shell —porque esa ronda no vuelve
+mientras la shell viva, y sin la segunda escritura la línea que dice que
+arrancó una shell se quedaría en memoria hasta que la máquina parase, que es
+el único momento en que no se puede escribir—.
+
+Pero `write_events` leía el fichero, le añadía **todo** el anillo y lo
+escribía entero. Llamada dos veces, la segunda leía un fichero que ya tenía
+las líneas de este arranque y se las añadía otra vez: **el registro decía que
+todo había pasado dos veces**.
+
+Nada falló. Ninguna prueba lo pidió. Lo delató que diez arranques daban
+16 945 bytes donde una escritura por arranque daba 8 400 — exactamente el
+doble, que es lo único que llamó la atención. Ahora el anillo recuerda qué ha
+entregado y cada escritura se lleva solo lo nuevo; diez arranques son 8 820
+bytes, y hay exactamente un `boot`, un `frames` y un `shell` por arranque.
+
+La lección es la misma que la de los ocho segundos del FSInfo en el
+Incremento 32, y me ha vuelto a pasar: **un cambio correcto es un cambio de
+comportamiento hasta que se mira el número**.
+
+### Y dos que sí encontraron las pruebas, antes de tocar un disco
+
+- **`join` escribía fragmentos de línea.** Con un tope de un byte producía
+  `"d"` — un registro de una letra, al que el siguiente arranque habría
+  añadido. Lo encontró el bucle que comprueba que el resultado son siempre
+  líneas enteras.
+- **Y tiraba una línea entera de más** cuando el corte caía justo en el
+  principio de una. Lo encontró la prueba que pedía exactamente la última
+  línea y recibía nada.
+
+Un registro cortado a mitad de línea miente sobre el primer evento que
+conserva, y el siguiente arranque construye encima de esa mentira. Por eso
+vale la pena que esto esté probado al nivel de la aritmética y no solo al
+final.
+
+### Lo que se ve
+
+Desde fuera (7-Zip) y desde la shell (`cat events.log`), lo mismo:
+
+```
+    3      250 loaded     24168 HELLO.ELF
+    3      251 loaded     34808 SHELL.ELF
+    3      251 started    0
+    3      253 exited     3 0
+    3      253 faulted    4 #PF page fault
+    3      254 wrote      20 RING3.TXT
+    3      256 frames     95
+    3      256 shell      9
+    4      232 disk       129022
+    4      234 wrote      2 BOOTS.TXT
+    4      234 boot       4
+```
+
+### Lo que este ADR deja abierto a sabiendas
+
+**Cualquiera puede sobrescribir el registro desde la shell** con
+`write EVENTS.LOG ...`. Un registro de auditoría en el que el auditado
+escribe no es auditoría. No se arregla aquí porque arreglarlo exige decidir
+de quién es un fichero, que es la pregunta de las capacidades — Fase 6.
+Queda anotado como lo que es: una cosa que la shell puede hacer y no debería.
+
+Y hay una ventana de pérdida entre un evento y la escritura, porque escribir
+en cada evento sería un recorrido de la FAT y dos tablas por cada proceso que
+termina. Este kernel no promete un registro síncrono; promete que **lo
+escrito está completo**.
+
+### Verificación ejecutada
+
+- 390 pruebas de host (376 + 14: el formato de la línea campo por campo, el
+  recorte a líneas enteras con todos los topes de 1 a 40, y qué se lleva una
+  escritura cuando ya hubo otra).
+- `fmt-lint` limpio, arranques en verde con las dos señales, FSInfo cuadrando.
+- **El tope de 32 KB, de extremo a extremo**: 42 arranques seguidos sobre el
+  mismo disco, que es lo que hace falta para cruzarlo de verdad en vez de
+  solo en una prueba unitaria. El fichero se queda en 32 760 bytes, acaba en
+  salto de línea, y sus 1 013 líneas son todas del formato: los arranques 1 a
+  3 se fueron **enteros** por el principio y la primera línea que queda es
+  una línea completa, no un fragmento.
+- Y por fuera: 7-Zip extrae el registro y `cat events.log` desde la shell en
+  ring 3 enseña lo mismo, sin que haya hecho falta una syscall nueva.
+
+### Fase 4 queda cerrada
+
+Los cuatro bullets del ROADMAP:
+
+- driver inicial de almacenamiento virtual — virtio-blk (ADR 0022–0024);
+- VFS y filesystem seleccionado mediante ADR — FAT32 (ADR 0025, 0027);
+- shell de usuario y utilidades básicas — en ring 3 (ADR 0028–0030);
+- registro de eventos del sistema — este.
+
+Y la salida de fase —crear, leer y persistir un archivo entre reinicios— está
+demostrada desde el Incremento 32 y ahora la hace también un programa sin
+privilegios.
 
 ## Incremento 35 — La shell, en ring 3
 
