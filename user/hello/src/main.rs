@@ -28,6 +28,13 @@ const OPEN: u64 = 5;
 const READ: u64 = 6;
 const CLOSE: u64 = 7;
 const WRITE_FILE: u64 = 8;
+const YIELD: u64 = 2;
+const LIST: u64 = 9;
+const CONSOLE_WRITE: u64 = 10;
+const CONSOLE_READ: u64 = 11;
+
+/// How big one directory entry is on the wire (ADR 0029, point 5).
+const ENTRY_BYTES: usize = 20;
 
 /// The errors this program expects to be given, by the numbers ADR 0028
 /// point 13 fixes. Named here so that a probe says what it is checking
@@ -184,6 +191,122 @@ unsafe fn write_file(name: &str, contents: &[u8]) -> i64 {
         );
     }
     result
+}
+
+/// Writes one directory entry into `into`, answering how many bytes it put
+/// there. A 20-byte record (ADR 0029, point 5).
+///
+/// # Safety
+///
+/// As `log`. The kernel checks that `into` is memory this program owns and
+/// may write before filling it.
+unsafe fn list(index: u64, into: &mut [u8]) -> i64 {
+    let result: i64;
+    // SAFETY: as `log`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") LIST => result,
+            in("rdi") index,
+            in("rsi") into.as_mut_ptr(),
+            in("rdx") into.len(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// `list` with the buffer as a raw address, for the probe that hands the
+/// kernel somewhere it must not fill.
+///
+/// # Safety
+///
+/// As `read_raw`: the kernel refuses an address that is not this program's
+/// writable memory, so nothing is written.
+unsafe fn list_raw(index: u64, at: *mut u8, len: usize) -> i64 {
+    let result: i64;
+    // SAFETY: as `log`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") LIST => result,
+            in("rdi") index,
+            in("rsi") at,
+            in("rdx") len,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// Writes text where the person can read it — the framebuffer, not the
+/// kernel's record. `log` is the other channel (ADR 0029, point 7).
+///
+/// # Safety
+///
+/// As `log`.
+unsafe fn console_write(bytes: &[u8]) -> i64 {
+    let result: i64;
+    // SAFETY: as `log`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") CONSOLE_WRITE => result,
+            in("rdi") bytes.as_ptr(),
+            in("rsi") bytes.len(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// Takes one key if one is waiting. Zero means none is, not end
+/// (ADR 0029, point 10). Never waits — waiting would stop the machine.
+///
+/// # Safety
+///
+/// As `log`.
+unsafe fn console_read() -> i64 {
+    let result: i64;
+    // SAFETY: as `log`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") CONSOLE_READ => result,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// Gives the CPU to whoever is next and comes back when this process's turn
+/// comes round again (ADR 0019).
+///
+/// How a program waits for something, since nothing in this ABI blocks: it
+/// asks, yields, and asks again.
+///
+/// # Safety
+///
+/// As `log`.
+unsafe fn yield_now() {
+    // SAFETY: as `log`. Nothing is read back: the call answers nothing.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") YIELD => _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
 }
 
 /// Stops this process. Never returns: the kernel gives the CPU to somebody
@@ -373,6 +496,137 @@ pub unsafe extern "C" fn _start() -> ! {
         close(descriptor);
         say(refused, "refused a buffer inside its own code")
     };
+
+    // ---- the console and the directory (ADR 0029) ----
+
+    // Listing: walk it until the kernel says there is no such index, and
+    // check that a file the disk came with is in there with its real size.
+    all &= unsafe {
+        let mut record = [0u8; ENTRY_BYTES];
+        let mut seen = 0;
+        let mut found_hello = false;
+        let mut index = 0;
+        loop {
+            let got = list(index, &mut record);
+            if got == ERR_NO_SUCH_FILE {
+                break;
+            }
+            if got != ENTRY_BYTES as i64 {
+                seen = -1;
+                break;
+            }
+            seen += 1;
+            // The name is space-padded on the right; compare the start.
+            if record.starts_with(b"HELLO.TXT") {
+                // Bytes 16..20 are the size, little-endian. 27 is what
+                // HELLO.TXT holds, and the directory bit must be clear.
+                let size = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+                found_hello = size == 27 && record[12] & 0x10 == 0;
+            }
+            index += 1;
+            if index > 64 {
+                // A listing that never ends is a listing that is wrong.
+                seen = -1;
+                break;
+            }
+        }
+        say(
+            seen > 1 && found_hello,
+            "listed the directory and found HELLO.TXT with its size",
+        )
+    };
+
+    // A buffer one byte short of a record: refused, rather than given a
+    // name without its size.
+    all &= unsafe {
+        let mut almost = [0u8; ENTRY_BYTES - 1];
+        say(
+            list(0, &mut almost) == ERR_BAD_ARGUMENT,
+            "refused a buffer too small for one entry",
+        )
+    };
+
+    // And a record written into its own code, which is the same check as
+    // for `read` and the same reason.
+    all &= unsafe {
+        say(
+            list_raw(0, _start as *mut u8, ENTRY_BYTES) == ERR_BAD_ARGUMENT,
+            "refused a listing into its own code",
+        )
+    };
+
+    // Writing where the person reads, which is not where `log` goes.
+    all &= unsafe {
+        const SEEN: &[u8] = b"HARLAN: a program in ring 3 wrote this line.\n";
+        say(
+            console_write(SEEN) == SEEN.len() as i64,
+            "wrote to the console the person reads",
+        )
+    };
+
+    // Bytes that are not text: the console draws text, so this is refused
+    // rather than drawn as rubbish.
+    all &= unsafe {
+        say(
+            console_write(&[0xFF, 0xFE, 0xFD]) == ERR_BAD_ARGUMENT,
+            "refused console bytes that are not text",
+        )
+    };
+
+    // Reading a key: on an unattended boot there is none, and the answer
+    // must be zero **and must come back**. A call that waited here would
+    // wait for a keyboard interrupt with the clock stopped, which is the
+    // machine and not this process (ADR 0029, point 11).
+    all &= unsafe {
+        let key = console_read();
+        say(
+            key == 0,
+            "asked for a key, was told there is none, and came back",
+        )
+    };
+
+    // And then a bounded wait for a real one, which is the half an
+    // unattended boot cannot check: that a key pressed on the keyboard
+    // comes back through this call.
+    //
+    // Waiting is `yield` and ask again, because the call does not block
+    // (ADR 0029, point 12) — which is also what makes this a busy wait, so
+    // it is bounded. Finding nothing is **not** a failure: nobody is
+    // typing. What it proves when somebody is typing is driven by hand with
+    // QEMU's monitor, and the line below is what says what arrived.
+    unsafe {
+        // Short on purpose. Each try is a syscall and a yield, so the
+        // window costs real boot time on every boot and every CI run:
+        // 400 000 tries added six seconds. This is about a second, which is
+        // enough for a `sendkey` loop on QEMU's monitor to land in and
+        // cheap enough to leave in.
+        const TRIES: u32 = 60_000;
+        let mut got = 0;
+        let mut tries = 0;
+        while tries < TRIES {
+            let key = console_read();
+            if key != 0 {
+                got = key;
+                break;
+            }
+            yield_now();
+            tries += 1;
+        }
+        if got == 0 {
+            log("HARLAN: ring3-key none arrived; nobody was typing\n");
+        } else if (0x20..=0x7E).contains(&got) {
+            // Echoed where the person reads it, so a screenshot shows the
+            // character that was actually pressed.
+            let typed = [got as u8];
+            console_write(b"HARLAN: ring3-key got the character: ");
+            console_write(&typed);
+            console_write(b"\n");
+            log("HARLAN: ring3-key a real keypress came back as a character\n");
+        } else {
+            console_write(b"HARLAN: ring3-key got a named key\n");
+            log("HARLAN: ring3-key a real keypress came back as a named key\n");
+        }
+    }
 
     // SAFETY: as above.
     unsafe {

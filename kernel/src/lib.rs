@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod console;
 #[cfg(target_arch = "x86_64")]
 pub mod devices;
 pub mod fs;
@@ -527,6 +528,22 @@ extern "C" fn continue_in_kernel_space<C: Console + 'static, P: PowerControl + '
 /// back in the pool, and the shell.
 #[cfg(target_arch = "x86_64")]
 fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelContext<C, P>) -> ! {
+    // The console goes to its module, where a syscall can reach it
+    // (docs/adr/0029-fase4-console-and-list-abi.md). Here and not where the
+    // context was built: the trait object formed below carries a vtable
+    // address, and one formed before the kernel moved to the higher half
+    // would name an image that is no longer mapped — which is the reason
+    // `KernelContext` keeps concrete types.
+    //
+    // From this line on, `context.console` is not read again. The module is
+    // the only way to the console, and the kernel's own shell gets it back
+    // through `console::take`.
+    // SAFETY: the console was leaked onto the heap by `kmain`, so it lives
+    // as long as the kernel; this runs after the move to the higher half,
+    // so the vtable address is mapped; and nothing else uses the console
+    // through another reference from here on.
+    unsafe { console::adopt(&raw mut *context.console) };
+
     use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
 
     // What still runs through the identity map: the kernel's own code and
@@ -1187,7 +1204,28 @@ extern "C" fn into_the_shell<C: Console + 'static, P: PowerControl + 'static>(
     // A syscall runs with interrupts off (`FMASK`), and the shell needs
     // the keyboard.
     harlan_arch_x86_64::Cpu.enable();
-    let console = &mut *context.console;
+    // Taken rather than borrowed for each line: the shell loops for ever,
+    // and holding the lock across that loop would leave interrupts disabled
+    // for ever — the keyboard IRQ would never fire and the shell would
+    // never get a key.
+    //
+    // One owner at a time: from here on a syscall finds no console, which is
+    // right, because this runs only when nothing is runnable and a syscall
+    // can only come from a process that is running.
+    let Some(console) = console::take() else {
+        // `run` adopts it and nothing else takes it, so this cannot happen.
+        // If it ever does, the kernel has no shell, and saying so is better
+        // than carrying on as if it had one.
+        error!("HARLAN: there is no console to run a shell on");
+        loop {
+            use harlan_hal::CpuControl;
+            harlan_arch_x86_64::Cpu.halt_once();
+        }
+    };
+    // SAFETY: `take` handed over the only way to the console, so this is the
+    // only reference to it; it points at heap the kernel leaked, which
+    // outlives this function (which never returns).
+    let console = unsafe { &mut *console };
     banner(console);
     shell::run_shell(console, context.power)
 }
