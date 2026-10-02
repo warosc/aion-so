@@ -1,0 +1,15 @@
+[package]
+name = "harlan-hello"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A user program, not part of the kernel: it is compiled on its own, ends
+# up on the disk, and the kernel knows nothing about it but its name
+# (docs/adr/0026-fase4-elf-user-programs.md).
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[dependencies]

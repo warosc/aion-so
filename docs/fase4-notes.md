@@ -1,0 +1,967 @@
+# Notas de Fase 4 — Almacenamiento y shell
+
+Lo más reciente arriba. Salida de la fase (ROADMAP.md): **crear, leer y
+persistir un archivo entre reinicios** — cumplida en el Incremento 32, con
+diez arranques seguidos sobre el mismo disco contando cuántos van. Desde el
+Incremento 33 eso lo puede hacer también un programa en ring 3, por el ABI
+del ADR 0028.
+
+Decisiones de alcance tomadas al abrir la fase: **virtio-blk** como primer
+driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
+estático** como formato ejecutable —el ADR 0014 dejó el binario plano
+incrustado explícitamente como provisional "hasta que haya filesystem"—.
+
+## Incremento 33 — Un programa que abre, lee y escribe ficheros
+
+`docs/adr/0028-fase4-file-abi-v0.md`. Lo que el kernel hacía por dentro
+pasa a poder hacerlo un programa en ring 3.
+
+### La decisión: la asimetría
+
+**Descriptores para leer, el fichero entero para escribir.** No es una
+simetría rota por descuido, son dos problemas distintos:
+
+- leer a trozos hace falta porque un fichero es más grande que un buffer, y
+  un descriptor es lo mínimo que lo resuelve: recuerda por dónde iba;
+- escribir a trozos significaría asignar un cluster en medio de una cadena
+  con el directorio diciendo todavía el tamaño viejo, que es exactamente lo
+  que el ADR 0027 punto 2 se negó a prometer. Un `write` con posición sería
+  un ABI prometiendo lo que el escritor de debajo no cumple.
+
+El coste se asume y se nombra: cambiar tres bytes de un fichero obliga a
+leerlo entero, cambiarlos y escribirlo entero. Para una shell y sus
+ficheros de configuración basta; para un editor no, y ese es el día en que
+el ADR sube de versión.
+
+### Qué hace
+
+- **Cuatro llamadas**, tras las cinco que había: `open` (5), `read` (6),
+  `close` (7), `write_file` (8). Y seis errores nuevos, del `-7` al `-12`,
+  siguiendo la numeración en vez de inventar un esquema.
+- **Un descriptor es un entero pequeño**, índice en una tabla fija de
+  cuatro dentro de `Process`. Opaco, por proceso, no transferible, cerrado
+  por `exit`. Un programa no puede inventarse uno válido ni nombrar el de
+  otro: fuera de esa tabla los números no significan nada.
+- **Se reparten desde el hueco más bajo**, no desde el siguiente número, así
+  que abrir y cerrar en bucle no se queda sin descriptores.
+- **Fuera de rango, nunca abierto y cerrado son la misma respuesta.** Un
+  programa que adivina no aprende nada de la diferencia porque no hay
+  diferencia.
+- **`kill` cierra la tabla**, no `exit`: un proceso que falló también ha
+  terminado, y un descriptor que dejara abierto mantendría ese fichero
+  imposible de escribir para siempre.
+- **El disco deja de ser una variable local del arranque.** `kernel/src/fs.rs`
+  lo sujeta tras un `IrqLock` con su lector y su sector de arranque. El
+  volumen **no** se guarda: se reconstruye en cada operación, así que no hay
+  cadena en caché, ni cuenta de clusters libres, ni estado de ficheros
+  abiertos que pueda quedar en desacuerdo con el disco.
+- Y una vez alcanzable, el arranque deja de tener un segundo camino: las
+  cuatro funciones que montaban su propio volumen pasan por `fs`. Un camino
+  al disco en vez de cinco, y el arranque ejercita el mismo que un `open`.
+
+### `write_file` se niega si alguien tiene ese nombre abierto
+
+Un descriptor guarda la cadena con la que se abrió, y sobrescribir
+reutiliza esa cadena (ADR 0027, punto 9): quien estuviera leyendo pasaría a
+ver los bytes nuevos entre los viejos. Recorrer cuatro descriptores por
+proceso son 64 comparaciones de nombre, nada al lado de los sectores que
+una escritura va a escribir. Elimina la clase entera de problema en vez de
+documentarla, y vive en `fs::write_file`, así que vale también para las
+escrituras del propio kernel —al arrancar no hay nada abierto y responde
+que no—.
+
+### La memoria de un proceso pasa a decir cuál puede escribir
+
+Esto no estaba previsto y es el hallazgo del incremento.
+
+`read` **rellena** un buffer, así que que sea suyo no basta. Un programa que
+entregue la dirección de su propio código haría que el kernel escribiera
+una página de solo lectura, y con `CR0.WP` puesto eso es un fallo de página
+**en anillo 0**: un argumento malo convertido en pánico del kernel.
+
+`Building::own` registra ahora si el rango es escribible junto con el rango,
+en una sola llamada para que los dos arrays no puedan separarse, y
+`Running::owns_writable` es lo que `read` pregunta.
+
+Quitar esa comprobación **no rompe ninguna prueba de host**. Rompe el
+arranque:
+
+```
+[ERROR]: HARLAN: #PF accessing 0x4021e0, error_code=0x3, rip=0xffff818000045730
+boot-test: marker "HARLAN-PHASE1-SHELL-READY" NOT observed within 30s
+```
+
+`rip` en espacio de kernel y `error_code=0x3` —escritura a una página
+presente de solo lectura—. Por eso el programa de ring 3 la prueba: es la
+única forma de que esa línea tenga una prueba que la defienda.
+
+### El programa de ring 3 prueba siete cosas
+
+Tres que puede hacer y cuatro que no:
+
+```
+HARLAN: ring3-file OK: read a file off the disk in eight-byte pieces
+HARLAN: ring3-file OK: wrote a file from ring 3
+HARLAN: ring3-file OK: read back what it had written
+HARLAN: ring3-file OK: refused a descriptor it never opened
+HARLAN: ring3-file OK: refused a file that is not there
+HARLAN: ring3-file OK: refused a name with a slash in it
+HARLAN: ring3-file OK: refused a buffer inside its own code
+HARLAN: ring3-file ALL OK
+```
+
+Lee en trozos de **ocho** bytes un fichero de 27: si el descriptor no
+recordara la posición, leería los mismos ocho para siempre. La barra es la
+única forma en que este ABI podría salir del directorio raíz, y se rechaza
+antes de llegar al volumen.
+
+### Dos cosas que solo se vieron midiendo
+
+- **El programa compilaba a 757 KB**, de los cuales 750 KB eran DWARF y
+  2 937 bytes eran código. El kernel lee el fichero entero en un buffer fijo
+  antes de analizarlo, así que lo rechazó por grande y arrancó sin programa
+  de usuario —correctamente, y en silencio desde el punto de vista de la
+  prueba de arranque—. `-C strip=debuginfo` lo deja en 16 KB. El cargador
+  usa los segmentos `PT_LOAD`; la información de depuración son 750 KB de
+  algo que nada en esta máquina lee.
+- **`boot-test` aceptaba un arranque que llegara a la shell.** La shell sube
+  pase lo que pase con los ficheros: las siete comprobaciones podían fallar
+  todas y el arranque seguía verde. Ahora exige `ring3-file ALL OK` y falla
+  con `ring3-file FAILED`, nombrando cuál falló. Hacen falta las dos
+  mitades, porque la ausencia de FAILED no es evidencia —un programa que
+  muere antes de su última comprobación no imprime veredicto ninguno—.
+
+  Comprobado rompiendo a propósito uno de los números de error que el
+  programa espera: el arranque llegó a la shell y `boot-test` falló de todas
+  formas, diciendo cuál.
+
+### Verificación ejecutada
+
+- 358 pruebas de host (341 + 17: la tabla de descriptores, los números que
+  un programa ve, y `read_at` desde cualquier offset).
+- `fmt-lint` limpio. `boot-test --repeat 10` 10/10 **sobre el mismo disco**,
+  con las siete comprobaciones en verde en cada uno, el contador de
+  arranques llegando a 10 y 93 marcos devueltos cada vez.
+- Mutación: 13 sobre el ABI, 13 detectadas. Doce por pruebas de host; la de
+  `owns_writable` solo por el arranque, que queda anotado en vez de
+  implícito. Una superviviente real salió al principio —recortar un
+  descriptor fuera de rango al último de la tabla— y era un hueco de mi
+  prueba: solo preguntaba con la tabla **vacía**, donde recortar también da
+  `None`. Con la tabla llena, muere.
+- Y 11 mutaciones sobre la aritmética de `read_at`, 11 detectadas, de las
+  cuales una necesitó una **cadena fragmentada** para morir: con cadenas
+  contiguas, leer más allá de un cluster sin seguir la cadena cae en el
+  cluster físico siguiente, que es justo el que se quería.
+- Por fuera: 7-Zip extrae los seis ficheros sin queja, `RING3.TXT` entre
+  ellos con `written from ring 3` exacto, y FSInfo cuadra con las dos tablas
+  medido en los bytes de la imagen.
+
+### Lo que hay que saber para el siguiente incremento
+
+- **Una llamada de fichero es larga.** El manejador corre con las
+  interrupciones desactivadas (ADR 0014, punto 2) y una lectura gira sobre
+  la virtqueue, así que `read` retrasa el reloj de forma medible. Se acepta
+  en Fase 4; E/S que bloquea y devuelve el control al scheduler es trabajo
+  de Fase 5, y ésta es la deuda que lo justifica.
+- **No hay `list`.** El directorio raíz se lista desde el kernel
+  (`fs::each_name`), no desde ring 3. La shell lo necesitará, y es una
+  llamada con sus propios casos raros —cuántas entradas caben en un buffer,
+  qué pasa si el directorio cambia a mitad del recorrido—.
+- **El descriptor es lo que será una capacidad en Fase 6.** Lo que se diseñó
+  ahora es la parte que no cambia: opaco, por proceso, revocable
+  cerrándolo. Hacerlo transferible es exactamente lo que lo convierte en
+  capacidad, y por eso el ADR dice explícitamente que en v0 no lo es.
+
+## Revisión de Fase 4 — once hallazgos, todos arreglados
+
+Codex deja de revisar, así que esta pasada la hice yo sobre mi propio
+trabajo. Es peor que una revisión cruzada por construcción: los puntos
+ciegos que tenía al escribir el código son los mismos que tengo al leerlo.
+Lo que compensa en parte es el método —una prueba por afirmación, escrita
+**antes** de tocar nada— porque una prueba no comparte mis suposiciones:
+si pasa, el hallazgo era falso, y si falla, era real. Dos de los once los
+encontré así y no leyéndolos.
+
+Y una advertencia sobre la propia revisión: **una de sus afirmaciones era
+falsa**. Decía que `fsck.vfat` fallaba en CI. Fui al log: pasaba
+(`5 files, 20/129022 clusters`). El defecto de debajo —el FSInfo
+desactualizado— era real y se medía en los bytes de la imagen (129002
+frente a 129001), pero la consecuencia que le atribuía no. Una revisión
+que exagera el síntoma es una revisión en la que hay que comprobar cada
+cosa antes de arreglarla, que es lo que se hizo.
+
+### Los once
+
+En `hal/src/fat.rs`, siete:
+
+1. **Un nombre podía llevar un NUL.** Se comprobaba la longitud y que
+   fuera ASCII, nada más. Un NUL como primer byte de una entrada es lo que
+   marca **el final del directorio**: un fichero llamado `"\0BAD.TXT"`
+   habría cortado el raíz en seco y se habría llevado todos los ficheros
+   posteriores. Ahora `allowed_in_a_name` rechaza NUL, los códigos de
+   control, `0x7F`, los caracteres que FAT reserva, y un `0xE5` inicial.
+2. **Un volumen podía declarar más clusters que entradas tiene su tabla.**
+   Recorrerlo lee más allá del final de la tabla, y escribirlo escribe en
+   la región de datos, que es el fichero de alguien. `FatTooSmall`, en el
+   punto donde los dos números se encuentran por primera vez.
+3. **`directory_slot` comparaba el nombre byte a byte y `find` sin
+   mayúsculas.** Un volumen escrito por otra herramienta con un nombre
+   corto en minúsculas recibía una **segunda** entrada en vez de que se
+   reemplazara la primera. Los dos comparan igual ahora.
+4. **Un directorio se podía sobrescribir como fichero**, dejando huérfano
+   todo lo que tuviera dentro: `IsADirectory`.
+5. **El recorrido que busca hueco en el directorio no tenía tope.** Una
+   cadena de raíz que se apunta a sí misma colgaba el kernel. Acotado por
+   el número de clusters, como todos los demás recorridos.
+6. **`free_chain` liberaba clusters que ya estaban libres.** Tras una
+   sobrescritura interrumpida —el estado que el orden del ADR 0027
+   *permite*— eso podía liberar el primer cluster del fichero **nuevo**,
+   porque a esas alturas ya se había entregado. Ahora recibe los clusters
+   que hay que conservar y se para en una entrada libre.
+7. **El FSInfo quedaba diciendo lo que era verdad antes de escribir.** Se
+   reescribe al final, **contado de las tablas** en vez de llevado en un
+   contador: un total acumulado es estado que puede acabar en desacuerdo
+   con el disco.
+
+En `hal/src/elf.rs`, dos agujeros de aritmética:
+
+8. **`e_phoff + count * entry_size` sin guardia.** Una cabecera con un
+   desplazamiento cerca de `u64::MAX` da la vuelta, cae otra vez dentro del
+   fichero, y el analizador recorre cabeceras que se ha inventado.
+   `saturating_add` hace que la comparación con el tamaño del fichero sea
+   la que decide.
+9. **Un segmento con `p_memsz == 0` se aceptaba.** El cargador resta uno
+   del final de un segmento para encontrar su última página, así que un
+   segmento vacío en la dirección cero es una resta por debajo de cero —y
+   este kernel se compila con comprobación de desbordamiento, o sea un
+   pánico al arrancar, provocado por un fichero que vino del disco.
+   `SegmentOfNothing` lo rechaza al analizar, donde todavía hay un error
+   que devolver.
+
+Y dos más:
+
+10. **`spawn_elf` perdía marcos.** Un fichero cuyo tercer segmento está mal
+    dejaba asignados e inalcanzables los marcos de los dos primeros: el
+    ayudante `Building` conocía los rangos pero no los marcos ya tomados
+    para ellos. Ahora la carga es una función y `Building::give_back`
+    devuelve lo que tomó por cualquier salida de error. Un programa que no
+    carga no cuesta nada, que es lo que permite seguir arrancando después
+    de rechazar uno.
+11. **`fsck.vfat` comprobaba la imagen equivocada en CI.** Corría al final
+    del trabajo de arranque, **después** de la prueba de estrés de heap,
+    que rehace y reformatea el disco. Estaba comprobando una imagen recién
+    formateada en la que ningún kernel había escrito: habría pasado por
+    mal que los diez arranques hubieran dejado el disco. Corre justo
+    después de los diez arranques, sobre la imagen que ellos escribieron.
+
+### Dos de mis propias pruebas afirmaban cosas falsas
+
+Al escribir las pruebas de verificación me equivoqué dos veces, y conviene
+anotarlo porque es el mismo error de siempre: la prueba y el código
+comparten mi malentendido.
+
+- La primera entrada del directorio raíz es **la etiqueta del volumen**, no
+  un fichero. Una prueba que daba por hecho lo contrario pasaba por la
+  razón equivocada.
+- `write_file` **reserva antes de liberar**, así que un fichero reemplazado
+  no cae en el cluster del que ocupaba. Mi prueba daba por hecho que sí.
+- Y una tercera dejaba un hueco libre en el primer cluster del raíz, así
+  que la cadena que pretendía hacer bucle no se seguía nunca.
+
+Es exactamente el patrón de `EMPTY.BIN` del Incremento 29, donde
+formateador y prueba compartían el mismo malentendido y hizo falta 7-Zip
+para romperlo. La conclusión no cambia: **una prueba propia que confirma lo
+que esperaba no es evidencia**; la evidencia es una implementación de fuera.
+
+### El arreglo del FSInfo costó ocho segundos de arranque
+
+Vale la pena contarlo porque lo encontró la medición y no la lectura. Con
+los once arreglos puestos, `boot-test --repeat 10` pasó 10/10 —y tardando
+13,3–13,5 s por arranque, donde el mismo kernel antes tardaba 5,2–5,5 s—.
+
+La causa era mía y estaba en el arreglo nº 7. `update_fs_info` recorría la
+tabla **entrada por entrada** llamando a `next_cluster`, y `next_cluster`
+lee un sector entero de 512 bytes para mirar cuatro de ellos. Para un
+volumen de 129 022 clusters son 129 022 viajes al disco para leer los
+mismos mil sectores una y otra vez.
+
+Leyendo cada sector de la tabla una vez y mirando sus 128 entradas, el
+arranque vuelve a 4,9–5,3 s y la respuesta es el mismo número: 129 001
+libres, el primero el 23, medido en los bytes de la imagen.
+
+Convertir una posición dentro de un sector en un número de cluster es justo
+la aritmética que se equivoca en uno y sigue pareciendo razonable, así que
+la sujetan dos pruebas: una contra la misma cuenta hecha con
+`next_cluster`, que lee una sola entrada y no tiene dónde equivocarse, y
+otra de que no se cuentan ni las dos entradas reservadas ni el relleno
+posterior al último cluster. Las dos detectan un desplazamiento
+deliberado de uno y la eliminación del límite.
+
+La lección es la de siempre y no la había aplicado aquí: **un arreglo de
+corrección es un cambio de rendimiento hasta que se mide**. Los diez
+arranques estaban en verde; sin mirar el tiempo, esto se habría ido con
+ellos.
+
+### Verificación ejecutada
+
+- 341 pruebas de host, `fmt-lint` limpio.
+- Ronda de mutación sobre la escritura: 17 mutaciones, 6 supervivientes en
+  la primera pasada. Las seis eran pruebas mías flojas, no código malo —la
+  escritura feliz estaba cubierta y los casos cuidadosos no—. Una
+  (la comprobación de límites de `set_next_cluster`) era **inalcanzable
+  desde dentro del módulo**, porque todas las llamadas internas acotan el
+  cluster antes. Se resolvió haciendo pública la operación, no borrando la
+  guardia: la guardia está para quien llama. 17/17 tras cerrar los huecos.
+- La imagen después de los arranques, por fuera: 7-Zip extrae los cinco
+  ficheros sin queja, y FSInfo cuadra con la tabla medido en los bytes
+  (`libres=129001 siguiente=23` en los dos sitios).
+
+### Lo que sigue
+
+El ADR 0028 fija el ABI de ficheros para que un programa en ring 3 pueda
+hacer lo que hasta ahora solo hace el kernel: **descriptores para leer, el
+fichero entero para escribir**. Es lo que necesita la shell de esta fase, y
+el descriptor se diseña desde ahora como lo que será una capacidad en
+Fase 6.
+
+## Incremento 32 — Escribir, y que lo escrito siga ahí
+
+`docs/adr/0027-fase4-fat32-write.md`. **La salida de Fase 4**: *crear, leer
+y persistir un archivo entre reinicios.*
+
+Leer mal da una respuesta equivocada y se nota al momento. Escribir mal
+deja un disco roto que se descubre después, y con él se pierde lo que
+hubiera dentro.
+
+### Qué hace
+
+- **Crear, extender y sobrescribir un fichero en el directorio raíz.** Ni
+  borrar, ni truncar, ni subdirectorios: lo que la salida de fase necesita.
+- **El orden, que es la decisión entera**: primero los datos, después la
+  cadena, y el directorio **al final, en una sola escritura de un sector**.
+  Cada paso deja el volumen en un estado que otro lector entiende. Escribir
+  en clusters que ninguna cadena nombra no cambia nada; escribir la cadena
+  deja, en el peor caso, clusters ocupados que no son de nadie —una cadena
+  perdida, que `fsck` sabe nombrar—; y la entrada del directorio es lo que
+  hace aparecer el fichero. Al revés, un corte deja un directorio que
+  apunta a clusters que todavía no son suyos: un disco que miente.
+- **Las dos tablas se escriben las dos.** Un volumen cuyas tablas no
+  coinciden es el que todo lo demás llama dañado.
+- **Si no hay clusters libres suficientes, no se escribe nada.** Se reserva
+  antes de tocar un byte: un fichero a medias porque el disco se llenó es
+  peor que un fichero que no está.
+- **Lo que un fichero no llena se pone a cero**, no se deja como estaba.
+  Devolver lo que era de otro es como un disco filtra.
+- **Los clusters del fichero viejo se liberan después** de que el
+  directorio diga el tamaño nuevo, por la misma razón que el orden de
+  arriba.
+- **La imagen deja de reescribirse en cada arranque.** Pasa a ser una
+  salida de `build`: si se rehiciera antes de cada arranque, borraría justo
+  lo que hay que demostrar.
+
+### Verificación ejecutada: la salida de fase
+
+Diez arranques seguidos sobre **el mismo disco**:
+
+```
+this is boot 10; BOOTS.TXT said 9 and now says 10, in 2 byte(s) from cluster 22
+```
+
+El fichero lo creó el primer arranque y lo leyó el segundo, con nada entre
+ellos salvo el disco. El número solo crece porque lo escrito sobrevivió.
+
+- **7-Zip, sobre la imagen después de que el kernel escribiera en ella**:
+  cinco ficheros, `Everything is Ok`, y `BOOTS.TXT` contiene el número que
+  el registro dice. Es la regla del ADR 0025 punto 5 aplicada al escritor:
+  lo que este kernel escribe lo lee otro.
+- **`fsck.vfat` en CI pasa a comprobar dos imágenes**: la que `xtask`
+  dispone, y —en el trabajo de arranque, después de once arranques— la que
+  el kernel ha estado escribiendo. Ahí es donde un escritor se gana el
+  sueldo.
+- Host: 330 pruebas (318 + 12), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 17, las 17 detectadas — **después de arreglar seis pruebas**.
+
+### Seis mutaciones que sobrevivieron, y lo que decían
+
+La primera vuelta detectó 11 de 17. Los seis supervivientes no eran código
+malo: eran pruebas mías que solo recorrían el camino feliz.
+
+1. **Un nombre en minúsculas se guardaba tal cual**: ninguna prueba
+   escribía uno.
+2. **Los cuatro bits reservados de una entrada se machacaban**: ninguna
+   prueba los tenía puestos.
+3. **Una entrada fuera del volumen se escribía igual.** Esta era distinta:
+   la comprobación era **inalcanzable** desde dentro del módulo, porque
+   todos los llamantes acotan su cluster antes. En vez de quitarla, la
+   operación pasó a ser pública: así la guarda está donde se puede confiar
+   en ella y donde una prueba la alcanza.
+4. **Un fichero a medias cuando el disco se llena**: ninguna prueba llenaba
+   el disco. Ahora una marca todas las entradas de las dos tablas a mano y
+   comprueba que el directorio no se toca.
+5. **Lo que un fichero no llena se quedaba como estaba**: hay que poner
+   basura en un cluster libre y comprobar que desaparece.
+6. **Una entrada reescrita conservaba campos de la vieja**: las fechas, que
+   este kernel no usa, seguían diciendo algo de un fichero que ya no
+   estaba.
+
+Dos de esas pruebas las escribí mal a la primera, y el fallo enseñó cosas
+del código: la primera entrada del raíz es la **etiqueta del volumen**, no
+un fichero; y escribir **reserva antes de liberar**, así que un fichero
+reescrito no cae en el cluster del que sustituye.
+
+### Riesgos y límites
+
+- **Sin journal y sin barreras.** Un corte entre dos sectores deja lo que
+  el orden permite y nada peor: en el peor caso, clusters ocupados que no
+  son de nadie. Este kernel no promete atomicidad; promete que el peor caso
+  es recuperable.
+- **Primer hueco, buscando desde el principio de la tabla**, sin mapa de
+  bits. Es lento y no tiene estado que mantener de acuerdo con el disco.
+- **Solo el directorio raíz, solo 8.3, y el fichero entero de una vez.**
+  Escribir a trozos exige saber dónde se quedó, y eso es un descriptor de
+  fichero.
+- **El kernel puede ahora dejar un disco peor de lo que lo encontró.** Es
+  la primera vez, y es la razón de que el orden sea una decisión y no un
+  detalle.
+
+## Incremento 31 — Los programas de usuario pasan a ser programas
+
+`docs/adr/0026-fase4-elf-user-programs.md`. El ADR 0014 eligió un binario
+plano incrustado como primer programa de usuario y dijo cuándo se
+revisaría: *"El formato de verdad se decide cuando haya filesystem (Fase
+4)."* Ya lo hay.
+
+Los programas incrustados habían llegado a su límite: ocho, escritos a mano
+en hexadecimal dentro de `kernel/src/user.rs`, con los desplazamientos
+calculados a mano y fijados por pruebas que comprueban byte a byte que el
+comentario dice la verdad. Eso fue lo correcto para demostrar un salto a
+ring 3; no es forma de escribir una shell.
+
+### Qué hace
+
+- **Un crate de usuario de verdad**, `user/hello`, compilado para
+  `x86_64-unknown-none`. No es parte del kernel y no se enlaza con él: se
+  compila aparte, acaba en el disco, y el kernel no sabe de él más que su
+  nombre.
+- **ELF64 estático.** El toolchain produce un PIE por defecto, que
+  necesitaría reubicarse al cargar; se le pide explícitamente
+  `relocation-model=static`, `-no-pie` y una base de imagen, y entonces
+  sale un `ET_EXEC` con su entrada donde el kernel la espera.
+- **Los permisos salen de los segmentos**, no de una convención. Lo que el
+  arranque enseña —`r--` para los datos de solo lectura y `r-x` para el
+  código— lo dice el fichero, y un segmento que pidiera escritura **y**
+  ejecución se rechaza: el ADR 0008 vale también para un programa de
+  usuario.
+- **El fichero se valida entero antes de mapear nada**: la cabecera, la
+  tabla de cabeceras de programa, y de cada segmento que quepa en el
+  fichero, que no encoja, que no cruce a la mitad alta y que no pida W y X
+  a la vez. Un ELF es un fichero del disco, o sea dato de fuera.
+- **`p_memsz` mayor que `p_filesz` se pone a cero**: es el `.bss`, y como
+  los marcos llegan a cero del asignador, basta con no escribir encima.
+- **Un `Process` deja de tener dos rangos fijos** —código y pila— y pasa a
+  tener uno por segmento más la pila, con los marcos que haya tomado
+  anotados con su propósito. Las dos formas de arrancar un proceso
+  comparten esa contabilidad.
+- **Los programas escritos a mano siguen ahí**, los que se portan mal a
+  propósito (ADR 0020): un compilador no produce un programa que escribe
+  en su propio código.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+    HELLO.ELF — 6360 byte(s), from cluster 3
+  HELLO.ELF is 6360 byte(s), read off the disk
+  it is an ELF with 2 loadable segment(s), entry 0x401240, reaching 0x401285
+    segment at 0x400000, 492 byte(s) of file and 492 of memory, r--
+    segment at 0x4011f0, 149 byte(s) of file and 149 of memory, r-x
+  a process from an ELF: space at 0x5d9000, 2 segment(s), entry 0x401240,
+  a stack at 0x500000
+  process 8 runs in slot 8
+  from ring 3: HARLAN: hello from a program that came off the disk
+  from ring 3: HARLAN: compiled by the toolchain, loaded as ELF
+  the process in slot 8 exited with 0
+  ```
+
+- **La contabilidad sigue cuadrando** con nueve procesos:
+  `91 frame(s) back from the processes that ended; the allocator has the
+  62740 it started with`.
+- **Pruebas negativas**, rompiendo los bytes del ELF en `xtask` *después*
+  de que el toolchain haya producido uno bueno —así se prueba el cargador
+  y no el compilador—:
+  - poniéndole el bit de escritura al segmento ejecutable:
+    `SegmentWritableAndExecutable { at: 4198896 }`, que es `0x4011f0`;
+  - moviendo un segmento a la mitad alta: `SegmentOutsideUserSpace`;
+  - rompiendo el número mágico: `NotElf`.
+  Las tres llegan al shell y los otros ocho procesos siguen su camino.
+- Host: 318 pruebas (309 + 9), `fmt-lint` limpio —con el crate nuevo
+  añadido a clippy, en su propio target—.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 23, las 23 detectadas. Dos sobrevivieron primero y eran huecos
+  reales: ninguna prueba tenía una tabla de cabeceras fuera del fichero, y
+  ninguna tenía un fichero **sin** segmentos cargables —sin esa, quitar la
+  comprobación daba otro error y parecía bien—.
+
+### Riesgos y límites
+
+- **Estático y nada más**: sin enlazado dinámico, sin intérprete, sin
+  reubicaciones.
+- **Dos segmentos en una misma página se rechazan** con nombre, en vez de
+  adivinar qué permisos debería tener. El enlazador separa los segmentos
+  por páginas, así que no ocurre; si ocurriera, el kernel lo diría.
+- El programa se lee entero a un buffer del heap antes de analizarlo. Un
+  programa grande querrá leerse por segmentos, que es la misma cadena
+  recorrida desde un punto.
+- `p_vaddr` decide dónde va un segmento, así que el mapa de un proceso ya
+  no lo fija el kernel. La pila sí.
+
+## Incremento 30 — Un fichero, leído por su nombre
+
+`docs/adr/0025-fase4-fat32-read-only.md`, que ya estaba decidido. Esto es
+el resto del camino: de la tabla de asignación y el directorio raíz a los
+bytes de un fichero.
+
+### Qué hace
+
+- **La tabla**, con las cuatro cosas que una entrada puede decir: libre,
+  reservada, sigue en otro cluster, medio defectuoso, o fin de cadena.
+  Solo los 28 bits bajos son el número de cluster —los cuatro altos están
+  reservados y hay que enmascararlos—, y **todo lo que va de `0x0FFFFFF8`
+  arriba termina una cadena**, no solo el valor que escribe un formateador;
+  un lector que comparase por igualdad se saldría del disco al leer uno
+  escrito por otra herramienta.
+- **El directorio**, con lo que no es un fichero: la entrada que termina el
+  directorio, las borradas, los fragmentos de nombre largo y la etiqueta
+  del volumen. El nombre 8.3 recupera su punto, que la entrada no guarda, y
+  se compara sin distinguir mayúsculas porque nadie los escribe como se
+  almacenan.
+- **`Volume` sobre un rasgo `Sectors`**: un disco en el kernel, una imagen
+  en una prueba. El lector no sabe que habla con virtio y el disco no sabe
+  que guarda un sistema de ficheros.
+- **Un fichero se lee hasta donde dice su longitud**, no hasta donde acaba
+  su último cluster: lo que hay después del final de un fichero dentro de
+  su cluster es lo que hubiera antes.
+- **Una cadena rota es un error con nombre**, no un fichero corto: si la
+  cadena acaba antes que el fichero, el directorio y la tabla no están de
+  acuerdo y eso se dice. Y una cadena más larga que el volumen se
+  abandona, porque se apunta a sí misma.
+
+### La prueba que vale
+
+`xtask` escribe la imagen y `hal` la lee; ninguna de las dos cosas sirve
+sin la otra, así que la prueba de que se entienden vive donde están las
+dos. `xtask` pasa a depender de `harlan-hal` **solo en `dev-dependencies`**
+y monta en memoria la imagen que acaba de formatear.
+
+El camino entero —sector de arranque, directorio raíz, tabla, bytes— se
+recorre así en una prueba de host, contra los mismos bytes que recibe
+QEMU. Lo que antes solo podía fallar en un arranque ahora falla en medio
+segundo.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+    HELLO.TXT — 27 byte(s), from cluster 3
+    LONG.BIN — 2049 byte(s), from cluster 4
+    EMPTY.BIN — 0 byte(s), from cluster 0
+  3 thing(s) in the root directory
+  HELLO.TXT is 27 byte(s) and reads "HARLAN reads its own disk.", which is
+  what is in it
+  LONG.BIN is 2049 byte(s) across 5 cluster(s), every one of them what it
+  should be
+  ```
+
+  Tres cosas en el directorio y no cuatro: la etiqueta del volumen no es un
+  fichero. `LONG.BIN` son cuatro clusters y un byte, así que un lector que
+  parase en el límite de un cluster, o que leyera hasta el final del
+  último, no daría esos 2049 bytes correctos.
+- **Prueba negativa**: liberando el segundo cluster de la cadena de
+  `LONG.BIN` en la imagen, el kernel dice
+  `could not be read (BrokenChain { cluster: 5, entry: Free })` —y sigue
+  hasta el shell—. Mira lo que dice cada entrada en vez de limitarse a
+  seguirla.
+- Host: 309 pruebas (299 + 10), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 19, las 19 detectadas. Dos sobrevivieron primero:
+  - **Que una cadena rota se leyera como un fichero completo.** Ninguna
+    prueba de host rompía una cadena; solo lo hacía la sonda de arranque.
+    Añadida una que corrompe la imagen y comprueba el error exacto.
+  - **Quitar el atajo del fichero vacío no cambiaba nada**, porque el bucle
+    ya no se ejecuta cuando la longitud es cero. Era una rama que ninguna
+    prueba podía tomar, así que se ha ido y su razón está donde está el
+    bucle.
+
+### Riesgos y límites
+
+- **Solo el directorio raíz**: no se baja a subdirectorios. La estructura
+  es la misma —un directorio es una cadena como cualquier fichero— y lo que
+  falta es el camino, no el mecanismo.
+- **Sin nombres largos**, 8.3 y nada más.
+- **Solo lectura**: nada escribe en el disco.
+- Un fichero se lee entero en un buffer que el llamante da. Para un fichero
+  grande hará falta leerlo a trozos, que es la misma cadena recorrida desde
+  un punto.
+
+## Incremento 29 — El disco con un sistema de ficheros de verdad
+
+`docs/adr/0025-fase4-fat32-read-only.md`. El kernel lee sectores; un sector
+no es un fichero. Este incremento decide el formato y, sobre todo, **contra
+qué se comprueba que lo leemos bien**.
+
+Esa segunda pregunta es la importante. Un analizador escrito y probado por
+la misma persona que escribió la imagen que lee pasa todas sus pruebas
+aunque los dos compartan el mismo malentendido. Eso no es verificación, es
+un eco.
+
+### Qué hace
+
+- **FAT32, empezando por solo lectura**, sin particiones y con nombres 8.3
+  —las entradas de nombre largo son un añadido que se puede ignorar para
+  leer un disco entero—.
+- **La imagen la construye `xtask`**, no el sintetizador `fat:` de QEMU,
+  que al pedirle FAT32 avisa: *"FAT32 has not been tested"*.
+- **Y la comprueban otros**: `fsck.vfat` en CI, y 7-Zip en local. Son
+  implementaciones escritas por otra gente que saben qué es una imagen
+  FAT32 válida.
+- **El BPB se valida, no se cree.** Es dato que viene de fuera del kernel y
+  cada número se usa para calcular una dirección: tamaño de sector,
+  sectores por cluster —cero divide por cero—, número y tamaño de las
+  tablas, cluster raíz, y que las tablas quepan en el volumen. La
+  aritmética que podría desbordar se hace en 64 bits.
+- **El disco crece a 64 MiB.** No es gusto: FAT32 exige más de 65 525
+  clusters y por debajo la especificación dice que el volumen es FAT16
+  diga lo que diga su BPB. Un disco pequeño con un BPB que dice FAT32 es
+  exactamente la imagen que un lector descuidado acepta y `fsck` rechaza.
+- **Los marcadores en crudo del Incremento 28 desaparecen**: el sector 0 es
+  ahora el BPB. Lo que demostraban —que el número de sector llega al
+  dispositivo— lo demuestra la copia de seguridad que FAT32 guarda en el
+  sector 6, y de paso comprueba que la imagen la tiene donde debe.
+
+### Dos fallos que encontraron las pruebas, y uno que encontró otro
+
+1. **El tamaño de la tabla oscilaba.** El número de clusters depende del
+   tamaño de la tabla y el tamaño de la tabla depende del número de
+   clusters. Perseguir eso como punto fijo **no converge**: alterna entre
+   dos tamaños, cada uno una entrada corto de lo que el otro implica, y se
+   queda en el que toque cuando se acaba el bucle. Lo destapó una prueba
+   escrita antes del código —"la tabla tiene que caber para los clusters
+   que describe"— y se arregló preguntándolo como un sí o un no: una tabla
+   de `n` sectores sirve o no sirve, y como crecer solo lo hace más fácil,
+   el menor que sirve se busca partiendo el rango por la mitad.
+2. **La prueba de clusters grandes estaba mal, no el código.** Con ocho
+   sectores por cluster el volumen de 64 MiB ya no llega al mínimo de
+   FAT32, y el analizador lo rechazó. Tenía razón.
+3. **Y el que importa: 7-Zip se negó a leer `EMPTY.BIN`.** Mi formateador
+   le daba un cluster a un fichero vacío. La especificación dice que un
+   fichero de longitud cero tiene primer cluster **0**: un cluster
+   asignado que no pertenece a nadie es lo que un comprobador llama cadena
+   perdida. Y mi propia prueba afirmaba lo contrario —"y un cluster de
+   todas formas"— porque el formateador y la prueba tenían el mismo
+   malentendido escrito dentro. Eso es exactamente lo que el punto 5 del
+   ADR 0025 existe para atrapar, y lo atrapó a la primera.
+
+### Verificación ejecutada
+
+- **7-Zip**, en local, sobre la imagen: `Type = FAT`, `File System = FAT32`,
+  `Label = HARLAN`, `Cluster Size = 512`, los tres ficheros con sus
+  tamaños (27, 2049, 0) y, al extraerlos, `Everything is Ok` y el contenido
+  correcto byte a byte.
+- **`fsck.vfat -n -V`** en CI, en su propio trabajo, sobre la imagen que
+  `cargo xtask build` produce.
+- QEMU, que es lo que demuestra que el kernel lo lee:
+
+  ```
+  the disk holds FAT32: 131072 sector(s) of 512 byte(s), 129022 cluster(s)
+  of 1 sector(s), 2 table(s) of 1009 sector(s) from sector 32, root at
+  cluster 2 (sector Some(2050)), data from sector 2050
+  sector 6 holds the same boot sector as sector 0, byte for byte
+  ```
+
+  Los números coinciden uno a uno con los que `xtask` dijo al formatear
+  —131072 sectores, 129022 clusters, 1009 sectores por tabla, raíz en el
+  cluster 2—, que es la comparación que importa: el que escribe y el que
+  lee coinciden, y un tercero dice que la imagen es válida.
+- **Pruebas negativas**: con un `sectors_per_cluster` de cero el kernel
+  dice `does not hold a FAT32 volume (SectorsPerCluster { found: 0 })` en
+  vez de dividir por cero; con el tamaño de tabla de 16 bits puesto,
+  `NotFat32 { sixteen_bit_fat_size: 256 }`. Las dos llegan al shell.
+- Host: 299 pruebas (285 + 14), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS.
+- Mutación: 25, las 25 detectadas.
+
+### Riesgos y límites
+
+- **Solo lectura**, y nada lee todavía un fichero: este incremento llega al
+  BPB. La cadena de clusters y el directorio raíz son el siguiente.
+- **Sin nombres largos**: 8.3 y nada más.
+- **Sin particiones**: el volumen empieza en el sector 0.
+- CI gana una dependencia, `dosfstools`, y un paso que puede fallar por
+  algo que no es el kernel. Es el precio de tener una segunda opinión.
+- La imagen se reescribe en cada `build`. Es deliberado —una entrada que
+  se mueve porque una ejecución anterior escribió en ella hace que una
+  prueba que pasa no signifique nada— y querrá revisarse cuando el kernel
+  escriba en el disco.
+
+## Incremento 28 — Un sector, leído de verdad
+
+`docs/adr/0024-fase4-dma-and-the-queue.md`. El disco estaba negociado y sin
+nada por donde pedirle. Una petición de virtio no se escribe en un
+registro: se deja en memoria que el dispositivo lee **por sí mismo**, y el
+registro solo sirve para avisar de que hay algo nuevo.
+
+Eso invierte quién manda sobre la memoria. Hasta ahora toda la del kernel
+la leía y escribía el kernel. Aquí el kernel le da una dirección física a
+un dispositivo y el dispositivo escribe ahí: sin pasar por las tablas de
+páginas, sin comprobación de límites, y sin nada que lo detenga si la
+dirección está mal.
+
+### Qué hace
+
+- **Los marcos de DMA salen del asignador con un propósito propio**
+  (`FramePurpose::Dma`). Es la propiedad por marco del ADR 0004 aplicada a
+  lo más peligroso que hay: un marco que el hardware puede escribir no
+  debe poder acabar siendo una tabla de páginas o una pila.
+- **Dos vistas de la misma memoria, deliberadamente**: al dispositivo se le
+  dan direcciones **físicas**, porque no camina tablas; el kernel la lee en
+  `ventana + dirección física`.
+- **Cola partida de cuatro descriptores.** El dispositivo ofrece 256 y una
+  petición usa tres —cabecera, datos, estado—; cuatro es la potencia de dos
+  más pequeña que sirve, y todo cabe en un marco. Se **vuelve a leer** el
+  registro del tamaño después de escribirlo, porque un dispositivo que lo
+  ignorara dejaría al kernel con anillos de otra forma que la que el
+  dispositivo cree.
+- **Los índices son ventanas, no contadores**: crecen para siempre y dan la
+  vuelta a los 16 bits, y la entrada es `idx % tamaño`. Tratarlos como
+  contadores funciona durante las primeras 65 536 peticiones.
+- **Tres descriptores porque los permisos son tres**: la cabecera la lee el
+  dispositivo, los datos y el byte de estado los escribe. Un dispositivo
+  que pudiera escribir la cabecera podría cambiar lo que se le pidió.
+- **El byte de estado se precarga a `0xFF`**, un valor que el dispositivo
+  nunca escribe, para que "funcionó" no pueda leerse de memoria que ya
+  estaba a cero.
+- **Se sondea con límite.** Un dispositivo que no contesta es una línea en
+  el registro, no un arranque que se queda ahí.
+- **El orden de las escrituras es parte del protocolo**: el descriptor
+  antes de su índice en el anillo, el índice antes del aviso, con barreras
+  entre los pasos, porque el dispositivo puede estar mirando.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra:
+
+  ```
+  sector 0 of the disk reads "HARLAN-DISK-0", which is what is there
+  sector 8 of the disk reads "HARLAN-SECTOR-8", which is what is there
+  ```
+
+  **Dos sectores, no uno.** Leer solo el 0 no distingue un driver que pide
+  el sector 0 de uno cuyo número de sector nunca llega al dispositivo: los
+  dos dan los mismos bytes. `xtask` escribe un segundo marcador en el
+  sector 8 y el kernel comprueba los dos contra lo que debería haber.
+  (Esto lo descubrí porque la primera versión del cambio en `xtask` falló
+  en silencio: el sector 8 leyó ceros, que ya probaba que el número
+  llegaba, pero la comprobación era accidental en vez de positiva.)
+- **Prueba negativa**: pidiendo el sector 100 000 de un disco de 16 384,
+  `sector 100000 could not be read (Failed { status: 1 })` —error de E/S—
+  y el arranque llega al shell. El byte de estado se lee de verdad: el
+  dispositivo lo escribió sobre el `0xFF` precargado.
+- Host: 285 pruebas (275 + 10: el trazado de la cola y lo que no cabe, un
+  descriptor campo por campo, publicar y recoger contra un anillo en
+  memoria ordinaria donde la prueba hace el papel del dispositivo, el
+  timbre y su multiplicador, y la cabecera de una petición).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 23, las 23 detectadas. Dos hicieron falta arreglos de verdad:
+  una comprobación del trazado que otra tapaba —la del anillo usado solo
+  se puede disparar con un marco más pequeño que el que el trazado supone—
+  y otra, la del anillo disponible, que **no se puede disparar nunca** con
+  estos desplazamientos. Esa segunda dejó de ser una rama en tiempo de
+  ejecución y pasó a ser una aserción del compilador: es un hecho sobre
+  tres constantes, así que si una se mueve, el build se para en vez de
+  solapar dos anillos en silencio.
+
+### Riesgos y límites
+
+- **Sin IOMMU.** Lo que se le diga al dispositivo, lo escribe. No hay
+  segunda comprobación ni forma de limitarlo desde aquí. La corrección
+  descansa entera en que las direcciones vienen del asignador y se traducen
+  en un solo sitio. Es la propiedad más frágil del subsistema y no hay
+  `unsafe` que la marque: desde el punto de vista de Rust el kernel solo
+  escribió un número en un registro.
+- **Sin interrupciones**: se sondea. Hace falta MSI-X o INTx, y eso es un
+  incremento propio.
+- **Una petición a la vez**, y cuatro descriptores. Los dos números están
+  en un sitio y los dos habrá que subirlos.
+- Nada escribe en el disco todavía. `TYPE_OUT` existe y no se usa.
+
+## Incremento 27 — Los registros del disco, y qué virtio hablamos
+
+`docs/adr/0023-fase4-device-registers.md`. El disco está encontrado
+(Incremento 26). Para hablar con él faltaban dos cosas: **alcanzar sus
+registros**, que están en direcciones físicas que no son RAM, y **decidir
+qué versión del protocolo hablar**, porque el dispositivo que QEMU
+presentaba habla dos.
+
+### Qué hace
+
+- **Virtio 1.0 y solo ese.** Legacy guarda sus registros detrás de puertos
+  de E/S y sus direcciones de cola en 32 bits; está obsoleto desde 2014 y
+  habría que tirarlo entero. Es el mismo razonamiento que llevó a
+  `syscall` en vez de `int 0x80`: lo que se va a sustituir no se escribe.
+- **El dispositivo se configura moderno-solo** (`disable-legacy=on`), así
+  que pasa a anunciarse como `1af4:1042` y pierde su BAR de puertos. No es
+  cosmético: mientras el camino legacy exista, un driver con un error puede
+  funcionar por él y la prueba no diría nada.
+- **Las capacidades PCI se recorren** desde el puntero de `0x34` —solo si
+  el registro de estado dice que hay lista— y las de virtio dan un BAR, un
+  desplazamiento y un tamaño. Una lista que se apunta a sí misma se
+  abandona tras 48 entradas en vez de colgar el arranque.
+- **Un BAR se decodifica, no se adivina**: memoria o puertos según el bit
+  0, y de 64 bits cuando el tipo lo dice —y entonces ocupa **dos** de las
+  seis entradas, así que la siguiente no es un BAR sino su mitad alta—.
+- **Los registros tienen su propia región**, la séptima del espacio del
+  kernel (PML4 262), mapeada **no cacheable** y no ejecutable. Un registro
+  leído de una caché es un registro que no se leyó. La ventana física de al
+  lado describe RAM y es cacheable; mezclar las dos políticas en una región
+  sería un mapa que dice una cosa y significa dos.
+- **Solo se mapea lo que una capacidad describe**, redondeado a páginas.
+- **El saludo, en el orden que manda la especificación**: reinicio,
+  `ACKNOWLEDGE`, `DRIVER`, leer lo ofrecido, escribir lo aceptado —con
+  `VERSION_1` obligatoriamente—, `FEATURES_OK`, y **volver a leer el
+  estado**, porque el dispositivo retira ese bit cuando no acepta lo
+  elegido. Un driver que sigue adelante sin comprobarlo acaba hablándole a
+  algo que dejó de escuchar. Si algo falla, el kernel escribe `FAILED` y lo
+  dice, en vez de dejar el dispositivo a medio negociar.
+- **Se para en `FEATURES_OK`**: negociado y sin colas. `DRIVER_OK` es lo
+  que dice que un driver está listo para enviar peticiones, y todavía no
+  hay por dónde enviarlas.
+
+### Verificación ejecutada
+
+- QEMU, la cadena entera de la capacidad al registro:
+
+  ```
+  a virtio disk at pci 00:03.0 (1af4:1042)
+    bar 1: memory at 0x81010000
+    bar 4: memory at 0xc000000000, 64-bit, prefetchable
+  the disk at pci 00:03.0 is negotiated: registers from bar 4 at
+  0xffff83c000000000, offers 0x10130006e54, agreed 0x100000000,
+  1 queue(s), queue 0 holds 256 descriptor(s) and is notified at 0
+  ```
+
+  El dispositivo ya es `1af4:1042` y **no tiene BAR de puertos**, que es la
+  prueba de que legacy está de verdad apagado. El BAR 4 es de 64 bits, así
+  que ese camino del decodificador lo recorre la máquina de verdad. La
+  dirección mapeada es `KERNEL_DEVICES_START + 0xc000000000`. Y lo leído
+  son valores reales: bit 32 puesto en lo ofrecido (`VERSION_1`) y
+  `0x100000000` exactamente en lo aceptado.
+- **Prueba negativa**: quitando `disable-legacy=on`, el dispositivo vuelve
+  a ser `1af4:1001`, aparece `bar 0: ports at 0xc000`, y el driver dice
+  `the disk could not be started (Transitional)` **y el arranque llega al
+  shell**. Un driver que se niega no es un kernel que se cae.
+- Host: 275 pruebas (258 + 17: decodificación de BAR incluida la de 64
+  bits y la de puertos, el recorrido de capacidades con una lista que
+  contiene capacidades ajenas y otra que se apunta a sí misma, el
+  enmascarado de los bits reservados del puntero, y cada registro de la
+  configuración común contra un dispositivo hecho de memoria ordinaria).
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 24, las 24 detectadas. Una sobrevivió primero —quitar el
+  enmascarado de los dos bits reservados del puntero de capacidad— porque
+  ninguna prueba usaba un puntero con basura ahí. Añadida la prueba, la
+  regla queda escrita donde se comprueba.
+
+### Riesgos y límites
+
+- **Sin interrupciones del dispositivo**: no hay MSI-X ni manejador de la
+  línea INTx. El siguiente incremento sondea la cola, y eso se dirá allí.
+- El kernel **escribe** en un dispositivo por primera vez. Enumerar era
+  leer; negociar no lo es.
+- No se acepta ninguna bandera más que `VERSION_1`: cada una de las demás
+  cambia cómo es una petición, y todavía no hay peticiones.
+- El mapeo de registros acepta una página ya mapeada como caso normal: dos
+  estructuras de un dispositivo suelen compartir página. Eso significa que
+  no detectaría un solape con otra cosa que ya estuviera ahí, y la región
+  es solo de dispositivos.
+
+## Incremento 26 — El kernel pregunta qué hay
+
+`docs/adr/0022-fase4-pci-enumeration.md`. Todo lo que el kernel tocaba
+hasta ahora estaba en una dirección que alguien fijó hace cuarenta años:
+el PIC en `0x20`, el PIT en `0x40`, el teclado en `0x60`. Un disco no.
+
+### Qué hace
+
+- **El espacio de configuración se lee por los puertos `0xCF8`/`0xCFC`**,
+  no por ECAM: ECAM necesita la tabla MCFG de ACPI, que necesita un
+  analizador de ACPI, que es un subsistema entero. Los puertos alcanzan
+  los 256 buses y los primeros 256 bytes de cada función, que es donde
+  viven las capacidades de virtio.
+- **El recorrido es exhaustivo y sin recursión**, y solo pregunta por las
+  funciones 1 a 7 cuando la función 0 dice que el dispositivo es
+  multifunción: uno que no lo es puede contestar por las ocho, y el mismo
+  disco aparecería ocho veces.
+- **El kernel no configura nada mientras mira.** No asigna BAR, no
+  habilita bus mastering, no dimensiona nada —eso exige escribir en el
+  registro—. El firmware ya lo hizo. Enumerar es leer.
+- **Todo menos `in` y `out` vive en `hal`**, sobre un rasgo `ConfigSpace`
+  de una sola operación. La misma forma que `PageTables` sobre
+  `TableAccess`: el recorrido entero se prueba contra una máquina que no
+  existe.
+- **`xtask` le da un disco a la máquina**: una imagen cruda enganchada
+  como `virtio-blk-pci`. Nada arranca desde él; el firmware sigue
+  arrancando desde la ESP.
+
+### Verificación ejecutada
+
+- QEMU, que es lo que lo demuestra —la máquina entera, encontrada:
+
+  ```
+  pci 00:00.0 8086:1237 host bridge (class 06.00)
+  pci 00:01.0 8086:7000 ISA bridge (class 06.01)
+  pci 00:01.1 8086:7010 IDE storage (class 01.01)
+  pci 00:01.3 8086:7113 bridge (class 06.80)
+  pci 00:02.0 1234:1111 display (class 03.00)
+  pci 00:03.0 1af4:1001 SCSI storage (class 01.00)
+  a virtio disk at pci 00:03.0 (1af4:1001), first BAR 0xc001
+  ```
+
+  Es exactamente lo que `-machine pc` emula, con nuestro disco en `00:03.0`
+  y ni una función repetida. El puente PIIX3 en `00:01.0` **sí** es
+  multifunción, así que el camino de las funciones 1 a 7 lo recorre
+  también un arranque de verdad, no solo las pruebas.
+- Host: 258 pruebas (246 + 12: la dirección de configuración campo por
+  campo, la cabecera, la tabla de dispositivos, y el recorrido contra una
+  máquina falsa que registra qué se le preguntó).
+- **Coste**: ninguno medible. Diez arranques entre 5,24 s y 5,48 s, dentro
+  del margen de antes del escaneo (5,68–6,69 s en el incremento previo, en
+  la misma máquina). Los ~8200 accesos a puerto no se notan.
+- `boot-test --repeat 10` 10/10, soak de 120 s PASS, `fmt-lint` limpio.
+- Mutación: 15, las 15 detectadas. Todas alcanzables desde host porque el
+  recorrido está en `hal`: desplazar el bus un bit, leer la clase donde
+  está la subclase, buscar el bit de multifunción en el sitio equivocado,
+  recorrer un solo bus, preguntar por las ocho funciones siempre.
+
+### Lo que hay que saber para el siguiente incremento
+
+- **El dispositivo es transicional**: QEMU presenta `1af4:1001`, no
+  `1af4:1042`. Es decir, habla virtio legacy por un BAR de E/S **y**
+  virtio 1.0 por capacidades PCI. Cuál de los dos usar es la decisión del
+  ADR del driver.
+- **El FAT32 sintético de QEMU no sirve de referencia.** Enganchar un
+  directorio con `fat:32:rw:` funciona, pero QEMU avisa: *"FAT32 has not
+  been tested. You are welcome to do so!"*. Verificar un lector contra una
+  implementación no probada no verifica nada. El incremento del filesystem
+  tendrá que construir la imagen y comprobarla con algo independiente
+  —`fsck.vfat` en CI, que es Linux— en vez de confiar en el sintetizador.
+
+### Riesgos y límites
+
+- La configuración extendida de PCIe (de `0x100` en adelante) es
+  inalcanzable por este camino. Nada de lo que este kernel usa la
+  necesita todavía.
+- 32 funciones como máximo. Pasado eso el kernel dice cuántas perdió.
+- No se sigue ningún puente: los 256 buses se visitan a pelo. Encuentra lo
+  mismo en esta máquina y es menos código.

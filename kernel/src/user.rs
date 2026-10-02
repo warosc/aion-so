@@ -1,22 +1,27 @@
-//! The first thing that runs without privileges.
+//! The first thing that runs without privileges, and what it can ask for.
 //!
-//! A flat program, assembled by hand and carried inside the kernel image,
-//! copied into a page of its own and run in ring 3
+//! Flat programs, assembled by hand and carried inside the kernel image,
+//! each copied into a page of its own and run in ring 3
 //! (docs/adr/0014-fase3-syscall-abi-v0.md). No loader, no format, no
 //! relocations: what it takes to prove that the kernel can hand over the
 //! CPU, take it back through `syscall`, and not be reachable in between.
 //!
-//! One process, no scheduler, no address space of its own yet. Those are
-//! the next increments; this one is about the boundary.
+//! There are three of them now, run as four processes. Two processes run
+//! the same talking program and take turns, which is what the scheduler
+//! had to show (ADR 0018); the other two run a sender and a receiver and
+//! exchange a message, which is what Fase 3 is for
+//! (docs/adr/0019-fase3-ipc-v0.md). The message crosses from one address
+//! space to another because the kernel copies it, and by no other route.
 
+use harlan_arch_x86_64::interrupts::UserFault;
 use harlan_arch_x86_64::syscall::SyscallFrame;
-use harlan_hal::addr::{PhysAddr, VirtAddr};
-use harlan_hal::frame::PhysRange;
-use harlan_hal::paging::{PAGE_SIZE, Page, PageFlags, PageMapper};
+use harlan_hal::addr::VirtAddr;
 use harlan_hal::{error, info};
 
-use crate::memory::frame_allocator::FramePurpose;
-use crate::memory::zeroed_frames::KernelFrames;
+use crate::ipc::{self, TakeError};
+use crate::process::OpenFile;
+use crate::process::Process;
+use crate::scheduler::{self, Running, SendError};
 
 /// Where the program is mapped. Low, but clear of the first megabyte and
 /// of anything the firmware kept.
@@ -25,11 +30,27 @@ pub const PROGRAM_BASE: VirtAddr = VirtAddr::new(0x0040_0000);
 pub const STACK_BASE: VirtAddr = VirtAddr::new(0x0050_0000);
 pub const STACK_TOP: VirtAddr = VirtAddr::new(0x0050_1000);
 
-/// What the program asks for.
+/// What a program asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Call {
     Log = 0,
     Exit = 1,
+    /// Gives the CPU to whoever is next, and comes back later. The
+    /// timer does this too; this is the cooperative way, and it is what
+    /// makes the test deterministic (ADR 0018).
+    Yield = 2,
+    /// Puts a message in another process's mailbox (ADR 0019). Does not
+    /// wait: a full mailbox is an answer, not a pause.
+    Send = 3,
+    /// Takes the message waiting for this process, waiting until there is
+    /// one.
+    Recv = 4,
+    /// The file calls (docs/adr/0028-fase4-file-abi-v0.md): descriptors
+    /// for reading, the whole file for writing.
+    Open = 5,
+    Read = 6,
+    Close = 7,
+    WriteFile = 8,
 }
 
 impl Call {
@@ -37,48 +58,203 @@ impl Call {
         match number {
             0 => Some(Call::Log),
             1 => Some(Call::Exit),
+            2 => Some(Call::Yield),
+            3 => Some(Call::Send),
+            4 => Some(Call::Recv),
+            5 => Some(Call::Open),
+            6 => Some(Call::Read),
+            7 => Some(Call::Close),
+            8 => Some(Call::WriteFile),
             _ => None,
         }
     }
 }
 
 /// Negative, because `rax` carries the result and a number is easier to
-/// check than a bitfield (ADR 0014).
+/// check than a bitfield (ADR 0014). `-3`, no permission, is reserved by
+/// that ADR and has nothing to refuse yet.
 pub const ERR_UNKNOWN_CALL: i64 = -1;
 pub const ERR_BAD_ARGUMENT: i64 = -2;
+/// The mailbox written to already holds a message nobody has read. The
+/// sender decides what to do; the demonstration yields and tries again.
+pub const ERR_MAILBOX_FULL: i64 = -4;
+pub const ERR_NO_SUCH_PROCESS: i64 = -5;
+/// Nothing is waiting and nobody is left who could ever send anything, so
+/// waiting would be waiting for ever (ADR 0019, point 7).
+pub const ERR_WOULD_WAIT_FOR_EVER: i64 = -6;
 
-/// The program, assembled by hand:
+// The file ABI's own (docs/adr/0028-fase4-file-abi-v0.md, point 13),
+// continuing the numbering rather than starting a scheme of their own.
+
+/// Not a descriptor this process has open. Out of range and closed are the
+/// same answer: a program learns nothing by guessing.
+pub const ERR_BAD_DESCRIPTOR: i64 = -7;
+/// All four slots are taken (`process::MAX_OPEN`).
+pub const ERR_TOO_MANY_OPEN: i64 = -8;
+/// No file of that name in the root directory.
+pub const ERR_NO_SUCH_FILE: i64 = -9;
+/// Somebody has that file open, so writing it would change what they are
+/// in the middle of reading (ADR 0028, point 12).
+pub const ERR_FILE_IS_OPEN: i64 = -10;
+/// There is no room on the volume for it.
+pub const ERR_VOLUME_FULL: i64 = -11;
+/// The disk, or the volume on it, said no. **Not** fatal to the process:
+/// it asked for something legitimate and the medium failed, which is a
+/// different thing from a fault (ADR 0020, and ADR 0028 point 14).
+pub const ERR_DISK: i64 = -12;
+
+/// The longest name this filesystem holds: eight, a dot, and three.
+pub const MAX_NAME: u64 = 12;
+
+/// The most one `read` will move in a single call.
+///
+/// A limit so that a program cannot ask the kernel for an unbounded amount
+/// of work inside one syscall, which with interrupts off is an unbounded
+/// amount of time with the clock stopped (ADR 0028, last consequence). A
+/// program that wants more calls again; that is what a descriptor is for.
+pub const MAX_READ: u64 = 4096;
+
+// ---------------------------------------------------------------------
+// The programs
+// ---------------------------------------------------------------------
+
+/// Two processes saying who they are, taking turns:
 ///
 /// ```text
-///  0: b8 00 00 00 00     mov eax, 0          ; log
-///  5: 48 8d 3d 15 00 00 00  lea rdi, [rip+21] ; the message
-/// 12: be 1a 00 00 00     mov esi, 26         ; its length
-/// 17: 0f 05              syscall
-/// 19: b8 01 00 00 00     mov eax, 1          ; exit
-/// 24: bf 07 00 00 00     mov edi, 7          ; with 7
-/// 29: 0f 05              syscall
-/// 31: 0f 0b              ud2                 ; never reached
-/// 33: "HARLAN: hello from ring 3\n"
+///  0: b8 00 00 00 00        mov eax, 0           ; log
+///  5: 48 8d 3d 2f 00 00 00  lea rdi, [rip+47]    ; the message
+/// 12: be 1a 00 00 00        mov esi, 26          ; its length
+/// 17: 0f 05                 syscall
+/// 19: b8 02 00 00 00        mov eax, 2           ; yield
+/// 24: 0f 05                 syscall
+/// 26: b8 00 00 00 00        mov eax, 0           ; log, again
+/// 31: 48 8d 3d 15 00 00 00  lea rdi, [rip+21]
+/// 38: be 1a 00 00 00        mov esi, 26
+/// 43: 0f 05                 syscall
+/// 45: b8 01 00 00 00        mov eax, 1           ; exit
+/// 50: bf 07 00 00 00        mov edi, 7           ; with 7
+/// 55: 0f 05                 syscall
+/// 57: 0f 0b                 ud2                  ; never reached
+/// 59: "HARLAN: process _ speaking\n"
 /// ```
-pub static PROGRAM: [u8; 59] = {
-    let mut program = [0u8; 59];
-    program[0] = 0xB8; // mov eax, imm32
+///
+/// The underscore is the badge: `talker_program` writes a digit there, so
+/// that two processes running the same code can be told apart in the log.
+pub const TALKER_LEN: usize = TALK_AT as usize + TALK.len();
+
+/// Where in the message the badge goes.
+const BADGE_AT: usize = TALK_AT as usize + 16;
+
+const TALK: &str = "HARLAN: process _ speaking\n";
+const TALK_LEN: u8 = TALK.len() as u8;
+const TALK_AT: u8 = 59;
+
+/// The talking program, with `badge` written into its message.
+pub fn talker_program(badge: u8) -> [u8; TALKER_LEN] {
+    let mut program = [0u8; TALKER_LEN];
+    program[0] = 0xB8; // mov eax, imm32 (log)
     program[5] = 0x48; // lea rdi, [rip+disp32]
     program[6] = 0x8D;
     program[7] = 0x3D;
-    program[8] = MESSAGE_AT - 12; // from the end of this instruction
+    program[8] = TALK_AT - 12;
     program[12] = 0xBE; // mov esi, imm32
-    program[13] = MESSAGE_LEN;
+    program[13] = TALK_LEN;
     program[17] = 0x0F; // syscall
     program[18] = 0x05;
-    program[19] = 0xB8; // mov eax, imm32
-    program[20] = 1;
-    program[24] = 0xBF; // mov edi, imm32
-    program[25] = 7;
-    program[29] = 0x0F; // syscall
-    program[30] = 0x05;
-    program[31] = 0x0F; // ud2
-    program[32] = 0x0B;
+    program[19] = 0xB8; // mov eax, imm32 (yield)
+    program[20] = Call::Yield as u8;
+    program[24] = 0x0F; // syscall
+    program[25] = 0x05;
+    program[26] = 0xB8; // mov eax, imm32 (log)
+    program[31] = 0x48; // lea rdi, [rip+disp32]
+    program[32] = 0x8D;
+    program[33] = 0x3D;
+    program[34] = TALK_AT - 38;
+    program[38] = 0xBE; // mov esi, imm32
+    program[39] = TALK_LEN;
+    program[43] = 0x0F; // syscall
+    program[44] = 0x05;
+    program[45] = 0xB8; // mov eax, imm32 (exit)
+    program[46] = Call::Exit as u8;
+    program[50] = 0xBF; // mov edi, imm32
+    program[51] = 7;
+    program[55] = 0x0F; // syscall
+    program[56] = 0x05;
+    program[57] = 0x0F; // ud2
+    program[58] = 0x0B;
+    let message = TALK.as_bytes();
+    let mut index = 0;
+    while index < message.len() {
+        program[TALK_AT as usize + index] = message[index];
+        index += 1;
+    }
+    program[BADGE_AT] = badge;
+    program
+}
+
+/// What the sender says. Under a mailbox's worth (`ipc::CAPACITY`), which
+/// a test checks.
+const MESSAGE: &str = "HARLAN: this crossed from one address space to another\n";
+const MESSAGE_AT: u8 = 53;
+
+/// The sender: one message, and the patience to wait for a mailbox that
+/// somebody has not emptied yet.
+///
+/// ```text
+///  0: b8 03 00 00 00        mov eax, 3           ; send
+///  5: bf 02 00 00 00        mov edi, to          ; which slot
+/// 10: 48 8d 35 24 00 00 00  lea rsi, [rip+36]    ; the message
+/// 17: ba 37 00 00 00        mov edx, 55          ; its length
+/// 22: 0f 05                 syscall
+/// 24: 48 83 f8 fc           cmp rax, -4          ; was the mailbox full?
+/// 28: 75 09                 jne +9               ; no: done
+/// 30: b8 02 00 00 00        mov eax, 2           ; yield, and try again
+/// 35: 0f 05                 syscall
+/// 37: eb d9                 jmp -39              ; back to the top
+/// 39: b8 01 00 00 00        mov eax, 1           ; exit
+/// 44: bf 00 00 00 00        mov edi, 0
+/// 49: 0f 05                 syscall
+/// 51: 0f 0b                 ud2                  ; never reached
+/// 53: "HARLAN: this crossed from one address space to another\n"
+/// ```
+pub const SENDER_LEN: usize = MESSAGE_AT as usize + MESSAGE.len();
+
+/// The sending program, aimed at the process in slot `to`. The slot is
+/// written in by the kernel that spawns it: v0 has no way for a program
+/// to ask who is out there (ADR 0019, point 4).
+pub fn sender_program(to: u8) -> [u8; SENDER_LEN] {
+    let mut program = [0u8; SENDER_LEN];
+    program[0] = 0xB8; // mov eax, imm32 (send)
+    program[1] = Call::Send as u8;
+    program[5] = 0xBF; // mov edi, imm32 (the slot)
+    program[6] = to;
+    program[10] = 0x48; // lea rsi, [rip+disp32]
+    program[11] = 0x8D;
+    program[12] = 0x35;
+    program[13] = MESSAGE_AT - 17;
+    program[17] = 0xBA; // mov edx, imm32 (the length)
+    program[18] = MESSAGE.len() as u8;
+    program[22] = 0x0F; // syscall
+    program[23] = 0x05;
+    program[24] = 0x48; // cmp rax, imm8
+    program[25] = 0x83;
+    program[26] = 0xF8;
+    program[27] = ERR_MAILBOX_FULL as i8 as u8;
+    program[28] = 0x75; // jne, past the retry
+    program[29] = 9;
+    program[30] = 0xB8; // mov eax, imm32 (yield)
+    program[31] = Call::Yield as u8;
+    program[35] = 0x0F; // syscall
+    program[36] = 0x05;
+    program[37] = 0xEB; // jmp, back to the top
+    program[38] = (-39i8) as u8;
+    program[39] = 0xB8; // mov eax, imm32 (exit)
+    program[40] = Call::Exit as u8;
+    program[44] = 0xBF; // mov edi, imm32 (with 0)
+    program[49] = 0x0F; // syscall
+    program[50] = 0x05;
+    program[51] = 0x0F; // ud2
+    program[52] = 0x0B;
     let message = MESSAGE.as_bytes();
     let mut index = 0;
     while index < message.len() {
@@ -86,137 +262,239 @@ pub static PROGRAM: [u8; 59] = {
         index += 1;
     }
     program
-};
-
-const MESSAGE: &str = "HARLAN: hello from ring 3\n";
-const MESSAGE_LEN: u8 = MESSAGE.len() as u8;
-const MESSAGE_AT: u8 = 33;
-
-/// Where the program's memory is, so the kernel can tell whether a
-/// pointer it was handed belongs to it.
-#[derive(Debug, Clone, Copy)]
-pub struct Program {
-    pub code: PhysRange,
-    pub stack: PhysRange,
 }
 
-impl Program {
-    /// Whether `[ptr, ptr + len)` is memory this program owns.
-    ///
-    /// Everything that arrives in a register from ring 3 goes through
-    /// here before the kernel reads a byte of it.
-    pub fn owns(&self, ptr: u64, len: u64) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let Some(end) = ptr.checked_add(len) else {
-            return false;
-        };
-        let inside = |range: &PhysRange| {
-            let start = range.start.as_u64();
-            ptr >= start && end <= range.end().as_u64()
-        };
-        inside(&self.code) || inside(&self.stack)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartError {
-    /// No frame for the program's code or its stack.
-    OutOfFrames,
-    /// The pages it needs are taken, or the mapper refused them.
-    Mapping(harlan_hal::paging::MapError),
-}
-
-/// Copies the program into fresh frames and maps them for ring 3: the
-/// code executable and read-only, the stack writable and no-execute.
+/// The receiver: waits for a message, says what arrived, and leaves.
 ///
-/// # Safety
+/// ```text
+///  0: b8 04 00 00 00        mov eax, 4           ; recv
+///  5: bf 00 00 50 00        mov edi, 0x500000    ; the foot of its stack
+/// 10: be 40 00 00 00        mov esi, 64          ; a mailbox's worth
+/// 15: 0f 05                 syscall              ; rax = length
+/// 17: 48 89 c6              mov rsi, rax         ; log exactly that much
+/// 20: b8 00 00 00 00        mov eax, 0           ; log
+/// 25: bf 00 00 50 00        mov edi, 0x500000
+/// 30: 0f 05                 syscall
+/// 32: 48 89 d7              mov rdi, rdx         ; who sent it
+/// 35: b8 01 00 00 00        mov eax, 1           ; exit, with that
+/// 40: 0f 05                 syscall
+/// 42: 0f 0b                 ud2                  ; never reached
+/// ```
 ///
-/// The lower half must be the kernel's to map into — after
-/// `keep_only_in_lower_half`, not before — and nothing else may be using
-/// these addresses.
-pub unsafe fn load(
-    mapper: &mut dyn PageMapper,
-    frames: &mut KernelFrames<'_>,
-) -> Result<Program, StartError> {
-    let code_frame = frames
-        .allocate_for(FramePurpose::Kernel)
-        .ok_or(StartError::OutOfFrames)?;
-    let stack_frame = frames
-        .allocate_for(FramePurpose::Stack)
-        .ok_or(StartError::OutOfFrames)?;
+/// The buffer is in its **stack** page, not its code page: the kernel
+/// writes the message there, and the code page is read-only (ADR 0011).
+///
+/// It exits with the slot that wrote to it, which is the only way to see
+/// from outside the kernel that `rdx` carried the sender's name back into
+/// ring 3 (ADR 0019, point 8).
+pub const RECEIVER_LEN: usize = 44;
 
-    // The program goes in through the kernel's window, not through the
-    // mapping the program will use: that one is read-only.
-    let window = frames.window();
-    // SAFETY: the frame is fresh from the allocator, so nothing else uses
-    // it, and the window reaches it (its own contract).
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            PROGRAM.as_ptr(),
-            window.frame_ptr(code_frame),
-            PROGRAM.len(),
-        )
-    };
+/// Where the receiver asks for the message to be put: the foot of its
+/// stack page, four kilobytes below where `rsp` starts.
+pub const RECEIVE_BUFFER: u32 = STACK_BASE.as_u64() as u32;
 
-    // SAFETY: both frames are fresh, these addresses are user space and
-    // used by nothing else (the caller's contract).
-    unsafe {
-        mapper.map(
-            Page::containing_address(PROGRAM_BASE),
-            code_frame,
-            PageFlags::user(false, true),
-            frames,
-        )?;
-        mapper.map(
-            Page::containing_address(STACK_BASE),
-            stack_frame,
-            PageFlags::user(true, false),
-            frames,
-        )?;
-    }
-    Ok(Program {
-        code: PhysRange::new(PhysAddr::new(PROGRAM_BASE.as_u64()), PAGE_SIZE),
-        stack: PhysRange::new(PhysAddr::new(STACK_BASE.as_u64()), PAGE_SIZE),
-    })
+pub fn receiver_program() -> [u8; RECEIVER_LEN] {
+    let mut program = [0u8; RECEIVER_LEN];
+    let buffer = RECEIVE_BUFFER.to_le_bytes();
+    program[0] = 0xB8; // mov eax, imm32 (recv)
+    program[1] = Call::Recv as u8;
+    program[5] = 0xBF; // mov edi, imm32 (the buffer)
+    program[6..10].copy_from_slice(&buffer);
+    program[10] = 0xBE; // mov esi, imm32 (how much it can hold)
+    program[11] = ipc::CAPACITY as u8;
+    program[15] = 0x0F; // syscall
+    program[16] = 0x05;
+    program[17] = 0x48; // mov rsi, rax
+    program[18] = 0x89;
+    program[19] = 0xC6;
+    program[20] = 0xB8; // mov eax, imm32 (log)
+    program[21] = Call::Log as u8;
+    program[25] = 0xBF; // mov edi, imm32 (the buffer again)
+    program[26..30].copy_from_slice(&buffer);
+    program[30] = 0x0F; // syscall
+    program[31] = 0x05;
+    program[32] = 0x48; // mov rdi, rdx (exit with who sent it)
+    program[33] = 0x89;
+    program[34] = 0xD7;
+    program[35] = 0xB8; // mov eax, imm32 (exit)
+    program[36] = Call::Exit as u8;
+    program[40] = 0x0F; // syscall
+    program[41] = 0x05;
+    program[42] = 0x0F; // ud2
+    program[43] = 0x0B;
+    program
 }
 
-impl From<harlan_hal::paging::MapError> for StartError {
-    fn from(err: harlan_hal::paging::MapError) -> Self {
-        StartError::Mapping(err)
-    }
+// ---------------------------------------------------------------------
+// The programs that try what must not work
+// ---------------------------------------------------------------------
+//
+// Each one is its own process, because the first thing it tries is the
+// last thing it does: there is no way for a program to survive a fault
+// and go on to the next attempt (ADR 0020). What they demonstrate is not
+// that the attempt fails — a single `#PF` would show that — but that
+// everything else keeps running afterwards.
+
+/// Reads an address in the kernel's half:
+///
+/// ```text
+///  0: 48 b8 <8 bytes>       movabs rax, address
+/// 10: 48 8b 00              mov rax, [rax]
+/// 13: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The address is real kernel memory, mapped, with something in it. What
+/// stops the read is the one bit in the page tables that says the page is
+/// not the user's.
+pub const READS_KERNEL_LEN: usize = 15;
+
+pub fn reads_kernel_memory(address: u64) -> [u8; READS_KERNEL_LEN] {
+    let mut program = [0u8; READS_KERNEL_LEN];
+    program[0] = 0x48; // movabs rax, imm64
+    program[1] = 0xB8;
+    program[2..10].copy_from_slice(&address.to_le_bytes());
+    program[10] = 0x48; // mov rax, [rax]
+    program[11] = 0x8B;
+    program[12] = 0x00;
+    program[13] = 0x0F; // ud2
+    program[14] = 0x0B;
+    program
 }
 
-/// The program's memory, for the handler to check pointers against, and
-/// where to continue once it exits. Written before ring 3 is entered and
-/// read only from the syscall handler.
-static mut CURRENT: Option<Program> = None;
-static mut ON_EXIT: Option<(extern "C" fn(*mut u8) -> !, *mut u8)> = None;
+/// Writes to its own code page:
+///
+/// ```text
+///  0: bf 00 00 40 00        mov edi, 0x400000    ; where its code is
+///  5: c6 07 42              mov byte [rdi], 0x42
+///  8: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// Its code is mapped for ring 3 and not writable (ADR 0011, W^X). A
+/// program that could rewrite itself would make every check the kernel
+/// does on its code worthless.
+pub const WRITES_ITS_CODE_LEN: usize = 10;
 
-/// Handles one syscall. Runs on the kernel's syscall stack with
-/// interrupts disabled (`FMASK`).
+pub fn writes_its_own_code() -> [u8; WRITES_ITS_CODE_LEN] {
+    let mut program = [0u8; WRITES_ITS_CODE_LEN];
+    program[0] = 0xBF; // mov edi, imm32
+    program[1..5].copy_from_slice(&(PROGRAM_BASE.as_u64() as u32).to_le_bytes());
+    program[5] = 0xC6; // mov byte [rdi], imm8
+    program[6] = 0x07;
+    program[7] = 0x42;
+    program[8] = 0x0F; // ud2
+    program[9] = 0x0B;
+    program
+}
+
+/// Puts an instruction in its stack and jumps to it:
+///
+/// ```text
+///  0: bf 00 00 50 00        mov edi, 0x500000    ; its stack
+///  5: c6 07 c3              mov byte [rdi], 0xc3 ; a `ret`
+///  8: ff e7                 jmp rdi
+/// 10: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The write succeeds — it is its own stack. The jump does not: the page
+/// is not executable, which is the other half of W^X.
+pub const RUNS_ITS_STACK_LEN: usize = 12;
+
+pub fn runs_its_own_stack() -> [u8; RUNS_ITS_STACK_LEN] {
+    let mut program = [0u8; RUNS_ITS_STACK_LEN];
+    program[0] = 0xBF; // mov edi, imm32
+    program[1..5].copy_from_slice(&(STACK_BASE.as_u64() as u32).to_le_bytes());
+    program[5] = 0xC6; // mov byte [rdi], imm8
+    program[6] = 0x07;
+    program[7] = 0xC3; // `ret`, so that running it would at least be tidy
+    program[8] = 0xFF; // jmp rdi
+    program[9] = 0xE7;
+    program[10] = 0x0F; // ud2
+    program[11] = 0x0B;
+    program
+}
+
+/// Hands the kernel a pointer into the kernel and asks it to read it:
+///
+/// ```text
+///  0: b8 00 00 00 00        mov eax, 0           ; log
+///  5: 48 bf <8 bytes>       movabs rdi, address  ; the kernel's
+/// 15: be 08 00 00 00        mov esi, 8
+/// 20: 0f 05                 syscall              ; refused
+/// 22: 48 89 c7              mov rdi, rax         ; exit with what it got
+/// 25: 48 f7 df              neg rdi              ; as a number to read
+/// 28: b8 01 00 00 00        mov eax, 1
+/// 33: 0f 05                 syscall
+/// 35: 0f 0b                 ud2                  ; never reached
+/// ```
+///
+/// The one that does not fault. The kernel refuses the pointer and the
+/// process carries on, which is what a refusal should look like from the
+/// other side: an answer, not a crash. It exits with the error negated,
+/// so the code in the log reads as the number of the refusal.
+pub const LIES_LEN: usize = 37;
+
+pub fn lies_about_a_pointer(address: u64) -> [u8; LIES_LEN] {
+    let mut program = [0u8; LIES_LEN];
+    program[0] = 0xB8; // mov eax, imm32 (log)
+    program[1] = Call::Log as u8;
+    program[5] = 0x48; // movabs rdi, imm64
+    program[6] = 0xBF;
+    program[7..15].copy_from_slice(&address.to_le_bytes());
+    program[15] = 0xBE; // mov esi, imm32
+    program[16] = 8;
+    program[20] = 0x0F; // syscall
+    program[21] = 0x05;
+    program[22] = 0x48; // mov rdi, rax
+    program[23] = 0x89;
+    program[24] = 0xC7;
+    program[25] = 0x48; // neg rdi
+    program[26] = 0xF7;
+    program[27] = 0xDF;
+    program[28] = 0xB8; // mov eax, imm32 (exit)
+    program[29] = Call::Exit as u8;
+    program[33] = 0x0F; // syscall
+    program[34] = 0x05;
+    program[35] = 0x0F; // ud2
+    program[36] = 0x0B;
+    program
+}
+
+// ---------------------------------------------------------------------
+// The kernel's side of the boundary
+// ---------------------------------------------------------------------
+
+/// Handles one syscall. Runs on the kernel stack of the process that made
+/// it, with interrupts disabled (`FMASK`).
 pub fn handle(frame: &mut SyscallFrame) {
-    // SAFETY: single core, and this is only reachable from the syscall
-    // stub, which cannot run before `enter` set these.
-    let program = unsafe { CURRENT };
-    let Some(program) = program else {
-        error!("HARLAN: a syscall arrived with no program running");
+    // Who is running is the scheduler's to say. It used to be kept here
+    // as well, and a copy of it is a copy that goes stale on the next
+    // switch: from then on the kernel would check one process's pointers
+    // against another's memory.
+    // SAFETY: this is only reachable from the syscall stub, on one core,
+    // with interrupts off, while a process is running.
+    let running = unsafe { scheduler::running() };
+    let Some(running) = running else {
+        error!("HARLAN: a syscall arrived with no process running");
         frame.rax = ERR_UNKNOWN_CALL as u64;
         return;
     };
+    serve(frame, running);
+}
 
+/// The call itself, once it is known who asked. Split out from `handle`
+/// so that what it refuses can be tested without a process.
+fn serve(frame: &mut SyscallFrame, running: Running) {
     match Call::from(frame.rax) {
         Some(Call::Log) => {
             let (ptr, len) = (frame.rdi, frame.rsi);
-            if !program.owns(ptr, len) || len > 4096 {
-                error!("HARLAN: syscall log({ptr:#x}, {len}) is not the program's memory");
+            if !running.owns(ptr, len) || len > 4096 {
+                error!("HARLAN: syscall log({ptr:#x}, {len}) is not this process's memory");
                 frame.rax = ERR_BAD_ARGUMENT as u64;
                 return;
             }
             // SAFETY: the range was just checked to be inside the pages
-            // this program was given, which are mapped and stay mapped
-            // while it runs.
+            // this process was given, which are mapped in the space that
+            // is active and stay mapped while it runs.
             let bytes = unsafe {
                 core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
             };
@@ -232,15 +510,290 @@ pub fn handle(frame: &mut SyscallFrame) {
             }
         }
         Some(Call::Exit) => {
-            info!("HARLAN: the program exited with {}", frame.rdi);
-            // SAFETY: as above; set before ring 3 was entered.
-            let resume = unsafe { ON_EXIT };
-            let Some((resume, argument)) = resume else {
-                panic!("a program exited with nowhere for the kernel to go back to");
+            // Never comes back: the scheduler gives the CPU to whoever is
+            // next, or to the kernel if nobody is.
+            // SAFETY: this runs in the syscall handler, with interrupts
+            // off, while this process is the one running.
+            unsafe { crate::scheduler::exit_current(frame.rdi) };
+        }
+        Some(Call::Yield) => {
+            // SAFETY: as above. Comes back when this process's turn
+            // comes round again.
+            unsafe { crate::scheduler::switch_to_next() };
+            frame.rax = 0;
+        }
+        Some(Call::Send) => {
+            let (to, ptr, len) = (frame.rdi, frame.rsi, frame.rdx);
+            if !running.owns(ptr, len) || len as usize > ipc::CAPACITY {
+                error!(
+                    "HARLAN: syscall send({to}, {ptr:#x}, {len}) is not a message this process can send"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: the range is inside the pages this process was
+            // given, mapped in the space that is active — which is why
+            // the copy happens here, while the sender is the one running
+            // (ADR 0019, point 2).
+            let message = unsafe {
+                core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
             };
-            // The kernel goes on here, on the syscall stack, which is one
-            // of its own with guard pages around it.
-            resume(argument)
+            // SAFETY: as above, and the scheduler is this kernel's, on
+            // one core, with interrupts off.
+            match unsafe { scheduler::deliver(to as usize, running.slot, message) } {
+                Ok(delivery) => {
+                    info!(
+                        "HARLAN: {} byte(s) from slot {} are waiting in the mailbox of slot {to}",
+                        delivery.len, running.slot
+                    );
+                    frame.rax = len;
+                }
+                Err(SendError::Busy) => {
+                    // Said out loud: without it, a sender that is waiting
+                    // its turn to try again looks like a sender doing
+                    // nothing at all.
+                    info!(
+                        "HARLAN: the mailbox of slot {to} still holds a message, so slot {} was told to wait",
+                        running.slot
+                    );
+                    frame.rax = ERR_MAILBOX_FULL as u64;
+                }
+                Err(SendError::NoSuchProcess) => {
+                    error!("HARLAN: syscall send() names slot {to}, where there is no process");
+                    frame.rax = ERR_NO_SUCH_PROCESS as u64;
+                }
+                Err(SendError::Rejected(why)) => {
+                    error!("HARLAN: syscall send() was refused ({why:?})");
+                    frame.rax = ERR_BAD_ARGUMENT as u64;
+                }
+            }
+        }
+        Some(Call::Recv) => {
+            let (ptr, capacity) = (frame.rdi, frame.rsi);
+            if !running.owns(ptr, capacity) {
+                error!("HARLAN: syscall recv({ptr:#x}, {capacity}) is not this process's memory");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            loop {
+                // Asked for again each time round: waiting gives the CPU
+                // away, and what was true before is not what is true now.
+                // SAFETY: the range was just checked to be inside the
+                // pages this process was given, which are mapped writable
+                // in the space that is active. The kernel writes into
+                // user memory here, while its owner is the one running.
+                let into = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        VirtAddr::new(ptr).as_ptr::<u8>(),
+                        capacity as usize,
+                    )
+                };
+                // SAFETY: the scheduler is this kernel's, on one core,
+                // with interrupts off, and this process is running.
+                match unsafe { scheduler::take_message(into) } {
+                    Ok(delivery) => {
+                        info!(
+                            "HARLAN: slot {} took {} byte(s) sent by slot {}",
+                            running.slot, delivery.len, delivery.from
+                        );
+                        frame.rax = delivery.len as u64;
+                        // The sender's slot, so that a message is never
+                        // one of unknown origin (ADR 0019, point 8).
+                        frame.rdx = delivery.from as u64;
+                        return;
+                    }
+                    Err(TakeError::TooLong { len }) => {
+                        error!(
+                            "HARLAN: syscall recv() offered {capacity} byte(s) for a message of {len}"
+                        );
+                        frame.rax = ERR_BAD_ARGUMENT as u64;
+                        return;
+                    }
+                    Err(TakeError::Nothing) => {
+                        // SAFETY: as above. Comes back once somebody has
+                        // written to this process's mailbox.
+                        if !unsafe { scheduler::wait_for_message() } {
+                            error!(
+                                "HARLAN: slot {} is waiting for a message nobody could send",
+                                running.slot
+                            );
+                            frame.rax = ERR_WOULD_WAIT_FOR_EVER as u64;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        Some(Call::Open) => {
+            let (ptr, len) = (frame.rdi, frame.rsi);
+            if !running.owns(ptr, len) || len > MAX_NAME {
+                error!("HARLAN: syscall open({ptr:#x}, {len}) is not a name this process owns");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: the range was just checked to be inside the pages
+            // this process was given, which are mapped in the space that
+            // is active and stay mapped while it runs.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
+            };
+            let Ok(name) = core::str::from_utf8(bytes) else {
+                error!("HARLAN: syscall open() was handed something that is not text");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            };
+            let entry = match crate::fs::find(name) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    frame.rax = number_for(&err) as u64;
+                    return;
+                }
+            };
+            // SAFETY: this runs in the syscall handler with interrupts
+            // off, and the closure neither switches nor exits.
+            let opened = unsafe {
+                scheduler::with_running(|process| {
+                    process.open_file(OpenFile { entry, position: 0 })
+                })
+            };
+            match opened.flatten() {
+                Some(descriptor) => {
+                    info!(
+                        "HARLAN: slot {} opened {} ({} byte(s)) as descriptor {}",
+                        running.slot,
+                        entry.name(),
+                        entry.size,
+                        descriptor
+                    );
+                    frame.rax = descriptor as u64;
+                }
+                None => {
+                    error!(
+                        "HARLAN: slot {} has no free descriptor for {}",
+                        running.slot,
+                        entry.name()
+                    );
+                    frame.rax = ERR_TOO_MANY_OPEN as u64;
+                }
+            }
+        }
+        Some(Call::Read) => {
+            let (descriptor, ptr, len) = (frame.rdi, frame.rsi, frame.rdx);
+            // A buffer the kernel is about to **fill**, so owning it is not
+            // enough: it has to be writable by the program too
+            // (ADR 0028, point 9).
+            if !running.owns_writable(ptr, len) || len > MAX_READ {
+                error!(
+                    "HARLAN: syscall read({descriptor}, {ptr:#x}, {len}) is not a buffer this process may be given"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // What to read, taken from the process's table before the disk
+            // is touched: the entry and the position, copied out.
+            // SAFETY: as in `open`.
+            let open = unsafe {
+                scheduler::with_running(|process| {
+                    process.open_at(descriptor as usize).map(|file| *file)
+                })
+            };
+            let Some(open) = open.flatten() else {
+                error!(
+                    "HARLAN: slot {} has no descriptor {descriptor}",
+                    running.slot
+                );
+                frame.rax = ERR_BAD_DESCRIPTOR as u64;
+                return;
+            };
+            // SAFETY: the range was checked to be inside this process's
+            // writable pages, which are mapped in the active space.
+            let into = unsafe {
+                core::slice::from_raw_parts_mut(VirtAddr::new(ptr).as_ptr::<u8>(), len as usize)
+            };
+            match crate::fs::read_at(&open.entry, open.position, into) {
+                Ok(read) => {
+                    // The position moves by exactly what was read, and
+                    // only after it has been read: a read that failed
+                    // leaves the descriptor where it was, so asking again
+                    // asks for the same bytes.
+                    // SAFETY: as in `open`.
+                    unsafe {
+                        scheduler::with_running(|process| {
+                            if let Some(file) = process.open_at(descriptor as usize) {
+                                file.position = file.position.saturating_add(read as u32);
+                            }
+                        })
+                    };
+                    frame.rax = read as u64;
+                }
+                Err(err) => frame.rax = number_for(&err) as u64,
+            }
+        }
+        Some(Call::Close) => {
+            let descriptor = frame.rdi;
+            // SAFETY: as in `open`.
+            let closed = unsafe {
+                scheduler::with_running(|process| process.close_file(descriptor as usize))
+            };
+            if closed == Some(true) {
+                frame.rax = 0;
+            } else {
+                error!(
+                    "HARLAN: slot {} closed descriptor {descriptor}, which was not open",
+                    running.slot
+                );
+                frame.rax = ERR_BAD_DESCRIPTOR as u64;
+            }
+        }
+        Some(Call::WriteFile) => {
+            let (name_ptr, name_len, data_ptr, data_len) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            if !running.owns(name_ptr, name_len) || name_len > MAX_NAME {
+                error!(
+                    "HARLAN: syscall write_file({name_ptr:#x}, {name_len}, ..) is not a name this process owns"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            if !running.owns(data_ptr, data_len) || data_len > MAX_WRITE {
+                error!(
+                    "HARLAN: syscall write_file(.., {data_ptr:#x}, {data_len}) is not bytes this process owns"
+                );
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            }
+            // SAFETY: both ranges were just checked to be inside the pages
+            // this process was given, which are mapped in the active
+            // space. Read only, so a read-only page is fine here.
+            let (name, contents) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        VirtAddr::new(name_ptr).as_ptr::<u8>(),
+                        name_len as usize,
+                    ),
+                    core::slice::from_raw_parts(
+                        VirtAddr::new(data_ptr).as_ptr::<u8>(),
+                        data_len as usize,
+                    ),
+                )
+            };
+            let Ok(name) = core::str::from_utf8(name) else {
+                error!("HARLAN: syscall write_file() was handed a name that is not text");
+                frame.rax = ERR_BAD_ARGUMENT as u64;
+                return;
+            };
+            match crate::fs::write_file(name, contents) {
+                Ok(entry) => {
+                    info!(
+                        "HARLAN: slot {} wrote {} ({} byte(s))",
+                        running.slot,
+                        entry.name(),
+                        entry.size
+                    );
+                    frame.rax = data_len;
+                }
+                Err(err) => frame.rax = number_for(&err) as u64,
+            }
         }
         None => {
             error!("HARLAN: unknown syscall {}", frame.rax);
@@ -249,87 +802,334 @@ pub fn handle(frame: &mut SyscallFrame) {
     }
 }
 
-/// Runs `program` in ring 3. Never returns: the program leaves through
-/// `exit`, which continues the kernel at `resume`.
+/// The most one `write_file` will take in a single call.
+///
+/// What `MAX_FILE_CLUSTERS` allows, which is the writer's own limit
+/// (ADR 0027): asking for more is refused here, with a number, rather than
+/// part way through the write.
+pub const MAX_WRITE: u64 =
+    harlan_hal::fat::MAX_FILE_CLUSTERS as u64 * harlan_hal::fat::SECTOR_BYTES as u64;
+
+/// A limit of zero would refuse every write, which is a way of having no
+/// `write_file` at all. Checked at compile time, because at runtime the
+/// assertion is a constant one and says nothing a build could not.
+const _: () = assert!(MAX_WRITE > 0);
+
+/// Which number a program sees for something that went wrong on the disk.
+///
+/// The translation lives here and not in `fs`, so that what happened and
+/// what a program is told about it stay separable: the log says the first
+/// and `rax` carries the second.
+fn number_for(err: &crate::fs::FileError) -> i64 {
+    use crate::fs::FileError;
+    use harlan_hal::fat::WriteError;
+    match err {
+        FileError::NoDisk => {
+            error!("HARLAN: a file was asked for and there is no disk");
+            ERR_DISK
+        }
+        FileError::BadName => ERR_BAD_ARGUMENT,
+        FileError::NoSuchFile => ERR_NO_SUCH_FILE,
+        // A directory is not a file, and a program that asked for one by
+        // name asked for something that is there and is not what it wants.
+        FileError::IsADirectory => ERR_NO_SUCH_FILE,
+        FileError::Open => ERR_FILE_IS_OPEN,
+        FileError::Reading(why) => {
+            error!("HARLAN: the disk could not be read: {why:?}");
+            ERR_DISK
+        }
+        FileError::Writing(WriteError::Full { needed, free }) => {
+            error!("HARLAN: the volume has {free} free cluster(s) and {needed} are needed");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(WriteError::TooManyClusters { needed }) => {
+            error!("HARLAN: a file of {needed} cluster(s) is more than this kernel writes");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(WriteError::DirectoryFull) => {
+            error!("HARLAN: the root directory has no slot left");
+            ERR_VOLUME_FULL
+        }
+        FileError::Writing(why) => {
+            error!("HARLAN: the disk could not be written: {why:?}");
+            ERR_DISK
+        }
+    }
+}
+
+/// What the kernel does with a fault a process caused: says whose it was
+/// and what it did, and ends it. The machine carries on
+/// (docs/adr/0020-fase3-a-fault-belongs-to-the-process.md).
 ///
 /// # Safety
 ///
-/// `syscall::init` must have run with a stack of the kernel's own, the
-/// program's pages must be mapped as `load` left them, and `resume` must
-/// be safe to call on that syscall stack.
-pub unsafe fn enter(program: Program, resume: extern "C" fn(*mut u8) -> !, argument: *mut u8) -> ! {
-    // SAFETY: single core, before any user code exists.
-    unsafe {
-        CURRENT = Some(program);
-        ON_EXIT = Some((resume, argument));
-    }
+/// Only from the interrupt path, with interrupts off, after a fault the
+/// CPU took while a process was running in ring 3.
+pub unsafe fn on_fault(fault: UserFault) -> ! {
+    // SAFETY: as this function's contract; `running` is who the CPU was
+    // running when the fault arrived.
+    let running = unsafe { scheduler::running() };
+    let Some(running) = running else {
+        // The CPU says ring 3 and the scheduler says nobody: one of the
+        // two is wrong, and neither is something to carry on over.
+        error!(
+            "HARLAN: {} came from ring 3 with no process running, at rip={:#x}",
+            fault.name, fault.rip
+        );
+        harlan_hal::CpuControl::halt_loop(&harlan_arch_x86_64::Cpu)
+    };
+    error!(
+        "HARLAN: the process in slot {} caused {} at rip={:#x} (error_code={:#x}, address={:#x}); it does not run again",
+        running.slot, fault.name, fault.rip, fault.error_code, fault.address
+    );
+    // SAFETY: as this function's contract, and this process is the one
+    // the scheduler has running.
+    unsafe { scheduler::fault_current() }
+}
+
+/// Runs `process` in ring 3, in its own address space. Never returns: it
+/// leaves through `exit` or through a fault, and either way the CPU goes
+/// to whoever is next.
+///
+/// # Safety
+///
+/// `syscall::init` must have run with a stack of the kernel's own, and
+/// `process` must be one `spawn` built, in the slot the scheduler is
+/// running.
+pub unsafe fn enter(process: &'static Process) -> ! {
     harlan_arch_x86_64::syscall::set_handler(handle);
     info!(
-        "HARLAN: entering ring 3 at {:#x} with a stack at {:#x}",
-        PROGRAM_BASE, STACK_TOP
+        "HARLAN: entering ring 3 at {:#x} with a stack at {:#x}, in the space at {:#x}",
+        process.entry(),
+        process.stack_top(),
+        process.space.root()
     );
-    // SAFETY: the pages are mapped for ring 3 by `load`, the stack top is
-    // page-aligned, and the syscall path is set up (the caller's
-    // contract).
-    unsafe { harlan_arch_x86_64::user::enter(PROGRAM_BASE.as_u64(), STACK_TOP.as_u64()) }
+    // SAFETY: the kernel runs in the higher half, which this space shares,
+    // and holds no pointer into the lower half of the one it is leaving.
+    unsafe { process.activate() };
+    // SAFETY: the pages are mapped for ring 3 in the space just made
+    // active, the stack top is page-aligned, and the syscall path is set
+    // up (the caller's contract).
+    unsafe {
+        harlan_arch_x86_64::user::enter(process.entry().as_u64(), process.stack_top().as_u64())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harlan_hal::addr::PhysAddr;
+    use harlan_hal::frame::PhysRange;
 
-    fn program_at(base: u64) -> Program {
-        Program {
-            code: PhysRange::new(PhysAddr::new(base), PAGE_SIZE),
-            stack: PhysRange::new(PhysAddr::new(base + 0x10_0000), PAGE_SIZE),
+    /// Reads a `disp32` or `imm32` out of the program.
+    fn four_bytes_at(program: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([
+            program[at],
+            program[at + 1],
+            program[at + 2],
+            program[at + 3],
+        ])
+    }
+
+    /// The hand-assembled bytes have to mean what the comment says: both
+    /// `lea`s have to land on the message, the lengths have to match it,
+    /// and the badge has to be where the kernel writes it.
+    #[test]
+    fn the_talker_points_at_its_own_message() {
+        let program = talker_program(b'7');
+        // `lea rdi, [rip + disp]`, and rip is past the instruction.
+        let target_of =
+            |at: usize, end: usize| (end as u32).wrapping_add(four_bytes_at(&program, at));
+        assert_eq!(target_of(8, 12), TALK_AT as u32, "the first log");
+        assert_eq!(target_of(34, 38), TALK_AT as u32, "the second");
+        for at in [13, 39] {
+            assert_eq!(four_bytes_at(&program, at) as usize, TALK.len());
+        }
+
+        // The three syscalls, in the order the comment claims, and the
+        // trap after them.
+        assert_eq!(program[1], Call::Log as u8);
+        assert_eq!(program[20], Call::Yield as u8);
+        assert_eq!(program[27], Call::Log as u8);
+        assert_eq!(program[46], Call::Exit as u8);
+        for at in [17, 24, 43, 55] {
+            assert_eq!(
+                (program[at], program[at + 1]),
+                (0x0F, 0x05),
+                "syscall at {at}"
+            );
+        }
+        assert_eq!((program[57], program[58]), (0x0F, 0x0B), "ud2");
+
+        // The badge is inside the message, and nothing else moved.
+        assert_eq!(program[BADGE_AT], b'7');
+        let message = core::str::from_utf8(&program[TALK_AT as usize..]).unwrap();
+        assert_eq!(
+            message,
+            "HARLAN: process 7 speaking
+"
+        );
+        assert_ne!(
+            talker_program(b'1')[BADGE_AT],
+            talker_program(b'2')[BADGE_AT]
+        );
+    }
+
+    /// The sender's message has to be one a mailbox can hold, its `lea`
+    /// has to land on it, and the slot it names has to be the one it was
+    /// built for.
+    #[test]
+    fn the_sender_points_at_a_message_a_mailbox_can_hold() {
+        let program = sender_program(2);
+        assert!(
+            MESSAGE.len() <= ipc::CAPACITY,
+            "a message longer than a mailbox would never be sent"
+        );
+        assert_eq!(program[1], Call::Send as u8);
+        assert_eq!(program[6], 2, "the slot it was aimed at");
+        assert_eq!(sender_program(5)[6], 5);
+
+        // `lea rsi, [rip + disp]` at 10, four bytes of displacement at 13,
+        // rip past the instruction at 17.
+        assert_eq!(
+            17 + four_bytes_at(&program, 13) as usize,
+            MESSAGE_AT as usize
+        );
+        assert_eq!(four_bytes_at(&program, 18) as usize, MESSAGE.len());
+        assert_eq!(
+            core::str::from_utf8(&program[MESSAGE_AT as usize..]).unwrap(),
+            MESSAGE
+        );
+
+        // The retry: what it compares against has to be the error the
+        // kernel actually returns for a full mailbox, and the two jumps
+        // have to land where the comment says.
+        assert_eq!(&program[24..27], &[0x48, 0x83, 0xF8], "cmp rax, imm8");
+        assert_eq!(program[27] as i8 as i64, ERR_MAILBOX_FULL);
+        assert_eq!(program[28], 0x75, "jne");
+        assert_eq!(30 + program[29] as usize, 39, "past the retry, to the exit");
+        assert_eq!(program[31], Call::Yield as u8);
+        assert_eq!(program[37], 0xEB, "jmp");
+        assert_eq!(
+            39i32 + program[38] as i8 as i32,
+            0,
+            "back to the top, to send again"
+        );
+        assert_eq!(program[40], Call::Exit as u8);
+        assert_eq!((program[51], program[52]), (0x0F, 0x0B), "ud2");
+    }
+
+    /// The receiver has to ask for the message to be put in memory it
+    /// owns and can be written to — its stack, never its read-only code.
+    #[test]
+    fn the_receiver_asks_for_the_message_in_its_own_stack() {
+        let program = receiver_program();
+        assert_eq!(program[1], Call::Recv as u8);
+        assert_eq!(program[21], Call::Log as u8);
+        assert_eq!(&program[32..35], &[0x48, 0x89, 0xD7], "mov rdi, rdx");
+        assert_eq!(program[36], Call::Exit as u8);
+
+        let buffer = four_bytes_at(&program, 6);
+        assert_eq!(buffer, four_bytes_at(&program, 26), "the same both times");
+        assert_eq!(u64::from(buffer), STACK_BASE.as_u64(), "its stack page");
+        assert!(
+            u64::from(buffer) + ipc::CAPACITY as u64 <= STACK_TOP.as_u64(),
+            "and the whole buffer inside it"
+        );
+        assert_ne!(
+            u64::from(buffer),
+            PROGRAM_BASE.as_u64(),
+            "the code page is read-only: the kernel could not write there"
+        );
+
+        // It asks for no more than a mailbox holds, and logs exactly what
+        // arrived rather than the whole buffer.
+        assert_eq!(four_bytes_at(&program, 11) as usize, ipc::CAPACITY);
+        assert_eq!(&program[17..20], &[0x48, 0x89, 0xC6], "mov rsi, rax");
+        for at in [15, 30, 40] {
+            assert_eq!(
+                (program[at], program[at + 1]),
+                (0x0F, 0x05),
+                "syscall at {at}"
+            );
+        }
+        assert_eq!((program[42], program[43]), (0x0F, 0x0B), "ud2");
+    }
+
+    /// The trespassers have to trespass: each one has to aim at the thing
+    /// it is named for, or the boot would prove nothing.
+    #[test]
+    fn the_trespassers_aim_where_they_claim() {
+        let kernel_address = 0xFFFF_8180_0000_1234u64;
+        let reader = reads_kernel_memory(kernel_address);
+        assert_eq!(&reader[0..2], &[0x48, 0xB8], "movabs rax, imm64");
+        assert_eq!(
+            u64::from_le_bytes(reader[2..10].try_into().unwrap()),
+            kernel_address
+        );
+        assert_eq!(&reader[10..13], &[0x48, 0x8B, 0x00], "mov rax, [rax]");
+        assert!(
+            kernel_address >= 0xFFFF_8000_0000_0000,
+            "the higher half, which is the kernel's"
+        );
+
+        let writer = writes_its_own_code();
+        assert_eq!(
+            four_bytes_at(&writer, 1) as u64,
+            PROGRAM_BASE.as_u64(),
+            "its own code page, which is read-only"
+        );
+        assert_eq!(&writer[5..8], &[0xC6, 0x07, 0x42], "mov byte [rdi], 0x42");
+
+        let jumper = runs_its_own_stack();
+        assert_eq!(
+            four_bytes_at(&jumper, 1) as u64,
+            STACK_BASE.as_u64(),
+            "its own stack, which is not executable"
+        );
+        assert_eq!(&jumper[5..8], &[0xC6, 0x07, 0xC3], "writes a `ret` there");
+        assert_eq!(&jumper[8..10], &[0xFF, 0xE7], "jmp rdi");
+
+        let liar = lies_about_a_pointer(kernel_address);
+        assert_eq!(liar[1], Call::Log as u8);
+        assert_eq!(
+            u64::from_le_bytes(liar[7..15].try_into().unwrap()),
+            kernel_address,
+            "the pointer it hands the kernel"
+        );
+        assert_eq!(four_bytes_at(&liar, 16), 8, "and how much of it");
+        assert_eq!(&liar[22..25], &[0x48, 0x89, 0xC7], "mov rdi, rax");
+        assert_eq!(&liar[25..28], &[0x48, 0xF7, 0xDF], "neg rdi");
+        assert_eq!(liar[29], Call::Exit as u8, "and it lives to exit");
+
+        // The three that fault end in `ud2`: if the CPU ever got there,
+        // the attempt had succeeded and the log would say so loudly.
+        for (program, name) in [
+            (&reader[..], "reader"),
+            (&writer[..], "writer"),
+            (&jumper[..], "jumper"),
+        ] {
+            let end = program.len();
+            assert_eq!(
+                (program[end - 2], program[end - 1]),
+                (0x0F, 0x0B),
+                "{name} ends in ud2"
+            );
         }
     }
 
-    /// The hand-assembled bytes have to mean what the comment says: the
-    /// `lea` has to land on the message and the length has to match it.
-    #[test]
-    fn the_program_points_at_its_own_message() {
-        let displacement = i32::from_le_bytes([PROGRAM[8], PROGRAM[9], PROGRAM[10], PROGRAM[11]]);
-        // `lea rdi, [rip + disp]`, and rip is the end of that instruction.
-        let target = 12 + displacement;
-        assert_eq!(target as usize, MESSAGE_AT as usize);
-        let length = u32::from_le_bytes([PROGRAM[13], PROGRAM[14], PROGRAM[15], PROGRAM[16]]);
-        assert_eq!(length as usize, MESSAGE.len());
-        assert_eq!(
-            &PROGRAM[MESSAGE_AT as usize..MESSAGE_AT as usize + MESSAGE.len()],
-            MESSAGE.as_bytes()
-        );
-        // Both syscalls are there, and the trap after them.
-        assert_eq!((PROGRAM[17], PROGRAM[18]), (0x0F, 0x05));
-        assert_eq!((PROGRAM[29], PROGRAM[30]), (0x0F, 0x05));
-        assert_eq!((PROGRAM[31], PROGRAM[32]), (0x0F, 0x0B));
-        assert_eq!(PROGRAM[20], Call::Exit as u8);
-        assert_eq!(PROGRAM[1], Call::Log as u8);
+    /// A `Running`'s ranges are as many as a process may own; a test that
+    /// cares about one fills them all with it.
+    fn filled_with(range: PhysRange) -> [PhysRange; crate::process::MAX_RANGES] {
+        [range; crate::process::MAX_RANGES]
     }
 
-    /// Everything that arrives from ring 3 is checked against what the
-    /// program was given, and nothing else.
-    #[test]
-    fn a_pointer_is_only_good_if_it_is_the_program_s_own() {
-        let program = program_at(0x40_0000);
-        assert!(program.owns(0x40_0000, 1));
-        assert!(program.owns(0x40_0000, PAGE_SIZE));
-        assert!(program.owns(0x50_0000, PAGE_SIZE));
-
-        assert!(!program.owns(0x40_0000, PAGE_SIZE + 1), "past the page");
-        assert!(!program.owns(0x3F_FFFF, 2), "starts below it");
-        assert!(!program.owns(0x40_0000, 0), "nothing at all");
-        assert!(!program.owns(u64::MAX, 1), "would wrap");
-        assert!(!program.owns(0xFFFF_8000_0000_0000, 8), "the kernel's");
-        assert!(!program.owns(0x45_0000, 8), "the gap between the two");
-    }
-
-    fn frame_for(call: Call, ptr: u64, len: u64) -> SyscallFrame {
+    fn frame_for(call: Call, rdi: u64, rsi: u64, rdx: u64) -> SyscallFrame {
         SyscallFrame {
             rax: call as u64,
-            rdi: ptr,
-            rsi: len,
-            rdx: 0,
+            rdi,
+            rsi,
+            rdx,
             r10: 0,
             r8: 0,
             r9: 0,
@@ -338,56 +1138,253 @@ mod tests {
         }
     }
 
-    /// The handler reads what the program points at only after checking
-    /// the pointer is the program's. The bad pointer here is one that
-    /// would kill the test process if it were followed.
-    #[test]
-    fn log_reads_the_program_s_memory_and_refuses_anything_else() {
-        let text = b"hello from a test
-";
-        let program = Program {
-            code: PhysRange::new(PhysAddr::new(text.as_ptr() as u64), text.len() as u64),
-            stack: PhysRange::new(PhysAddr::new(0), 0),
-        };
-        // SAFETY: single-threaded test; nothing else reads this.
-        unsafe { CURRENT = Some(program) };
-
-        let mut good = frame_for(Call::Log, text.as_ptr() as u64, text.len() as u64);
-        handle(&mut good);
-        assert_eq!(good.rax, text.len() as u64);
-
-        for (ptr, len) in [
-            (0x1u64, 8u64),                // nowhere near the program
-            (text.as_ptr() as u64, 4096),  // starts right, runs past
-            (text.as_ptr() as u64 - 1, 2), // starts just before
-            (u64::MAX, 8),                 // would wrap
-            (text.as_ptr() as u64, 0),     // nothing at all
-        ] {
-            let mut bad = frame_for(Call::Log, ptr, len);
-            handle(&mut bad);
-            assert_eq!(
-                bad.rax as i64, ERR_BAD_ARGUMENT,
-                "log({ptr:#x}, {len}) must be refused without being read"
-            );
+    /// A process whose memory is this test's own, so that a pointer the
+    /// kernel accepts can actually be read on the host.
+    fn running_on(buffer: &mut [u8]) -> Running {
+        let range = PhysRange::new(PhysAddr::new(buffer.as_ptr() as u64), buffer.len() as u64);
+        Running {
+            slot: 0,
+            ranges: filled_with(range),
+            // The test's buffer is the test's to write. A process whose
+            // code is not writable is the subject of its own tests.
+            writable: filled_with(range),
         }
+    }
 
-        let mut unknown = frame_for(Call::Log, 0, 0);
-        unknown.rax = 99;
-        handle(&mut unknown);
-        assert_eq!(unknown.rax as i64, ERR_UNKNOWN_CALL);
+    /// The programs carry addresses; the mapping that makes those
+    /// addresses real is decided in `process`. If the two ever disagreed,
+    /// the receiver would ask the kernel to write where it has nothing.
+    #[test]
+    fn the_programs_and_the_mapping_agree_on_where_things_are() {
+        assert_eq!(PROGRAM_BASE, crate::process::CODE_BASE);
+        assert_eq!(STACK_BASE, crate::process::STACK_BASE);
+        assert_eq!(STACK_TOP, crate::process::STACK_TOP);
+        assert_eq!(u64::from(RECEIVE_BUFFER), STACK_BASE.as_u64());
+    }
 
-        // SAFETY: as above.
-        unsafe { CURRENT = None };
-        let mut orphan = frame_for(Call::Log, text.as_ptr() as u64, text.len() as u64);
-        handle(&mut orphan);
-        assert_eq!(orphan.rax as i64, ERR_UNKNOWN_CALL, "no program is running");
+    /// With no process running, a syscall is refused rather than
+    /// answered with something that reads as success.
+    #[test]
+    fn a_syscall_with_no_process_running_is_refused() {
+        // The scheduler has handed the CPU to nobody, which is the state
+        // a host test finds it in.
+        let mut frame = frame_for(Call::Log, 0x1000, 8, 0);
+        handle(&mut frame);
+        assert_eq!(frame.rax as i64, ERR_UNKNOWN_CALL);
     }
 
     #[test]
     fn only_the_calls_of_this_abi_exist() {
         assert_eq!(Call::from(0), Some(Call::Log));
         assert_eq!(Call::from(1), Some(Call::Exit));
-        assert_eq!(Call::from(2), None);
+        assert_eq!(Call::from(2), Some(Call::Yield));
+        assert_eq!(Call::from(3), Some(Call::Send));
+        assert_eq!(Call::from(4), Some(Call::Recv));
+        assert_eq!(Call::from(5), Some(Call::Open));
+        assert_eq!(Call::from(6), Some(Call::Read));
+        assert_eq!(Call::from(7), Some(Call::Close));
+        assert_eq!(Call::from(8), Some(Call::WriteFile));
+        assert_eq!(Call::from(9), None);
         assert_eq!(Call::from(u64::MAX), None);
+        // The numbers are the ABI (ADR 0028, point 3), so they are
+        // asserted and not derived: a renumbering that a program does not
+        // hear about is a program calling something else.
+        assert_eq!(Call::Open as u64, 5);
+        assert_eq!(Call::Read as u64, 6);
+        assert_eq!(Call::Close as u64, 7);
+        assert_eq!(Call::WriteFile as u64, 8);
+    }
+
+    /// Every pointer that arrives from ring 3 is refused before a byte of
+    /// it is read. The addresses here are not this test's memory, so a
+    /// check that let them through would crash the test rather than pass
+    /// it.
+    #[test]
+    fn a_pointer_that_is_not_the_process_s_own_is_refused_unread() {
+        let mut buffer = *b"a message that is this test's own memory";
+        let running = running_on(&mut buffer);
+        let elsewhere = 0x0040_0000;
+
+        for call in [Call::Log, Call::Recv] {
+            let mut frame = frame_for(call, elsewhere, 8, 0);
+            serve(&mut frame, running);
+            assert_eq!(frame.rax as i64, ERR_BAD_ARGUMENT, "{call:?}");
+        }
+        let mut frame = frame_for(Call::Send, 1, elsewhere, 8);
+        serve(&mut frame, running);
+        assert_eq!(frame.rax as i64, ERR_BAD_ARGUMENT, "send");
+    }
+
+    /// A message longer than a mailbox is refused before anything is
+    /// copied, and so is one of nothing at all.
+    #[test]
+    fn a_message_a_mailbox_could_not_hold_is_refused() {
+        let mut buffer = [7u8; ipc::CAPACITY * 2];
+        let running = running_on(&mut buffer);
+        let mine = buffer.as_ptr() as u64;
+
+        let mut frame = frame_for(Call::Send, 1, mine, ipc::CAPACITY as u64 + 1);
+        serve(&mut frame, running);
+        assert_eq!(frame.rax as i64, ERR_BAD_ARGUMENT, "longer than a mailbox");
+
+        // A length of zero is not memory this process owns either, which
+        // is the same refusal by a different route.
+        let mut frame = frame_for(Call::Send, 1, mine, 0);
+        serve(&mut frame, running);
+        assert_eq!(frame.rax as i64, ERR_BAD_ARGUMENT, "nothing at all");
+
+        // Exactly a mailbox's worth is not too long: it gets as far as
+        // the slot, and is refused for the slot's sake instead.
+        let mut frame = frame_for(Call::Send, 1, mine, ipc::CAPACITY as u64);
+        serve(&mut frame, running);
+        assert_eq!(
+            frame.rax as i64, ERR_NO_SUCH_PROCESS,
+            "exactly full is a message, and there is nobody in slot 1"
+        );
+    }
+
+    /// Sending to a slot where there is no process is an error, not a
+    /// message that goes nowhere quietly. With an empty scheduler, every
+    /// slot is such a slot.
+    #[test]
+    fn sending_to_nobody_says_so() {
+        let mut buffer = *b"a short message";
+        let running = running_on(&mut buffer);
+        let mine = buffer.as_ptr() as u64;
+
+        for to in [0, 1, MAX_SLOT_TRIED] {
+            let mut frame = frame_for(Call::Send, to, mine, buffer.len() as u64);
+            serve(&mut frame, running);
+            assert_eq!(frame.rax as i64, ERR_NO_SUCH_PROCESS, "slot {to}");
+        }
+    }
+
+    /// Well past the last slot, to check that a number from ring 3 cannot
+    /// reach past the array.
+    const MAX_SLOT_TRIED: u64 = u64::MAX;
+
+    /// Waiting for a message nobody could ever send is an error the
+    /// process is told about, not a machine that stops.
+    #[test]
+    fn waiting_for_a_message_nobody_could_send_is_an_error() {
+        let mut buffer = [0u8; ipc::CAPACITY];
+        let running = running_on(&mut buffer);
+        let mut frame = frame_for(Call::Recv, buffer.as_ptr() as u64, ipc::CAPACITY as u64, 0);
+        serve(&mut frame, running);
+        assert_eq!(frame.rax as i64, ERR_WOULD_WAIT_FOR_EVER);
+    }
+
+    // -----------------------------------------------------------------
+    // What a program is told about a file (ADR 0028, point 13)
+    // -----------------------------------------------------------------
+
+    /// Every way a file operation can fail maps to a number, each number
+    /// is negative, and the ones that mean different things are different.
+    ///
+    /// Asserted rather than derived: these numbers are the ABI, and a
+    /// program compiled against one of them and served another is a program
+    /// that mistakes "no such file" for "the disk is broken".
+    #[test]
+    fn every_file_failure_has_its_own_number() {
+        use crate::fs::FileError;
+        use harlan_hal::fat::{VolumeError, WriteError};
+
+        assert_eq!(number_for(&FileError::BadName), ERR_BAD_ARGUMENT);
+        assert_eq!(number_for(&FileError::NoSuchFile), ERR_NO_SUCH_FILE);
+        assert_eq!(number_for(&FileError::Open), ERR_FILE_IS_OPEN);
+        assert_eq!(number_for(&FileError::NoDisk), ERR_DISK);
+        // A directory is something that is there and is not what was
+        // asked for, which from a program's side is the same as absent.
+        assert_eq!(number_for(&FileError::IsADirectory), ERR_NO_SUCH_FILE);
+        // Running out of room is its own answer, not a broken disk: a
+        // program can do something about one and not the other.
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::Full { needed: 4, free: 1 })),
+            ERR_VOLUME_FULL
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::TooManyClusters {
+                needed: 999
+            })),
+            ERR_VOLUME_FULL
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::DirectoryFull)),
+            ERR_VOLUME_FULL
+        );
+        // Anything the medium did is a disk error.
+        assert_eq!(
+            number_for(&FileError::Reading(VolumeError::ChainLoops)),
+            ERR_DISK
+        );
+        assert_eq!(
+            number_for(&FileError::Writing(WriteError::Reading(
+                VolumeError::BadCluster { cluster: 7 }
+            ))),
+            ERR_DISK
+        );
+    }
+
+    /// Nothing an error maps to is mistakable for a result.
+    ///
+    /// `rax` carries both: a count of bytes, or a negative number. A
+    /// failure that mapped to zero or more would be read as "no bytes" or
+    /// as a descriptor, and a program would carry on with it.
+    #[test]
+    fn no_file_error_can_be_mistaken_for_an_answer() {
+        for number in [
+            ERR_BAD_DESCRIPTOR,
+            ERR_TOO_MANY_OPEN,
+            ERR_NO_SUCH_FILE,
+            ERR_FILE_IS_OPEN,
+            ERR_VOLUME_FULL,
+            ERR_DISK,
+        ] {
+            assert!(number < 0, "{number} would be read as a result");
+        }
+        // And none of them is any of the others, nor any of the five that
+        // came before: the whole set is distinct.
+        let all = [
+            ERR_UNKNOWN_CALL,
+            ERR_BAD_ARGUMENT,
+            ERR_MAILBOX_FULL,
+            ERR_NO_SUCH_PROCESS,
+            ERR_WOULD_WAIT_FOR_EVER,
+            ERR_BAD_DESCRIPTOR,
+            ERR_TOO_MANY_OPEN,
+            ERR_NO_SUCH_FILE,
+            ERR_FILE_IS_OPEN,
+            ERR_VOLUME_FULL,
+            ERR_DISK,
+        ];
+        for (at, one) in all.iter().enumerate() {
+            for other in &all[at + 1..] {
+                assert_ne!(one, other, "two errors share a number");
+            }
+        }
+    }
+
+    /// The limits a file call refuses before it does any work.
+    ///
+    /// A name longer than the format can hold, and a read or write bigger
+    /// than this kernel will do inside one syscall. Each is a number a
+    /// program can be told rather than a surprise part of the way through.
+    #[test]
+    fn the_limits_of_a_file_call_are_what_the_format_and_the_writer_allow() {
+        // Eight, a dot and three.
+        assert_eq!(MAX_NAME, 12);
+        assert!(harlan_hal::fat::encode_name("ABCDEFGH.IJK").is_some());
+        assert!(
+            harlan_hal::fat::encode_name("ABCDEFGHI.JKL").is_none(),
+            "one longer than MAX_NAME is not a name the format holds"
+        );
+        // A read fits in a page, so one call is bounded work.
+        assert_eq!(MAX_READ, 4096);
+        // And a write is what the writer itself allows, not a number
+        // invented here (ADR 0027).
+        assert_eq!(
+            MAX_WRITE,
+            harlan_hal::fat::MAX_FILE_CLUSTERS as u64 * harlan_hal::fat::SECTOR_BYTES as u64
+        );
     }
 }

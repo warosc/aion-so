@@ -70,15 +70,23 @@ pub enum FramePurpose {
     Stack = 4,
     /// Anything else the kernel keeps.
     Kernel = 5,
+    /// Memory a device can read and write by itself. Its own purpose
+    /// because it is the most dangerous kind there is: a frame the
+    /// hardware may write must never end up being a page table or a
+    /// stack, and the purpose is what makes confusing them an error
+    /// instead of a silent disaster
+    /// (docs/adr/0024-fase4-dma-and-the-queue.md).
+    Dma = 6,
 }
 
 impl FramePurpose {
-    pub const ALL: [FramePurpose; 5] = [
+    pub const ALL: [FramePurpose; 6] = [
         FramePurpose::Boot,
         FramePurpose::PageTable,
         FramePurpose::Heap,
         FramePurpose::Stack,
         FramePurpose::Kernel,
+        FramePurpose::Dma,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -88,6 +96,7 @@ impl FramePurpose {
             FramePurpose::Heap => "heap",
             FramePurpose::Stack => "stacks",
             FramePurpose::Kernel => "kernel",
+            FramePurpose::Dma => "device memory",
         }
     }
 
@@ -98,6 +107,7 @@ impl FramePurpose {
             3 => Some(FramePurpose::Heap),
             4 => Some(FramePurpose::Stack),
             5 => Some(FramePurpose::Kernel),
+            6 => Some(FramePurpose::Dma),
             _ => None,
         }
     }

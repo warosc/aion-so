@@ -60,6 +60,19 @@ pub const KERNEL_RUNTIME_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 5 *
 /// (docs/adr/0012-fase3-higher-half-kernel.md).
 pub const KERNEL_IMAGE_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 3 * (1 << 39));
 
+/// Where the registers of a device are mapped: PML4 slot 262. A device
+/// register at physical `p` is reached at `KERNEL_DEVICES_START + p`, the
+/// same one addition as the physical window and the runtime services.
+///
+/// It is a region of its own because of how it has to be mapped, not
+/// because of where it points: **uncacheable**, and never executable. A
+/// register read from a cache is a register that was not read, and one
+/// written late is an order the device has not received. The physical
+/// window next door describes RAM and is cacheable, and mixing the two
+/// policies in one region would be a map that says one thing and means
+/// two (docs/adr/0023-fase4-device-registers.md).
+pub const KERNEL_DEVICES_START: VirtAddr = VirtAddr::new(KERNEL_SPACE_BASE + 6 * (1 << 39));
+
 const ENTRIES: usize = 512;
 const PAGE: u64 = 4096;
 const LARGE_PAGE: u64 = 2 * 1024 * 1024;
@@ -574,6 +587,88 @@ impl<A: TableAccess> PageTables<A> {
         Ok(tables)
     }
 
+    /// A new tree of tables for a process: an empty lower half and this
+    /// one's higher half, shared by reference.
+    fn new_process_space(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<PageTables<A>, MapError>
+    where
+        A: Clone,
+    {
+        let root = self.new_table(frames)?;
+        for slot in table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES {
+            let entry = self.access.read(self.root, slot);
+            self.access.write(root, slot, entry);
+        }
+        Ok(PageTables {
+            root,
+            access: self.access.clone(),
+        })
+    }
+
+    /// Gives back the table frames of the lower half, and the root, and
+    /// answers how many `give_back` accepted.
+    ///
+    /// Three things it deliberately does not free:
+    ///
+    /// - **The kernel's tables.** Every space's entries at and above
+    ///   `KERNEL_SPACE_BASE` point at the same tables, copied by reference
+    ///   (ADR 0017). Freeing one would unmap the kernel from every other
+    ///   space, including the one the CPU is walking.
+    /// - **What a leaf entry points at.** That is somebody's memory, and
+    ///   whoever handed it out hands it back. A large-page entry in the
+    ///   lower half is such a leaf and has no table below it, so the walk
+    ///   stops there.
+    /// - **Anything, if `give_back` says no.** The count is what really
+    ///   came back, so a caller that refuses a frame — because it was
+    ///   never a page table, say — can see that it did.
+    ///
+    /// The lower-half entries of the root are cleared as they go, so a
+    /// frame that is handed out again cannot be read as a table tree by
+    /// anything that still has the root's address.
+    fn free_lower_half(&mut self, give_back: &mut dyn FnMut(PhysFrame) -> bool) -> u64 {
+        let mut freed = 0;
+        let mut hand_back = |addr: u64| {
+            // `ADDRESS_MASK` has already cleared the low twelve bits, so
+            // `containing_address` rounds nothing down here: it is the
+            // frame at that very address, named in the type that says so.
+            if give_back(PhysFrame::containing_address(PhysAddr::new(addr))) {
+                freed += 1;
+            }
+        };
+        for slot in 0..table_indices(KERNEL_SPACE_BASE)[0] {
+            let entry = self.access.read(self.root, slot);
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let directory_pointers = entry & ADDRESS_MASK;
+            for index in 0..ENTRIES {
+                let entry = self.access.read(directory_pointers, index);
+                // A 1 GiB page is a leaf: no table under it to free.
+                if entry & PRESENT == 0 || entry & HUGE != 0 {
+                    continue;
+                }
+                let directory = entry & ADDRESS_MASK;
+                for index in 0..ENTRIES {
+                    let entry = self.access.read(directory, index);
+                    // And a 2 MiB page is a leaf too.
+                    if entry & PRESENT == 0 || entry & HUGE != 0 {
+                        continue;
+                    }
+                    // Whatever the page table's own entries point at is
+                    // the process's memory, not this walk's business.
+                    hand_back(entry & ADDRESS_MASK);
+                }
+                hand_back(directory);
+            }
+            hand_back(directory_pointers);
+            self.access.write(self.root, slot, 0);
+        }
+        hand_back(self.root);
+        freed
+    }
+
     /// A zeroed page table in a fresh frame. Tables are written through
     /// their physical address, so a frame that address does not reach
     /// writably is refused (and not returned to `frames`, which has no way
@@ -604,6 +699,7 @@ impl<A: TableAccess> PageTables<A> {
 /// the active root or new tables `new_table` verified identity-mapped and
 /// writable, with indices below 512, and only ever writes the kernel's own
 /// tables (the host tests check that no firmware table is written).
+#[derive(Clone)]
 struct PhysAccess {
     /// A table at physical address `p` is reached at `base + p`. Zero
     /// while the firmware's identity map is what the kernel runs under;
@@ -657,6 +753,84 @@ impl TableAccess for PhysAccess {
         unsafe {
             asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags));
         }
+    }
+}
+
+/// A process's page tables: the kernel's higher half, shared, and a
+/// lower half of its own.
+///
+/// The kernel's entries are **copied, not rebuilt**: both roots point at
+/// the same tables, so anything the kernel maps afterwards is visible from
+/// every process and its memory stays its own
+/// (docs/adr/0017-fase3-process-address-space.md).
+pub struct AddressSpace {
+    tables: PageTables<PhysAccess>,
+}
+
+impl AddressSpace {
+    /// Maps one page of this process's memory.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must be free for this process to own, and `page` must be in
+    /// the lower half and unused in this space. `flags.user` decides
+    /// whether ring 3 can reach it, and `map` refuses the mismatch.
+    pub unsafe fn map(
+        &mut self,
+        page: Page,
+        frame: PhysFrame,
+        flags: PageFlags,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<(), MapError> {
+        self.tables
+            .map(page.start_address().as_u64(), frame, flags, frames)
+    }
+
+    /// What `addr` resolves to in this space, if anything.
+    pub fn translate(&self, addr: VirtAddr) -> Option<PhysAddr> {
+        self.tables
+            .translate(addr.as_u64())
+            .map(|t| PhysAddr::new(t.phys))
+    }
+
+    /// Gives back every table frame this space owns — the lower half's and
+    /// the root's — and answers how many came back.
+    ///
+    /// The memory the process was given is not among them: those frames
+    /// are handed back by whoever handed them out, and `give_back` is what
+    /// enforces the difference, by refusing a frame that was never a page
+    /// table.
+    ///
+    /// Until this existed, four frames per process stayed held for as long
+    /// as the machine ran — the debt ADR 0018 named in its point 7, and
+    /// where it said five (docs/adr/0021-fase3-reclaiming-a-dead-space.md
+    /// has the measurement).
+    ///
+    /// # Safety
+    ///
+    /// This space must not be the one the CPU is walking, and nothing may
+    /// use it again: its root is gone and its lower half is unmapped.
+    pub unsafe fn destroy(&mut self, give_back: &mut dyn FnMut(PhysFrame) -> bool) -> u64 {
+        self.tables.free_lower_half(give_back)
+    }
+
+    /// The physical address of this space's root, which is what CR3 holds.
+    pub fn root(&self) -> u64 {
+        self.tables.root
+    }
+
+    /// Makes this the space the CPU walks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be running in the higher half, which every space
+    /// shares, and must not be using anything of the lower half of the
+    /// space it is leaving. The stack, the heap and the kernel's image all
+    /// qualify; a pointer into a process's memory does not.
+    pub unsafe fn activate(&self) {
+        // SAFETY: loading CR3 with the root of a table tree that contains
+        // this very code in its higher half.
+        unsafe { write_cr3(self.tables.root) };
     }
 }
 
@@ -746,6 +920,40 @@ impl KernelPageTable {
     /// Physical address of the kernel's root table (PML4).
     pub fn root(&self) -> u64 {
         self.tables.root
+    }
+
+    /// A space for a process: an empty lower half, and the kernel's higher
+    /// half shared with this one.
+    ///
+    /// # Safety
+    ///
+    /// The kernel must own its tables and reach frames through its own
+    /// window, and `frames` must hand out memory nobody else has.
+    pub unsafe fn new_address_space(
+        &mut self,
+        frames: &mut dyn FrameAllocator,
+    ) -> Result<AddressSpace, PagingError> {
+        // The higher half by reference: the same tables, so what the
+        // kernel maps later is there without anyone copying anything.
+        let tables = self
+            .tables
+            .new_process_space(frames)
+            .map_err(|err| match err {
+                MapError::OutOfFrames => PagingError::OutOfFrames,
+                _ => PagingError::TableFrameNotWritable,
+            })?;
+        Ok(AddressSpace { tables })
+    }
+
+    /// Goes back to the kernel's own space.
+    ///
+    /// # Safety
+    ///
+    /// As `AddressSpace::activate`.
+    pub unsafe fn activate(&self) {
+        // SAFETY: the kernel's own root, which every process's space
+        // shares the higher half of.
+        unsafe { write_cr3(self.tables.root) };
     }
 
     /// Replaces the firmware's identity map with one built from the
@@ -894,7 +1102,7 @@ mod tests {
     /// Simulated physical memory holding page tables. Reading a frame that
     /// holds no table fails the test (the walker must never read
     /// non-table memory), and so does writing a firmware table.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeMemory {
         /// What the walker adds to a table's physical address, as the
         /// kernel's window does once the lower half is gone.
@@ -981,6 +1189,176 @@ mod tests {
 
     fn frame(addr: u64) -> PhysFrame {
         PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap()
+    }
+
+    /// The kernel as it is from Incremento 17 on: its tables reached
+    /// through the physical window, the lower half empty. A process space
+    /// can only be built on top of this — a fresh space has no identity
+    /// map, so a new table of its own is reachable only through the
+    /// window, which every space shares (ADR 0013).
+    fn kernel_through_its_window(frames: &mut Frames) -> PageTables<FakeMemory> {
+        let mut kernel = adopted(frames);
+        let window = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        kernel
+            .map_physical_window(frames, window, GIB)
+            .expect("the window");
+        kernel.access.window = window;
+        kernel
+            .keep_only(frames, &[])
+            .expect("emptying the lower half");
+        kernel
+    }
+
+    /// A process's space gives back exactly the tables it took, and not
+    /// one of the kernel's — which every space shares, so freeing one
+    /// would unmap the kernel from everybody.
+    #[test]
+    fn a_dead_space_gives_back_its_tables_and_none_of_the_kernel_s() {
+        let mut frames = Frames((0x40_0000..0x44_0000).step_by(PAGE as usize).collect());
+        let mut kernel = kernel_through_its_window(&mut frames);
+        // Something of the kernel's, so the higher half has tables of its
+        // own that have to survive.
+        kernel
+            .map(page(0), frame(0x80_0000), DATA, &mut frames)
+            .unwrap();
+        let kernel_tables: BTreeSet<u64> = kernel.access.tables.keys().copied().collect();
+
+        let mut space = kernel.new_process_space(&mut frames).unwrap();
+        for (page, at) in [(0x40_0000, 0x90_0000), (0x8000_0000, 0x91_0000)] {
+            space
+                .map(page, frame(at), PageFlags::user(true, false), &mut frames)
+                .unwrap();
+        }
+        let took: BTreeSet<u64> = space
+            .access
+            .tables
+            .keys()
+            .copied()
+            .filter(|table| !kernel_tables.contains(table))
+            .collect();
+        assert!(
+            took.len() >= 4,
+            "a root and at least one level below it: {took:?}"
+        );
+
+        let mut given_back = Vec::new();
+        let freed = space.free_lower_half(&mut |frame| {
+            // Frame-aligned, which is what lets the walk name these in the
+            // type at all.
+            assert_eq!(frame.start_address().as_u64() & (PAGE - 1), 0);
+            given_back.push(frame.start_address().as_u64());
+            true
+        });
+        assert_eq!(freed, given_back.len() as u64, "it counted what it gave");
+        assert_eq!(
+            given_back.iter().copied().collect::<BTreeSet<_>>(),
+            took,
+            "exactly the tables it took, root included"
+        );
+        assert_eq!(
+            given_back.len(),
+            given_back.iter().collect::<BTreeSet<_>>().len(),
+            "and each of them once"
+        );
+        // The memory the process was given is not a table and stays where
+        // it is.
+        for at in [0x90_0000, 0x91_0000] {
+            assert!(!given_back.contains(&at), "{at:#x} is the process's memory");
+        }
+        // The kernel is still mapped in its own space.
+        assert_eq!(
+            kernel.translate(page(0)).map(|t| t.phys),
+            Some(0x80_0000),
+            "the kernel's own half is untouched"
+        );
+
+        // And the root it left behind names nothing of the lower half, so
+        // a frame handed out again cannot be walked as a table tree by
+        // anything that still has the root's address — while every kernel
+        // slot is exactly as it was.
+        for slot in 0..table_indices(KERNEL_SPACE_BASE)[0] {
+            assert_eq!(space.access.read(space.root, slot), 0, "slot {slot}");
+        }
+        for slot in table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES {
+            assert_eq!(
+                space.access.read(space.root, slot),
+                kernel.access.read(kernel.root, slot),
+                "slot {slot} is the kernel's and must be untouched"
+            );
+        }
+    }
+
+    /// A large page in the lower half is a leaf: what it points at is
+    /// memory, and there is no table under it. Freeing it as if it were
+    /// one would hand the process's own pages to the table allocator.
+    #[test]
+    fn a_large_page_in_a_dead_space_is_not_mistaken_for_a_table() {
+        let mut frames = Frames((0x40_0000..0x44_0000).step_by(PAGE as usize).collect());
+        let mut kernel = kernel_through_its_window(&mut frames);
+        let mut space = kernel.new_process_space(&mut frames).unwrap();
+        space
+            .map(
+                0x40_0000,
+                frame(0x90_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .unwrap();
+
+        // A 2 MiB page next to the 4 KiB one, written by hand: `map` only
+        // makes small pages, and the walk has to cope with both.
+        let indices = table_indices(0x40_0000);
+        let pdpt = space.access.read(space.root, indices[0]) & ADDRESS_MASK;
+        let directory = space.access.read(pdpt, indices[1]) & ADDRESS_MASK;
+        const BIG: u64 = 0xA0_0000;
+        space.access.write(
+            directory,
+            indices[2] + 1,
+            BIG | PRESENT | WRITABLE | HUGE | USER,
+        );
+        // And a 1 GiB one, two levels up.
+        const HUGER: u64 = 0x4000_0000;
+        space.access.write(
+            pdpt,
+            indices[1] + 1,
+            HUGER | PRESENT | WRITABLE | HUGE | USER,
+        );
+
+        let mut given_back = Vec::new();
+        space.free_lower_half(&mut |frame| {
+            given_back.push(frame.start_address().as_u64());
+            true
+        });
+        assert!(!given_back.contains(&BIG), "the 2 MiB page is memory");
+        assert!(!given_back.contains(&HUGER), "and so is the 1 GiB one");
+        assert!(given_back.contains(&directory), "the table above it is not");
+        assert!(given_back.contains(&pdpt));
+        assert!(given_back.contains(&space.root));
+    }
+
+    /// A frame the caller refuses is not counted as returned: the number
+    /// in the log has to be the number that really came back.
+    #[test]
+    fn frames_the_allocator_refuses_are_not_counted() {
+        let mut frames = Frames((0x40_0000..0x44_0000).step_by(PAGE as usize).collect());
+        let mut kernel = kernel_through_its_window(&mut frames);
+        let mut space = kernel.new_process_space(&mut frames).unwrap();
+        space
+            .map(
+                0x40_0000,
+                frame(0x90_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .unwrap();
+
+        let mut offered = 0;
+        let freed = space.free_lower_half(&mut |_| {
+            offered += 1;
+            false
+        });
+        assert!(offered >= 4, "it still offered every one of them");
+        assert_eq!(freed, 0, "and counted none as taken");
     }
 
     /// The entry that maps `addr`, whatever level resolves it.
@@ -1641,6 +2019,78 @@ mod tests {
             )
             .expect("mapping a page of the kernel's");
         assert_eq!(leaf_entry(&tables, page(0)) & USER, 0);
+    }
+
+    /// Two spaces, the same address, different memory — and the kernel's
+    /// half shared: both roots point at the *same* tables, which is what
+    /// makes anything it maps later visible from every process.
+    ///
+    /// The fake memory is copied when a space is made, so sharing is
+    /// asserted the way the hardware sees it: identical entries, naming
+    /// the same tables.
+    #[test]
+    fn two_spaces_give_the_same_address_different_memory() {
+        let mut frames = Frames((0..24).map(|n| 0x40_0000 + n * 0x1000).collect());
+        let mut kernel = adopted(&mut frames);
+        let window = KERNEL_SPACE_BASE + 4 * (1 << 39);
+        kernel
+            .map_physical_window(&mut frames, window, GIB)
+            .expect("the window");
+        kernel.access.window = window;
+        kernel.keep_only(&mut frames, &[]).expect("emptying it");
+        kernel
+            .map(
+                page(0),
+                frame(0x50_0000),
+                PageFlags::kernel(true, false),
+                &mut frames,
+            )
+            .expect("a page of the kernel's");
+
+        let mut first = kernel.new_process_space(&mut frames).expect("first space");
+        let mut second = kernel.new_process_space(&mut frames).expect("second space");
+        assert_ne!(first.root, second.root, "each space has its own root");
+
+        // Every kernel slot names the same table in all three roots.
+        for slot in table_indices(KERNEL_SPACE_BASE)[0]..ENTRIES {
+            let mine = kernel.access.read(kernel.root, slot);
+            assert_eq!(first.access.read(first.root, slot), mine, "slot {slot}");
+            assert_eq!(second.access.read(second.root, slot), mine, "slot {slot}");
+        }
+        // And nothing of the lower half survives into a new space.
+        for slot in 0..table_indices(KERNEL_SPACE_BASE)[0] {
+            assert_eq!(first.access.read(first.root, slot), 0, "slot {slot}");
+        }
+
+        // The same address in both, backed by different frames.
+        let shared_address = 0x0000_0000_2000_0000;
+        first
+            .map(
+                shared_address,
+                frame(0x60_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .expect("the first process's page");
+        second
+            .map(
+                shared_address,
+                frame(0x70_0000),
+                PageFlags::user(true, false),
+                &mut frames,
+            )
+            .expect("the second process's page");
+        assert_eq!(first.translate(shared_address).unwrap().phys, 0x60_0000);
+        assert_eq!(second.translate(shared_address).unwrap().phys, 0x70_0000);
+
+        // Neither was given anything else down there.
+        assert_eq!(first.translate(0x2100_0000), None);
+        assert_eq!(second.translate(0x2100_0000), None);
+
+        // The kernel's memory is reachable, and the same, from both.
+        for space in [&first, &second] {
+            assert_eq!(space.translate(page(0)).map(|t| t.phys), Some(0x50_0000));
+        }
     }
 
     #[test]
