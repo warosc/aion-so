@@ -1011,6 +1011,13 @@ pub unsafe fn on_fault(fault: UserFault) -> ! {
         "HARLAN: the process in slot {} caused {} at rip={:#x} (error_code={:#x}, address={:#x}); it does not run again",
         running.slot, fault.name, fault.rip, fault.error_code, fault.address
     );
+    // A process that died of a fault is exactly what an audit is for, so
+    // the slot and what killed it both go in (ADR 0031, point 9).
+    crate::events::record_with(
+        crate::events::What::Faulted,
+        running.slot as u64,
+        fault.name,
+    );
     // SAFETY: as this function's contract, and this process is the one
     // the scheduler has running.
     unsafe { scheduler::fault_current() }

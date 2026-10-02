@@ -170,7 +170,17 @@ pub fn write_file(name: &str, contents: &[u8]) -> Result<DirectoryEntry, FileErr
         return Err(FileError::Open);
     }
     match with(|volume| volume.write_file(name, contents))? {
-        Ok(entry) => Ok(entry),
+        Ok(entry) => {
+            // Every write is recorded, including the one that writes the
+            // record itself — which lands in the next flush rather than
+            // this one, because the lines were copied out before it.
+            crate::events::record_with(
+                crate::events::What::Wrote,
+                u64::from(entry.size),
+                entry.name(),
+            );
+            Ok(entry)
+        }
         Err(WriteError::IsADirectory) => Err(FileError::IsADirectory),
         Err(err) => Err(FileError::Writing(err)),
     }

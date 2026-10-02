@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod console;
 #[cfg(target_arch = "x86_64")]
 pub mod devices;
+pub mod events;
 pub mod fs;
 pub mod identity;
 pub mod ipc;
@@ -951,11 +952,13 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         // reads the rest of its files through the same
                         // path a program's `open` takes.
                         fs::adopt(disk, reader, volume);
+                        events::record(events::What::Disk, u64::from(volume.clusters));
                         check_backup_boot_sector(&volume, &boot_sector);
                         read_a_file();
                         count_this_boot();
                     }
                     Ok(Err(err)) => {
+                        events::record(events::What::NoDisk, 0);
                         error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
                     }
                     Err(err) => error!("HARLAN: the boot sector could not be read ({err:?})"),
@@ -1113,6 +1116,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         // sending to a stranger.
                         Some(slot) if slot == which => {
                             info!("HARLAN: process {which} runs in slot {slot}");
+                            events::record(events::What::Started, slot as u64);
                             started += 1;
                         }
                         Some(slot) => error!(
@@ -1146,9 +1150,12 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             }
             let free_now = context.frames.free_frames();
             match free_now.cmp(&free_before_any_process) {
-                core::cmp::Ordering::Equal => info!(
-                    "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
-                ),
+                core::cmp::Ordering::Equal => {
+                    events::record(events::What::Frames, returned);
+                    info!(
+                        "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
+                    )
+                }
                 core::cmp::Ordering::Less => error!(
                     "HARLAN: {returned} frame(s) back from the processes that ended, but {} are still held; {free_now} free",
                     free_before_any_process - free_now
@@ -1159,6 +1166,13 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                 ),
             }
         }
+
+        // The self-test round is over and accounted for, so it is written
+        // down (ADR 0031, point 8). Here and not inside the branch below:
+        // a disk with no `SHELL.ELF` on it still has a disk, and losing a
+        // boot's events because the shell was missing would lose exactly
+        // the boot somebody is asking about.
+        write_events();
 
         // And now the shell, in a round of its own, because this one does
         // not end (docs/adr/0030-fase4-shell-in-ring-3.md). Everything
@@ -1200,6 +1214,13 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                     match unsafe { scheduler::add(shell) } {
                         Some(slot) => {
                             info!("HARLAN: the shell runs in slot {slot}");
+                            events::record(events::What::Shell, slot as u64);
+                            // Again, because the round below does not come
+                            // back while the shell lives: without this the
+                            // line saying a shell started would sit in the
+                            // ring until the machine stopped, which is the
+                            // one moment it cannot be written.
+                            write_events();
                             harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
                             harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
                             // SAFETY: the kernel is in its own space, on
@@ -1218,6 +1239,8 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                                     process::destroy(&mut context.mapper, &mut context.frames, dead)
                                 };
                             }
+                            events::record(events::What::ShellGone, 0);
+                            write_events();
                             info!(
                                 "HARLAN: the shell in ring 3 is gone; the kernel's own takes over"
                             );
@@ -1329,16 +1352,83 @@ fn count_this_boot() {
     let mut text = [0u8; 11];
     let written = write_number(&mut text, this);
     match fs::write_file(NAME, &text[..written]) {
-        Ok(entry) => match before {
-            Some(before) => info!(
-                "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
-                entry.size, entry.first_cluster
-            ),
-            None => info!(
-                "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
-                entry.size, entry.first_cluster
-            ),
+        Ok(entry) => {
+            // The boot number is what stands in for a date: without a wall
+            // clock, "boot 7" is the closest thing to *when* this machine
+            // can say (ADR 0031, point 10).
+            events::this_boot(this);
+            events::record(events::What::Boot, u64::from(this));
+            match before {
+                Some(before) => info!(
+                    "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+                None => info!(
+                    "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
+    }
+}
+
+/// Writes the events of this boot onto what the disk already held.
+///
+/// Read, join, write whole: the only shape ADR 0027 allows, and the one
+/// that makes the file the history of the machine rather than of the last
+/// boot (ADR 0031, point 6).
+///
+/// Everything here is on the stack of a kernel that has a 4 MB heap, so the
+/// two buffers are heap-allocated: 32 KB on a kernel stack with a guard
+/// page either side would be most of it.
+fn write_events() {
+    const NAME: &str = "EVENTS.LOG";
+
+    // What this boot has to say.
+    let mut mine = alloc::vec![0u8; events::EVENTS * events::LINE];
+    let mine_len = events::copy_into(&mut mine);
+
+    // What was already there. A missing file is not a failure: the first
+    // boot of a fresh disk has nothing to add to.
+    let mut old = alloc::vec![0u8; events::MAX_FILE];
+    let old_len = match fs::find(NAME) {
+        Ok(entry) => match fs::read_file(&entry, &mut old) {
+            Ok(read) => read,
+            Err(err) => {
+                error!("HARLAN: {NAME} is there and could not be read ({err:?})");
+                0
+            }
         },
+        Err(fs::FileError::NoSuchFile) => 0,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+
+    let mut joined = alloc::vec![0u8; events::MAX_FILE];
+    let len = events::join(
+        &old[..old_len],
+        &mine[..mine_len],
+        events::MAX_FILE,
+        &mut joined,
+    );
+    match fs::write_file(NAME, &joined[..len]) {
+        Ok(entry) => {
+            let (kept, lost) = events::counted();
+            if lost > 0 {
+                warn!(
+                    "HARLAN: {NAME} is {} byte(s); {kept} event(s) written and {lost} lost to the ring",
+                    entry.size
+                );
+            } else {
+                info!(
+                    "HARLAN: {NAME} is {} byte(s), holding {kept} event(s) from this boot and what came before",
+                    entry.size
+                );
+            }
+        }
         Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
     }
 }
@@ -1417,6 +1507,7 @@ fn load_program<'a>(
                     if segment.executable() { "x" } else { "-" }
                 );
             }
+            events::record_with(events::What::Loaded, read as u64, name);
             Some((program, &into[..read]))
         }
         Err(err) => {
