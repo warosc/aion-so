@@ -5,6 +5,11 @@ edition.workspace = true
 publish = false
 
 [features]
+# Writes a hardware inventory onto the volume it booted from, before
+# leaving Boot Services, and shows it on the screen
+# (docs/adr/0035-fase5-hardware-inventory.md). For a stick that goes into a
+# machine nobody here has seen.
+inventory = []
 heap-stress = ["harlan-kernel/heap-stress"]
 soak = ["harlan-kernel/soak"]
 

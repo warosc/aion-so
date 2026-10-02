@@ -68,7 +68,13 @@ enum XtaskCommand {
     /// Build the bootable USB image: one file, GPT-partitioned, with the
     /// bootloader on an EFI System Partition and the HARLAN volume beside
     /// it (docs/adr/0034-fase5-usb-image.md).
-    UsbImage,
+    UsbImage {
+        /// Build the inventory stick instead: it writes what the machine
+        /// turned out to be into `INVENTORY.TXT` on its own ESP, and shows
+        /// it on the screen (docs/adr/0035-fase5-hardware-inventory.md).
+        #[arg(long)]
+        inventory: bool,
+    },
     /// Build and run HARLAN OS interactively in QEMU (opens a window).
     Run,
     /// Run host-runnable unit tests (every crate except `harlan-boot`, which
@@ -127,7 +133,7 @@ fn main() -> Result<()> {
         XtaskCommand::Test => test(&root),
         XtaskCommand::FmtLint { fix } => fmt_lint(&root, fix),
         XtaskCommand::Debug => debug(&root),
-        XtaskCommand::UsbImage => usb_image(&root).map(|_| ()),
+        XtaskCommand::UsbImage { inventory } => usb_image(&root, inventory).map(|_| ()),
         XtaskCommand::BootTest {
             timeout_secs,
             marker,
@@ -198,9 +204,15 @@ fn build(root: &Path, features: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The cargo invocations `build` runs, with `features` enabled on both
-/// crates (`harlan-boot` forwards each one to `harlan-kernel`). Pure so the
-/// feature plumbing is unit-testable.
+/// Features the bootloader has and the kernel does not.
+///
+/// Every other one exists on both, with `harlan-boot` forwarding it. This
+/// list is what stops `--features inventory` being handed to a crate that
+/// has never heard of it, which cargo refuses outright.
+const BOOT_ONLY_FEATURES: &[&str] = &["inventory"];
+
+/// The cargo invocations `build` runs, with `features` enabled on the
+/// crates that have them. Pure so the feature plumbing is unit-testable.
 fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
     [
         ("harlan-kernel", KERNEL_TARGET),
@@ -210,9 +222,14 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
         let mut command: Vec<String> = ["build", "-p", package, "--target", target]
             .map(String::from)
             .into();
-        if !features.is_empty() {
+        let mine: Vec<&str> = features
+            .iter()
+            .copied()
+            .filter(|feature| package == "harlan-boot" || !BOOT_ONLY_FEATURES.contains(feature))
+            .collect();
+        if !mine.is_empty() {
             command.push("--features".to_string());
-            command.push(features.join(","));
+            command.push(mine.join(","));
         }
         command
     })
@@ -656,8 +673,9 @@ const ESP_SECTORS: u32 = 70_000;
 /// One file. Everything before this — a directory QEMU pretends is a FAT
 /// volume, and a second raw file beside it — is something only an emulator
 /// can boot (docs/adr/0034-fase5-usb-image.md).
-fn usb_image(root: &Path) -> Result<PathBuf> {
-    build(root, &[])?;
+fn usb_image(root: &Path, inventory: bool) -> Result<PathBuf> {
+    let features: &[&str] = if inventory { &["inventory"] } else { &[] };
+    build(root, features)?;
 
     let efi = root
         .join("target")
@@ -675,7 +693,13 @@ fn usb_image(root: &Path) -> Result<PathBuf> {
     );
     let image = gpt::usb_image(bootloader, data, ESP_SECTORS)?;
 
-    let path = root.join("target").join("harlan-usb.img");
+    // A different name, so an inventory stick and an ordinary one cannot
+    // be confused on somebody's desk.
+    let path = root.join("target").join(if inventory {
+        "harlan-inventory.img"
+    } else {
+        "harlan-usb.img"
+    });
     fs::write(&path, &image).with_context(|| format!("failed to write {}", path.display()))?;
     println!(
         "usb: {} is {} byte(s) ({} MiB)",
@@ -1440,5 +1464,39 @@ mod tests {
         let args = build_qemu_args(&cfg);
         let idx = args.iter().position(|a| a == "-debugcon").unwrap();
         assert!(args[idx + 1].starts_with("file:"));
+    }
+
+    /// A feature only the bootloader has is given only to the bootloader.
+    ///
+    /// Cargo refuses a `--features` naming one a crate does not have, so
+    /// this is the difference between `usb-image --inventory` working and
+    /// not building at all.
+    #[test]
+    fn a_boot_only_feature_does_not_reach_the_kernel() {
+        let [kernel, boot] = build_commands(&["inventory"]);
+        assert!(
+            !kernel.contains(&"--features".to_string()),
+            "the kernel was given a feature it does not have: {kernel:?}"
+        );
+        assert!(boot.contains(&"inventory".to_string()), "{boot:?}");
+    }
+
+    /// And one both have still reaches both.
+    #[test]
+    fn a_shared_feature_reaches_both() {
+        let [kernel, boot] = build_commands(&["soak"]);
+        for command in [&kernel, &boot] {
+            assert!(command.contains(&"soak".to_string()), "{command:?}");
+        }
+    }
+
+    /// Mixed, each to the crate that has it.
+    #[test]
+    fn each_feature_goes_where_it_belongs() {
+        let [kernel, boot] = build_commands(&["soak", "inventory"]);
+        let at = kernel.iter().position(|a| a == "--features").expect("some");
+        assert_eq!(kernel[at + 1], "soak", "only the shared one");
+        let at = boot.iter().position(|a| a == "--features").expect("some");
+        assert_eq!(boot[at + 1], "soak,inventory");
     }
 }
