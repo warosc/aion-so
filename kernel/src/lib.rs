@@ -988,38 +988,12 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // before anything is started, because one of the processes is it
         // (docs/adr/0026-fase4-elf-user-programs.md).
         let mut elf_bytes = alloc::vec![0u8; 64 * 1024];
-        let elf = read_user_program(&mut elf_bytes)
-            .and_then(|read| {
-                match harlan_hal::elf::parse(
-                    &elf_bytes[..read],
-                    harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
-                ) {
-                    Ok(program) => {
-                        info!(
-                            "HARLAN: it is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
-                            program.segment_count(),
-                            program.entry,
-                            program.highest_address()
-                        );
-                        for segment in program.segments() {
-                            info!(
-                                "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
-                                segment.at,
-                                segment.file_size,
-                                segment.memory_size,
-                                if segment.readable() { "r" } else { "-" },
-                                if segment.writable() { "w" } else { "-" },
-                                if segment.executable() { "x" } else { "-" }
-                            );
-                        }
-                        Some(program)
-                    }
-                    Err(err) => {
-                        error!("HARLAN: what came off the disk is not a program this kernel loads ({err:?})");
-                        None
-                    }
-                }
-            });
+        let elf = load_program(USER_PROGRAM, &mut elf_bytes);
+        // And the shell, which is the one that does not end
+        // (docs/adr/0030-fase4-shell-in-ring-3.md). Its own buffer: both
+        // are loaded before anything is started, so they cannot share one.
+        let mut shell_bytes = alloc::vec![0u8; 64 * 1024];
+        let shell_elf = load_program(SHELL_PROGRAM, &mut shell_bytes);
 
         // Eight processes, each with a space of its own and a kernel
         // stack of its own.
@@ -1072,9 +1046,14 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             ToStart::Flat(&running_its_stack),
             ToStart::Flat(&lying),
         ];
-        if let Some(program) = &elf {
-            programs.push(ToStart::Elf(program, &elf_bytes));
+        if let Some((program, file)) = &elf {
+            programs.push(ToStart::Elf(program, file));
         }
+        // The shell is **not** in this list. It does not end, so a round
+        // containing it never finishes, and the frame balance below — the
+        // check that says the processes which ended gave back everything
+        // they took — would stop being measured on every boot. It starts
+        // afterwards, in a round of its own.
 
         // What the allocator has before any process exists. Everything
         // taken from here on belongs to a process, and once they are all
@@ -1178,6 +1157,75 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                     "HARLAN: {returned} frame(s) back from the processes that ended, which is {} more than they ever took; {free_now} free",
                     free_now - free_before_any_process
                 ),
+            }
+        }
+
+        // And now the shell, in a round of its own, because this one does
+        // not end (docs/adr/0030-fase4-shell-in-ring-3.md). Everything
+        // above has finished and been accounted for; from here the machine
+        // belongs to whoever is typing.
+        if let Some((program, file)) = &shell_elf {
+            // A kernel stack of its own, the next one after the ones the
+            // demonstrations used — they are gone, but their stacks were
+            // mapped and this is simpler than reusing one.
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let shell_stack = match stack {
+                Ok(stack) => stack,
+                Err(err) => {
+                    error!("HARLAN: no kernel stack for the shell ({err:?})");
+                    // Never returns: the kernel's own shell takes over.
+                    into_the_shell::<C, P>((context as *mut KernelContext<C, P>).cast())
+                }
+            };
+            // SAFETY: the kernel owns its tables and reaches frames through
+            // its own window; nothing else uses what this takes.
+            match unsafe {
+                process::spawn_elf(
+                    &mut context.mapper,
+                    &mut context.frames,
+                    program,
+                    file,
+                    shell_stack,
+                )
+            } {
+                Ok(shell) => {
+                    let shell = alloc::boxed::Box::leak(alloc::boxed::Box::new(shell));
+                    // SAFETY: `spawn_elf` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(shell) } {
+                        Some(slot) => {
+                            info!("HARLAN: the shell runs in slot {slot}");
+                            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+                            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
+                            // SAFETY: the kernel is in its own space, on
+                            // its own stack, and nothing is running.
+                            //
+                            // This does not come back while the shell is
+                            // alive. It does if the shell exits, and then
+                            // the kernel's own takes over below — which is
+                            // what `exit` at the prompt is for.
+                            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+                            // SAFETY: nothing is running on them.
+                            for dead in unsafe { scheduler::dead_processes() } {
+                                // SAFETY: the process is gone and nothing
+                                // is on its stack.
+                                unsafe {
+                                    process::destroy(&mut context.mapper, &mut context.frames, dead)
+                                };
+                            }
+                            info!(
+                                "HARLAN: the shell in ring 3 is gone; the kernel's own takes over"
+                            );
+                        }
+                        None => error!("HARLAN: no room in the scheduler for the shell"),
+                    }
+                }
+                Err(err) => error!("HARLAN: the shell could not be started ({err:?})"),
             }
         }
     }
@@ -1329,27 +1377,75 @@ enum ToStart<'a> {
     Elf(&'a harlan_hal::elf::Program, &'a [u8]),
 }
 
+/// The name of the program that demonstrates the ABI, and of the shell.
+const USER_PROGRAM: &str = "HELLO.ELF";
+const SHELL_PROGRAM: &str = "SHELL.ELF";
+
+/// Reads a program off the disk into `into` and parses it.
+///
+/// One function rather than a block per program: the second copy of a
+/// sequence of checks is where one of them gets left out.
+///
+/// `None`, with a line saying why, for a disk that is not there, a file
+/// that is not there, one too big for the buffer, or one that is not a
+/// program this kernel loads. A kernel that could not load a program
+/// still boots; it just has one process fewer.
+fn load_program<'a>(
+    name: &str,
+    into: &'a mut [u8],
+) -> Option<(harlan_hal::elf::Program, &'a [u8])> {
+    let read = read_program(name, into)?;
+    match harlan_hal::elf::parse(
+        &into[..read],
+        harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
+    ) {
+        Ok(program) => {
+            info!(
+                "HARLAN: {name} is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
+                program.segment_count(),
+                program.entry,
+                program.highest_address()
+            );
+            for segment in program.segments() {
+                info!(
+                    "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
+                    segment.at,
+                    segment.file_size,
+                    segment.memory_size,
+                    if segment.readable() { "r" } else { "-" },
+                    if segment.writable() { "w" } else { "-" },
+                    if segment.executable() { "x" } else { "-" }
+                );
+            }
+            Some((program, &into[..read]))
+        }
+        Err(err) => {
+            error!("HARLAN: {name} is not a program this kernel loads ({err:?})");
+            None
+        }
+    }
+}
+
 /// Reads the user program off the disk, as bytes.
 ///
 /// Answers `None` and says why if it is not there or cannot be read: a
 /// kernel whose disk failed has no user program, and that has to be a line
 /// in the log rather than a boot that carries on as if it had one.
-fn read_user_program(into: &mut [u8]) -> Option<usize> {
-    const NAME: &str = "HELLO.ELF";
-    let entry = match fs::find(NAME) {
+fn read_program(name: &str, into: &mut [u8]) -> Option<usize> {
+    let entry = match fs::find(name) {
         Ok(entry) => entry,
         Err(err) => {
-            error!("HARLAN: no program can be loaded: {NAME} ({err:?})");
+            error!("HARLAN: {name} cannot be loaded ({err:?})");
             return None;
         }
     };
     match fs::read_file(&entry, into) {
         Ok(read) => {
-            info!("HARLAN: {NAME} is {read} byte(s), read off the disk");
+            info!("HARLAN: {name} is {read} byte(s), read off the disk");
             Some(read)
         }
         Err(err) => {
-            error!("HARLAN: {NAME} could not be read ({err:?})");
+            error!("HARLAN: {name} could not be read ({err:?})");
             None
         }
     }
