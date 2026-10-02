@@ -73,6 +73,40 @@ pub struct BootSector {
     /// How many clusters the data region actually holds, which is what
     /// says whether this is FAT32 at all.
     pub clusters: u32,
+    /// Who the volume says it is, when it says anything.
+    ///
+    /// `None` when the extended block is not there. Whether what it says is
+    /// good enough to write to is **not** decided here: that is a policy,
+    /// and this is a format reader (docs/adr/0033-fase5-only-our-disk.md).
+    pub volume_id: Option<VolumeId>,
+}
+
+/// What a FAT32 volume calls itself: a serial written when it was formatted
+/// and a label somebody chose.
+///
+/// Neither is a secret and neither is unique — any tool can write both. What
+/// they are good for is telling one volume from another **by accident**,
+/// which is the question "is this the disk our tooling made?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeId {
+    pub serial: u32,
+    /// Eleven bytes, space-padded on the right, as the format stores it.
+    pub label: [u8; 11],
+}
+
+impl VolumeId {
+    /// The label as text, without its padding.
+    ///
+    /// Empty for a label that is not text — which is possible, because
+    /// these are eleven bytes somebody else wrote.
+    pub fn label(&self) -> &str {
+        let end = self
+            .label
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |at| at + 1);
+        core::str::from_utf8(&self.label[..end]).unwrap_or("")
+    }
 }
 
 /// Offsets in the boot sector, from the specification.
@@ -87,6 +121,12 @@ mod at {
     pub const ROOT_CLUSTER: usize = 44;
     pub const FS_INFO_SECTOR: usize = 48;
     pub const BACKUP_BOOT_SECTOR: usize = 50;
+    /// `0x29` here says the three fields after it — serial, label and the
+    /// filesystem type — are really there. Anything else and those bytes
+    /// are whatever the formatter happened to leave.
+    pub const EXTENDED_SIGNATURE: usize = 66;
+    pub const VOLUME_SERIAL: usize = 67;
+    pub const VOLUME_LABEL: usize = 71;
     pub const SIGNATURE: usize = 510;
 }
 
@@ -182,6 +222,21 @@ impl BootSector {
             return Err(BootSectorError::FatTooSmall { entries, clusters });
         }
 
+        // Who the volume says it is. Only believed when the byte that
+        // says those fields exist says so: otherwise they are whatever was
+        // left in the sector, and a label read out of rubbish is worse than
+        // no label at all.
+        let volume_id = if sector[at::EXTENDED_SIGNATURE] == 0x29 {
+            let mut label = [0u8; 11];
+            label.copy_from_slice(&sector[at::VOLUME_LABEL..at::VOLUME_LABEL + 11]);
+            Some(VolumeId {
+                serial: u32_at(sector, at::VOLUME_SERIAL),
+                label,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             bytes_per_sector,
             sectors_per_cluster,
@@ -193,6 +248,7 @@ impl BootSector {
             fs_info_sector: u16_at(sector, at::FS_INFO_SECTOR),
             backup_boot_sector: u16_at(sector, at::BACKUP_BOOT_SECTOR),
             clusters,
+            volume_id,
         })
     }
 
@@ -1161,9 +1217,64 @@ mod tests {
         sector[44..48].copy_from_slice(&2u32.to_le_bytes());
         sector[48..50].copy_from_slice(&1u16.to_le_bytes());
         sector[50..52].copy_from_slice(&6u16.to_le_bytes());
+        // The extended block, as `xtask`'s formatter writes it: the byte
+        // that says it is there, the serial, and the label. Here and not in
+        // one test, so that what every test calls "good" is what the disk
+        // this kernel boots from actually looks like.
+        sector[66] = 0x29;
+        sector[67..71].copy_from_slice(&0x4841_524Cu32.to_le_bytes());
+        sector[71..82].copy_from_slice(b"HARLAN     ");
         sector[510] = 0x55;
         sector[511] = 0xAA;
         sector
+    }
+
+    // -----------------------------------------------------------------
+    // Who a volume says it is (docs/adr/0033-fase5-only-our-disk.md)
+    // -----------------------------------------------------------------
+
+    /// The serial and the label come off a boot sector that carries them.
+    #[test]
+    fn a_volume_says_who_it_is_when_it_carries_the_extended_block() {
+        let sector = good();
+        let boot = BootSector::parse(&sector).expect("a good boot sector");
+        let id = boot.volume_id.expect("the extended block is there");
+        assert_eq!(id.serial, 0x4841_524C);
+        assert_eq!(id.label(), "HARLAN");
+    }
+
+    /// Without the byte that says those fields exist, they are not read at
+    /// all. They would otherwise be whatever the formatter left there, and
+    /// a label read out of rubbish is worse than no label: it is a name
+    /// something might be trusted by.
+    #[test]
+    fn a_volume_with_no_extended_block_says_nothing() {
+        let mut sector = good();
+        for wrong in [0x00u8, 0x28, 0x2A, 0xFF] {
+            sector[66] = wrong;
+            let boot = BootSector::parse(&sector).expect("still a FAT32 volume");
+            assert!(boot.volume_id.is_none(), "signature {wrong:#04x}");
+        }
+    }
+
+    /// A label is what is there without its padding, and nothing else.
+    #[test]
+    fn a_label_loses_its_padding_and_keeps_its_spaces() {
+        let of = |bytes: &[u8; 11]| VolumeId {
+            serial: 0,
+            label: *bytes,
+        };
+        assert_eq!(of(b"HARLAN     ").label(), "HARLAN");
+        assert_eq!(of(b"NOTYOURS   ").label(), "NOTYOURS");
+        // Eleven characters leave no padding to take.
+        assert_eq!(of(b"ABCDEFGHIJK").label(), "ABCDEFGHIJK");
+        // A space inside is part of the name; only the ones at the end go.
+        assert_eq!(of(b"MY DISK    ").label(), "MY DISK");
+        // Nothing at all is nothing, not a space.
+        assert_eq!(of(b"           ").label(), "");
+        // And bytes that are not text are not a name. These are eleven
+        // bytes somebody else wrote.
+        assert_eq!(of(&[0xFF; 11]).label(), "");
     }
 
     #[test]

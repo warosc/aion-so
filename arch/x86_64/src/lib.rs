@@ -10,6 +10,7 @@ pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod serial;
 pub mod stack;
 pub mod switch;
 pub mod syscall;
