@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 
+pub mod cpuid;
 mod gdt;
 mod idt;
 pub mod interrupts;
