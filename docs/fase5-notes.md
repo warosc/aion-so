@@ -9,6 +9,108 @@ dependen de este repositorio: saber qué lleva dentro el equipo objetivo, y
 arrancarlo. Lo que sí se puede hacer entre tanto es todo lo demás, y lo
 primero de todo es que cuando ese arranque ocurra, la máquina diga algo.
 
+## Incremento 39 — La imagen USB
+
+`docs/adr/0034-fase5-usb-image.md`.
+
+### No había ninguna imagen
+
+Lo que QEMU arranca es `-drive format=raw,file=fat:rw:target/esp`: un
+**directorio** que el emulador finge que es un volumen FAT, con un `disk.img`
+suelto al lado. Ninguna de las dos cosas existe fuera de QEMU. Para arrancar
+el PC objetivo hace falta **un fichero** que se escriba tal cual con `dd`.
+
+### Particionada, y por qué
+
+GPT con MBR protector, dos particiones: una ESP con el cargador y el volumen
+HARLAN al lado —que es exactamente la imagen que `prepare_disk` ya producía,
+metida dentro—.
+
+Un medio extraíble sin particionar lo arranca bastante firmware, y
+"bastante" es justo el problema: la máquina en la que esto tiene que
+funcionar es una que nadie de aquí puede probar antes. Una GPT es lo que
+escribe cualquier instalador porque funciona siempre.
+
+Los GUID son fijos, no aleatorios. Lo correcto serían aleatorios, y haría que
+cada build diera una imagen distinta, lo que convierte *"¿ha cambiado la
+imagen?"* en una pregunta que nadie puede contestar. La build reproducible es
+una promesa de Fase 0.
+
+### Dos fallos que encontró 7-Zip antes que ningún firmware
+
+**El cargador estaba en la raíz.** UEFI busca `\EFI\BOOT\BOOTX64.EFI` en
+un medio extraíble y no busca en ningún otro sitio — está en la
+especificación. El formateador solo sabía escribir la raíz, así que la
+primera imagen tenía el cargador donde nada mira. Si lo llego a probar
+directamente en QEMU, el síntoma habría sido "no arranca" sin más.
+
+Eso obligó a enseñarle al formateador a hacer directorios. Son dos cosas
+distintas y conviene no confundirlas: `xtask` escribe un volumen que el
+firmware **de otro** tiene que poder leer, y el kernel sigue leyendo nombres
+8.3 en la raíz y nada más (ADR 0028).
+
+**Y la entrada de directorio llevaba la ruta entera.** `padded_name` recibía
+`EFI/BOOT/BOOTX64.EFI` y lo copiaba en un campo de once bytes: pánico. Ese es
+de los buenos, porque se oye.
+
+De paso salió que `is_eight_three` exigía un punto y `harlan_hal::encode_name`
+no — los dos extremos llevaban tiempo sin estar de acuerdo, y nadie se había
+dado cuenta porque ningún nombre hasta hoy iba sin extensión. `EFI` sí.
+
+### Y uno que encontró su propia prueba
+
+La CRC-32 está comprobada contra valores que todo el mundo conoce, no contra
+una segunda copia de sí misma. **La prueba falló, y lo que estaba mal era mi
+constante esperada para `"abc"`**, no la implementación — lo confirmé con
+`zlib`, que es de fuera. Una suma de comprobación verificada por su propio
+autor es una suma que está de acuerdo consigo misma.
+
+### Arranca
+
+QEMU con el stick y **nada más**: sin directorio ESP, sin segundo disco. Si
+el firmware no lee la GPT y el FAT32 que escribimos, no pasa absolutamente
+nada.
+
+```
+ARRANCA desde la imagen USB
+HARLAN: a serial port at COM1; the log goes there too
+HARLAN OS - Fase 2 boot
+...
+HARLAN: no virtio storage on the bus
+HARLAN: HELLO.ELF cannot be loaded (NoDisk)
+HARLAN: SHELL.ELF cannot be loaded (NoDisk)
+HARLAN-PHASE1-SHELL-READY
+```
+
+Y por el puerto serie salieron 12 817 bytes del mismo arranque.
+
+### Lo que esto NO hace, dicho claro
+
+**El kernel arrancado desde el stick no lee el stick.** Un stick USB no es un
+disco virtio: para leer la partición de datos hace falta un driver de
+almacenamiento USB, que es el bullet **siguiente** de la fase.
+
+Lo que se ve arriba es exactamente lo que debe verse: sin disco, sin
+programas, y la shell del kernel —el camino de reserva del ADR 0030— arriba.
+Una imagen que arranca y no encuentra sus datos es media cosa; media cosa
+anunciada como entera es peor que media cosa.
+
+**Una idea para ese bullet, anotada para no perderla**: el cargador corre
+bajo UEFI y puede leer bloques con los servicios del firmware **antes** de
+salir de ellos. Leer por ahí lo que el kernel necesita evitaría escribir un
+driver USB para el camino de lectura. Escribir seguiría necesitando uno.
+
+### Verificación ejecutada
+
+- 7-Zip abre la imagen como GPT, nombra las dos particiones y lista
+  `EFI\BOOT\BOOTX64.EFI` dentro de la ESP con sus dos directorios.
+- 65 pruebas en `xtask`, siete de ellas nuevas sobre la GPT: las dos sumas de
+  comprobación calculadas como las calcula un lector, las dos cabeceras
+  apuntándose la una a la otra, las particiones donde dicen sus entradas y
+  sin solaparse, y el MBR protector cubriendo el disco.
+- Las pruebas de ida y vuelta contra `harlan-hal` siguen pasando sin cambios:
+  **sin barras en los nombres, el formateador escribe lo mismo que antes.**
+
 ## Incremento 38 — Solo nuestro disco
 
 `docs/adr/0033-fase5-only-our-disk.md`.
