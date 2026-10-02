@@ -4,6 +4,8 @@
 mod console_hw;
 mod framebuffer;
 mod image;
+#[cfg(feature = "inventory")]
+mod inventory;
 mod memory;
 mod panic;
 mod power;
@@ -34,6 +36,13 @@ fn efi_main() -> Status {
     // Also a Boot Services question: the kernel marks this range executable
     // and everything else no-execute when it builds its own page tables.
     let kernel_image = image::query_with_code();
+
+    // The inventory, while the firmware's file services still exist: this
+    // is the only moment the stick can be written to without a driver for
+    // whatever it is plugged into (docs/adr/0035-fase5-hardware-inventory.md).
+    #[cfg(feature = "inventory")]
+    // SAFETY: once, here, before anything else runs, with Boot Services up.
+    let inventory = unsafe { inventory::take(framebuffer.as_ref()) };
 
     // SAFETY: this is the only call site, on a single linear,
     // non-reentrant path. No Boot-Services-backed resource is held past
@@ -82,6 +91,30 @@ fn efi_main() -> Status {
     // on. The memory stays mapped: UEFI's identity mapping is still what's
     // live (no page tables are touched by exiting boot services).
     let console = unsafe { HardwareConsole::new(framebuffer) };
+
+    // On the screen too, for whoever is standing in front of the machine
+    // with no serial cable and no second computer. The file on the stick is
+    // the better copy; this is the one that needs nothing
+    // (docs/adr/0035-fase5-hardware-inventory.md).
+    #[cfg(feature = "inventory")]
+    let console = {
+        use harlan_hal::Console;
+        let mut console = console;
+        console.clear();
+        // A line at a time, because what is in the buffer is text and the
+        // console takes `&str`. Anything that is not text is skipped rather
+        // than drawn as rubbish — it cannot happen, since everything
+        // written into the report is text, and skipping is what to do if it
+        // ever does.
+        for line in inventory.split(|byte| *byte == b'\n') {
+            if let Ok(line) = core::str::from_utf8(line) {
+                console.write_str(line);
+                console.write_str("\n");
+            }
+        }
+        console
+    };
+
     // The kernel takes ownership of all three: it moves them into its own
     // heap as soon as it has one, so that nothing of its own is left in the
     // firmware's memory (docs/adr/0007-fase2-own-memory.md).

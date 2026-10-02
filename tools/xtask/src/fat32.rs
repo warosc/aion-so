@@ -40,13 +40,19 @@ const DIRECTORY_ENTRY_BYTES: usize = 32;
 /// file.
 const ATTR_VOLUME_LABEL: u8 = 0x08;
 const ATTR_ARCHIVE: u8 = 0x20;
+/// What marks an entry as a directory rather than a file.
+const ATTR_DIRECTORY: u8 = 0x10;
 
 /// A file to put on the image: an 8.3 name and its contents.
 pub struct File {
-    /// Exactly as it will appear in the directory: eight characters of
-    /// name and three of extension, space-padded, upper case. Checked, not
+    /// Where it goes, as it will appear in the directory: eight
+    /// characters of name and three of extension, upper case. Checked, not
     /// trusted, because a name of the wrong length would shift every field
     /// after it in the entry.
+    ///
+    /// Slashes make directories: `EFI/BOOT/BOOTX64.EFI` puts the file three
+    /// levels down, creating `EFI` and `EFI/BOOT` on the way. Each
+    /// component has to be an 8.3 name of its own.
     pub name: &'static str,
     pub contents: Vec<u8>,
 }
@@ -104,7 +110,7 @@ pub fn format(
     files: &[File],
 ) -> Result<(Vec<u8>, Geometry), FormatError> {
     for file in files {
-        if !is_eight_three(file.name) {
+        if file.name.is_empty() || !file.name.split('/').all(is_eight_three) {
             return Err(FormatError::BadName { name: file.name });
         }
     }
@@ -128,11 +134,49 @@ pub fn format(
     }
 
     let cluster_bytes = SECTOR_BYTES * sectors_per_cluster as usize;
-    // One entry for the label and one per file; the root directory is one
-    // cluster, which is all this kernel needs.
-    let entries = files.len() + 1;
-    if entries * DIRECTORY_ENTRY_BYTES > cluster_bytes {
-        return Err(FormatError::RootDirectoryFull { entries });
+    let per_directory = cluster_bytes / DIRECTORY_ENTRY_BYTES;
+
+    // What goes in which directory. The root is "", and every other key is
+    // a path like `EFI` or `EFI/BOOT`. A `BTreeMap` so that the order is
+    // the same on every build: a formatter whose output depended on hash
+    // order would make "did the image change?" unanswerable.
+    let mut tree: BTreeMap<String, Vec<Entry<'_>>> = BTreeMap::new();
+    tree.insert(String::new(), Vec::new());
+    for file in files {
+        // Only the directories matter here; the entry itself takes the
+        // last part of the path when it is written.
+        let parents = match file.name.rfind('/') {
+            Some(at) => &file.name[..at],
+            None => "",
+        };
+        // Every directory on the way, created once and in order.
+        let mut path = String::new();
+        for part in parents.split('/').filter(|part| !part.is_empty()) {
+            let parent = path.clone();
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(part);
+            if !tree.contains_key(&path) {
+                tree.insert(path.clone(), Vec::new());
+                tree.entry(parent)
+                    .or_default()
+                    .push(Entry::Directory(path.clone()));
+            }
+        }
+        tree.entry(parents.to_string())
+            .or_default()
+            .push(Entry::File(file));
+    }
+
+    // The root also holds the volume label; every other directory holds
+    // `.` and `..`.
+    for (path, held) in &tree {
+        let fixed = if path.is_empty() { 1 } else { 2 };
+        let entries = held.len() + fixed;
+        if entries > per_directory {
+            return Err(FormatError::RootDirectoryFull { entries });
+        }
     }
 
     // Where each file goes: the root directory holds cluster 2, and the
@@ -140,6 +184,25 @@ pub fn format(
     let mut chains: BTreeMap<u32, u32> = BTreeMap::new();
     chains.insert(FIRST_DATA_CLUSTER, END_OF_CHAIN);
     let mut next_free = FIRST_DATA_CLUSTER + 1;
+
+    // One cluster each, which is what `per_directory` was checked against.
+    let mut directory_cluster: BTreeMap<String, u32> = BTreeMap::new();
+    directory_cluster.insert(String::new(), FIRST_DATA_CLUSTER);
+    for path in tree.keys() {
+        if path.is_empty() {
+            continue;
+        }
+        if next_free >= FIRST_DATA_CLUSTER + geometry.clusters {
+            return Err(FormatError::OutOfClusters {
+                needed: 1,
+                available: 0,
+            });
+        }
+        chains.insert(next_free, END_OF_CHAIN);
+        directory_cluster.insert(path.clone(), next_free);
+        next_free += 1;
+    }
+
     let mut placed = Vec::new();
     for file in files {
         let needed = file.contents.len().div_ceil(cluster_bytes) as u32;
@@ -198,17 +261,54 @@ pub fn format(
         }
     }
 
-    // The root directory: the volume label first, as a formatter does,
-    // then one entry per file.
-    let root_at = geometry.sector_of_cluster(geometry.root_cluster) as usize * SECTOR_BYTES;
-    let mut entry_at = root_at;
-    image[entry_at..entry_at + 11].copy_from_slice(&padded_label(label));
-    image[entry_at + 11] = ATTR_VOLUME_LABEL;
-    entry_at += DIRECTORY_ENTRY_BYTES;
-    for (file, first) in &placed {
-        let entry = directory_entry(file, *first);
-        image[entry_at..entry_at + DIRECTORY_ENTRY_BYTES].copy_from_slice(&entry);
-        entry_at += DIRECTORY_ENTRY_BYTES;
+    // Every directory. The root starts with the volume label, as a
+    // formatter writes it; the others start with `.` and `..`, which is
+    // what every reader expects to find and what `fsck` checks for.
+    let where_file_went: BTreeMap<&str, u32> = placed
+        .iter()
+        .map(|(file, first)| (file.name, *first))
+        .collect();
+    for (path, held) in &tree {
+        let cluster = directory_cluster[path];
+        let mut entry_at = geometry.sector_of_cluster(cluster) as usize * SECTOR_BYTES;
+        if path.is_empty() {
+            image[entry_at..entry_at + 11].copy_from_slice(&padded_label(label));
+            image[entry_at + 11] = ATTR_VOLUME_LABEL;
+            entry_at += DIRECTORY_ENTRY_BYTES;
+        } else {
+            // `.` points at this directory and `..` at its parent — and
+            // `..` of a directory whose parent is the root points at
+            // **zero**, not at the root's cluster. That is the format's
+            // rule and a reader that finds anything else calls the volume
+            // damaged.
+            let parent = match path.rfind('/') {
+                Some(at) => &path[..at],
+                None => "",
+            };
+            let parent_cluster = if parent.is_empty() {
+                0
+            } else {
+                directory_cluster[parent]
+            };
+            for (name, at) in [(b".          ", cluster), (b"..         ", parent_cluster)] {
+                image[entry_at..entry_at + 11].copy_from_slice(name);
+                image[entry_at + 11] = ATTR_DIRECTORY;
+                write_u16(&mut image, entry_at + 20, (at >> 16) as u16);
+                write_u16(&mut image, entry_at + 26, at as u16);
+                entry_at += DIRECTORY_ENTRY_BYTES;
+            }
+        }
+        for entry in held {
+            let bytes = match entry {
+                Entry::File(file) => directory_entry(file, where_file_went[file.name]),
+                Entry::Directory(child) => {
+                    let name = child.rsplit('/').next().unwrap_or(child);
+                    directory_entry_for_directory(name, directory_cluster[child])
+                }
+            };
+            image[entry_at..entry_at + DIRECTORY_ENTRY_BYTES].copy_from_slice(&bytes);
+            entry_at += DIRECTORY_ENTRY_BYTES;
+        }
     }
 
     // And the files themselves. The empty ones have nowhere to be, which
@@ -222,6 +322,29 @@ pub fn format(
     }
 
     Ok((image, geometry))
+}
+
+/// What a directory holds: a file, or another directory by its full path.
+enum Entry<'a> {
+    File(&'a File),
+    Directory(String),
+}
+
+/// The entry for a subdirectory: its name, the directory attribute, its
+/// first cluster, and a size of zero — a directory's size field is always
+/// zero, and a reader that believed anything else would stop early.
+fn directory_entry_for_directory(name: &str, cluster: u32) -> [u8; DIRECTORY_ENTRY_BYTES] {
+    let mut entry = [0u8; DIRECTORY_ENTRY_BYTES];
+    entry[..11].copy_from_slice(&padded_name(name));
+    entry[11] = ATTR_DIRECTORY;
+    entry[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    entry[28..32].copy_from_slice(&0u32.to_le_bytes());
+    entry
+}
+
+fn write_u16(image: &mut [u8], at: usize, value: u16) {
+    image[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }
 
 /// How many sectors each table needs: one 32-bit entry per cluster, plus
@@ -261,12 +384,16 @@ fn sectors_per_fat_for(total_sectors: u32, sectors_per_cluster: u8) -> u32 {
 
 /// Whether a name is exactly the eight and three a directory entry holds.
 fn is_eight_three(name: &str) -> bool {
-    let Some((base, extension)) = name.split_once('.') else {
-        return false;
+    // The extension is optional, which is what the format says and what
+    // `harlan_hal::fat::encode_name` has always accepted. The two ends
+    // disagreed until a directory — `EFI`, with no extension — needed a
+    // name and this refused it.
+    let (base, extension) = match name.split_once('.') {
+        Some((base, extension)) => (base, extension),
+        None => (name, ""),
     };
     !base.is_empty()
         && base.len() <= 8
-        && !extension.is_empty()
         && extension.len() <= 3
         && name
             .bytes()
@@ -291,8 +418,13 @@ fn padded_label(label: &str) -> [u8; 11] {
 }
 
 fn directory_entry(file: &File, first_cluster: u32) -> [u8; DIRECTORY_ENTRY_BYTES] {
+    // The **last** part of the path: an entry holds a name, and the
+    // directories it is under are where the entry sits, not what it says.
+    // Writing the whole path here panicked on the first image with a
+    // subdirectory in it, which is the loudest a bug of this kind gets.
+    let name = file.name.rsplit('/').next().unwrap_or(file.name);
     let mut entry = [0u8; DIRECTORY_ENTRY_BYTES];
-    entry[..11].copy_from_slice(&padded_name(file.name));
+    entry[..11].copy_from_slice(&padded_name(name));
     entry[11] = ATTR_ARCHIVE;
     // The cluster number arrives in two halves, sixteen bits apart, with
     // the high half earlier in the entry than the low one.
