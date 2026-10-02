@@ -102,6 +102,13 @@ struct Ring {
     /// Which boot this is, as `BOOTS.TXT` counts them. Zero until the boot
     /// has been counted, which is early.
     boot: u32,
+    /// How many have been handed to `copy_into` and written down.
+    ///
+    /// Without this a second flush in one boot writes the boot's lines a
+    /// second time, and the log says everything happened twice. It did —
+    /// ten boots came to exactly double the size one write per boot gave,
+    /// which is how it was noticed.
+    flushed: usize,
 }
 
 impl Ring {
@@ -110,6 +117,7 @@ impl Ring {
             lines: [Line::empty(); EVENTS],
             written: 0,
             boot: 0,
+            flushed: 0,
         }
     }
 }
@@ -268,21 +276,39 @@ fn put_number(into: &mut [u8; LINE], at: usize, number: u64, width: usize) -> us
 /// Stops when `into` is full rather than wrapping, because half a line is a
 /// line that lies about the event it ends on.
 pub fn copy_into(into: &mut [u8]) -> usize {
-    let ring = RING.lock();
-    let have = ring.written.min(EVENTS);
-    // Where the oldest kept line is: once the ring has wrapped, it is the
-    // one about to be overwritten.
-    let first = ring.written.saturating_sub(have);
+    let mut ring = RING.lock();
+    let (first, count) = unflushed(ring.written, ring.flushed, EVENTS);
     let mut at = 0;
-    for step in 0..have {
+    let mut taken = 0;
+    for step in 0..count {
         let line = &ring.lines[(first + step) % EVENTS];
         if at + line.len > into.len() {
             break;
         }
         into[at..at + line.len].copy_from_slice(&line.bytes[..line.len]);
         at += line.len;
+        taken += 1;
     }
+    // Only what actually went out is marked as gone: a line left behind
+    // because the buffer filled is a line the next flush still owes.
+    ring.flushed = first + taken;
     at
+}
+
+/// Which lines a flush should take, and from where.
+///
+/// `(first, count)`: the index of the oldest line not yet written down, and
+/// how many there are. A free function over the three numbers so that the
+/// wrapping can be tested without the ring, which is a static shared by
+/// every test in the binary and therefore the one thing that cannot be set
+/// up twice.
+fn unflushed(written: usize, flushed: usize, capacity: usize) -> (usize, usize) {
+    // Anything older than `written - capacity` has been overwritten, so a
+    // flush that fell that far behind starts from the oldest line still
+    // there rather than from one that is gone.
+    let oldest = written.saturating_sub(capacity);
+    let first = flushed.max(oldest);
+    (first, written.saturating_sub(first))
 }
 
 /// How many events this boot recorded, and how many it had to drop.
@@ -456,6 +482,42 @@ mod tests {
             before.len(),
             "the rewrite moved the other columns"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // What a flush takes
+    // -----------------------------------------------------------------
+
+    /// A second flush in one boot takes only what is new.
+    ///
+    /// Without this the whole ring went out again, the file got this
+    /// boot's lines twice, and the log said everything happened twice.
+    /// Nothing failed: ten boots simply came to double the bytes one write
+    /// per boot had given, which is the only reason it was noticed.
+    #[test]
+    fn a_flush_takes_only_what_the_last_one_left() {
+        // Nothing written, nothing to take.
+        assert_eq!(unflushed(0, 0, 128), (0, 0));
+        // Five written, none flushed: all five, from the start.
+        assert_eq!(unflushed(5, 0, 128), (0, 5));
+        // Flushed those five, then two more: the two, from five.
+        assert_eq!(unflushed(7, 5, 128), (5, 2));
+        // And a flush with nothing new takes nothing.
+        assert_eq!(unflushed(7, 7, 128), (7, 0));
+    }
+
+    /// A flush that fell behind further than the ring is deep starts at
+    /// the oldest line that is still there, not at one that is gone.
+    #[test]
+    fn a_flush_that_fell_behind_starts_where_the_ring_still_has_lines() {
+        // 200 written into a ring of 128, 10 flushed: lines 0..72 are
+        // overwritten, so it starts at 72 and takes the 128 that remain.
+        assert_eq!(unflushed(200, 10, 128), (72, 128));
+        // Flushed past the overwrite point: carry on from there.
+        assert_eq!(unflushed(200, 150, 128), (150, 50));
+        // Never more than the ring holds.
+        let (_, count) = unflushed(10_000, 0, 128);
+        assert_eq!(count, 128);
     }
 
     // -----------------------------------------------------------------

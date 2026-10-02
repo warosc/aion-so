@@ -1419,12 +1419,15 @@ fn write_events() {
             let (kept, lost) = events::counted();
             if lost > 0 {
                 warn!(
-                    "HARLAN: {NAME} is {} byte(s); {kept} event(s) written and {lost} lost to the ring",
+                    "HARLAN: {NAME} is {} byte(s); {kept} event(s) recorded this boot and {lost} lost to the ring before they could be written",
                     entry.size
                 );
             } else {
+                // `mine_len` and not the count of events this boot: a
+                // second flush writes only what the first left, and saying
+                // otherwise would be the log describing itself wrongly.
                 info!(
-                    "HARLAN: {NAME} is {} byte(s), holding {kept} event(s) from this boot and what came before",
+                    "HARLAN: {NAME} is {} byte(s); {mine_len} new byte(s) appended, {kept} event(s) recorded this boot",
                     entry.size
                 );
             }
