@@ -464,6 +464,10 @@ struct QemuConfig {
     headless: bool,
     debug_stub: bool,
     debugcon_log: Option<PathBuf>,
+    /// Where COM1 goes. Separate from the debug port on purpose: the two
+    /// are different devices, and a test that reads one proves nothing
+    /// about the other (docs/adr/0032-fase5-serial-console.md).
+    serial_log: Option<PathBuf>,
     /// QEMU's own diagnostics (`-d guest_errors,cpu_reset`), for soak runs.
     qemu_log: Option<PathBuf>,
 }
@@ -525,6 +529,17 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
             args.push("-debugcon".to_string());
             args.push("stdio".to_string());
         }
+    }
+
+    // COM1. Always attached, so that a build which stopped writing to it
+    // produces an empty file rather than no file — "nothing came out" and
+    // "nowhere to come out of" look the same otherwise.
+    if let Some(serial_path) = &cfg.serial_log {
+        args.push("-serial".to_string());
+        args.push(format!("file:{}", serial_path.display()));
+    } else {
+        args.push("-serial".to_string());
+        args.push("none".to_string());
     }
 
     if cfg.headless {
@@ -668,6 +683,7 @@ fn prepare_qemu_config(
         headless,
         debug_stub,
         debugcon_log: None,
+        serial_log: None,
         qemu_log: None,
     })
 }
@@ -721,11 +737,15 @@ fn boot_test(
 fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) -> Result<()> {
     let mut cfg = prepare_qemu_config(root, true, false, memory)?;
     let log_path = root.join("target").join("boot-test.log");
+    let serial_path = root.join("target").join("boot-test-serial.log");
     let stderr_path = root.join("target").join("boot-test-qemu-stderr.log");
-    if log_path.exists() {
-        fs::remove_file(&log_path).context("failed to clear previous boot-test log")?;
+    for path in [&log_path, &serial_path] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
+        }
     }
     cfg.debugcon_log = Some(log_path.clone());
+    cfg.serial_log = Some(serial_path.clone());
     let args = build_qemu_args(&cfg);
 
     let stderr_file = fs::File::create(&stderr_path)
@@ -812,6 +832,22 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
                 );
             }
             println!("boot-test: the shell in ring 3 came up");
+
+            // And the same boot, out of the other device. A kernel that
+            // stopped writing to COM1 would still pass everything above,
+            // and would reach the target PC saying nothing at all
+            // (docs/adr/0032-fase5-serial-console.md).
+            let serial = fs::read_to_string(&serial_path).unwrap_or_default();
+            if !serial.contains(RING3_SHELL_MARKER) {
+                bail!(
+                    "boot-test: the boot did not come out of COM1 (see {}); the debug port is an emulator's, and a kernel that only writes there is silent on real hardware",
+                    serial_path.display()
+                );
+            }
+            println!(
+                "boot-test: {} byte(s) of the same boot came out of COM1",
+                serial.len()
+            );
             if log.contains(RING3_FILE_FAILED) {
                 let which: Vec<&str> = log
                     .lines()
@@ -1104,6 +1140,7 @@ mod tests {
             headless: false,
             debug_stub: false,
             debugcon_log: None,
+            serial_log: None,
             qemu_log: None,
         }
     }
