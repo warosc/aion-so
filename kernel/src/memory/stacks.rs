@@ -102,6 +102,22 @@ fn unmap_stack(mapper: &mut dyn PageMapper, frames: &mut KernelFrames<'_>, stack
     rollback_stack(mapper, frames, stack.bottom(), stack.size() / PAGE_SIZE);
 }
 
+/// Unmaps `stack` and gives its frames back, answering how many.
+///
+/// # Safety
+///
+/// Nothing may be using it — least of all the caller, which must not be
+/// running on it.
+pub unsafe fn unmap(
+    mapper: &mut dyn PageMapper,
+    frames: &mut KernelFrames<'_>,
+    stack: Stack,
+) -> u64 {
+    let before = frames.free_frames();
+    unmap_stack(mapper, frames, stack);
+    frames.free_frames() - before
+}
+
 /// How many pages the stack a syscall lands on gets. Same reasoning as
 /// the double-fault stack: small, but with a guard page at each end.
 pub const SYSCALL_STACK_PAGES: u64 = 4;

@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod fat32;
+mod gpt;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
@@ -18,7 +21,34 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// Not shared via a dependency edge because xtask is host tooling, not part
 /// of the freestanding boot chain. Override with `--marker` to check the
 /// older Fase 0 checkpoint (`HARLAN-PHASE0-BOOT-OK`) instead.
+/// The kernel's own shell, which runs when there is no disk to load a
+/// program from. Still the default, because a boot without a disk has to
+/// stay checkable (ADR 0030).
 const DEFAULT_MARKER: &str = "HARLAN-PHASE1-SHELL-READY";
+
+/// The shell in ring 3 (user/shell/src/main.rs), which is what comes up
+/// when there **is** a disk — and which does not end, so the kernel's own
+/// never runs and never prints its marker.
+///
+/// A separate marker and not the same one: if either meant "a shell came
+/// up", the regression worth catching would be the one that hides — the
+/// shell program failing to load, the kernel's coming up instead, and the
+/// boot staying green while nothing in ring 3 works.
+const RING3_SHELL_MARKER: &str = "HARLAN-RING3-SHELL-READY";
+
+/// What the program in ring 3 says when every one of its file checks
+/// passed (user/hello/src/main.rs, docs/adr/0028-fase4-file-abi-v0.md).
+///
+/// Checked as well as the boot marker, because the shell comes up whether
+/// or not a program could read a file: a boot that only reaches the marker
+/// is a boot that proves the kernel got that far and nothing about the
+/// ABI.
+const RING3_FILE_MARKER: &str = "HARLAN: ring3-file ALL OK";
+
+/// What it says when one of them did not. Looked for because its absence
+/// is not evidence on its own — a program that dies before its last check
+/// prints no verdict at all — but its presence is proof of a failure.
+const RING3_FILE_FAILED: &str = "HARLAN: ring3-file FAILED";
 /// Guest RAM the frame allocator's fixed bitmap is sized for (see
 /// kernel::memory::FRAME_BITMAP_WORDS). More RAM boots too; the frames
 /// above the covered range are ignored and logged.
@@ -35,6 +65,16 @@ struct Cli {
 enum XtaskCommand {
     /// Build the kernel and the UEFI boot application, and assemble the ESP directory.
     Build,
+    /// Build the bootable USB image: one file, GPT-partitioned, with the
+    /// bootloader on an EFI System Partition and the HARLAN volume beside
+    /// it (docs/adr/0034-fase5-usb-image.md).
+    UsbImage {
+        /// Build the inventory stick instead: it writes what the machine
+        /// turned out to be into `INVENTORY.TXT` on its own ESP, and shows
+        /// it on the screen (docs/adr/0035-fase5-hardware-inventory.md).
+        #[arg(long)]
+        inventory: bool,
+    },
     /// Build and run HARLAN OS interactively in QEMU (opens a window).
     Run,
     /// Run host-runnable unit tests (every crate except `harlan-boot`, which
@@ -93,6 +133,7 @@ fn main() -> Result<()> {
         XtaskCommand::Test => test(&root),
         XtaskCommand::FmtLint { fix } => fmt_lint(&root, fix),
         XtaskCommand::Debug => debug(&root),
+        XtaskCommand::UsbImage { inventory } => usb_image(&root, inventory).map(|_| ()),
         XtaskCommand::BootTest {
             timeout_secs,
             marker,
@@ -154,12 +195,24 @@ fn build(root: &Path, features: &[&str]) -> Result<()> {
         let args: Vec<&str> = command.iter().map(String::as_str).collect();
         run_cargo(root, &args)?;
     }
-    assemble_esp(root)
+    assemble_esp(root)?;
+    // Everything the machine boots with, not only the part that is
+    // compiled: the disk is as much an input as the image on the ESP, and
+    // CI checks it with `fsck.vfat` before anything is run
+    // (docs/adr/0025-fase4-fat32-read-only.md).
+    prepare_disk(root)?;
+    Ok(())
 }
 
-/// The cargo invocations `build` runs, with `features` enabled on both
-/// crates (`harlan-boot` forwards each one to `harlan-kernel`). Pure so the
-/// feature plumbing is unit-testable.
+/// Features the bootloader has and the kernel does not.
+///
+/// Every other one exists on both, with `harlan-boot` forwarding it. This
+/// list is what stops `--features inventory` being handed to a crate that
+/// has never heard of it, which cargo refuses outright.
+const BOOT_ONLY_FEATURES: &[&str] = &["inventory"];
+
+/// The cargo invocations `build` runs, with `features` enabled on the
+/// crates that have them. Pure so the feature plumbing is unit-testable.
 fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
     [
         ("harlan-kernel", KERNEL_TARGET),
@@ -169,12 +222,81 @@ fn build_commands(features: &[&str]) -> [Vec<String>; 2] {
         let mut command: Vec<String> = ["build", "-p", package, "--target", target]
             .map(String::from)
             .into();
-        if !features.is_empty() {
+        let mine: Vec<&str> = features
+            .iter()
+            .copied()
+            .filter(|feature| package == "harlan-boot" || !BOOT_ONLY_FEATURES.contains(feature))
+            .collect();
+        if !mine.is_empty() {
             command.push("--features".to_string());
-            command.push(features.join(","));
+            command.push(mine.join(","));
         }
         command
     })
+}
+
+/// The user program's own target and the flags that make it loadable.
+///
+/// The toolchain's default for a bare target is a position-independent
+/// executable, which needs relocating at load time. This kernel loads
+/// static ones (docs/adr/0026-fase4-elf-user-programs.md), so the
+/// relocation model and the linker are told so, and the image is based
+/// where a user program lives.
+const USER_PACKAGE: &str = "harlan-hello";
+const USER_BINARY: &str = "hello";
+/// The shell, the second program on the disk
+/// (docs/adr/0030-fase4-shell-in-ring-3.md).
+const SHELL_PACKAGE: &str = "harlan-shell";
+const SHELL_BINARY: &str = "shell";
+const SHELL_ON_DISK: &str = "SHELL.ELF";
+const USER_RUSTFLAGS: &str = concat!(
+    "-C relocation-model=static -C link-arg=-no-pie -C link-arg=--image-base=0x400000",
+    // Without this, a program of 2.9 KB of code ships with 750 KB of
+    // DWARF that nothing on this machine can read: the kernel loads the
+    // PT_LOAD segments and nothing else. It is the on-disk size that
+    // matters, because the kernel reads the whole file into a fixed buffer
+    // before parsing it, and refuses one that does not fit.
+    " -C strip=debuginfo",
+);
+/// What it is called on the disk. Eight and three, like everything else
+/// there (ADR 0025).
+const USER_ON_DISK: &str = "HELLO.ELF";
+
+/// Builds the user program and answers its bytes.
+///
+/// Its own cargo invocation, because the flags above must not reach the
+/// kernel: it is built for the same target and is not an ELF anybody
+/// loads this way.
+fn build_user_program(root: &Path) -> Result<Vec<u8>> {
+    build_program(root, USER_PACKAGE, USER_BINARY)
+}
+
+/// Builds one user program and answers its bytes.
+///
+/// One function for both, taking the names, rather than a copy per
+/// program: the flags are the contract with the loader — static
+/// relocation, no PIE, a fixed image base, and no debug info because the
+/// kernel reads the whole file into a fixed buffer before parsing it — and
+/// a second copy of a contract is one that drifts.
+fn build_program(root: &Path, package: &str, binary: &str) -> Result<Vec<u8>> {
+    let manifest_path = root.join("Cargo.toml");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .args(["-p", package, "--target", KERNEL_TARGET])
+        .env("RUSTFLAGS", USER_RUSTFLAGS)
+        .status()
+        .with_context(|| format!("failed to spawn cargo for {package}"))?;
+    if !status.success() {
+        bail!("building {package} failed with {status}");
+    }
+    let built = root
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join(binary);
+    fs::read(&built).with_context(|| format!("failed to read {}", built.display()))
 }
 
 fn assemble_esp(root: &Path) -> Result<()> {
@@ -212,8 +334,16 @@ fn test(root: &Path) -> Result<()> {
             "harlan-kernel",
             "-p",
             "xtask",
+            // The program's end of the directory record, which is the
+            // other end of the kernel's own `encode_entry`.
+            "-p",
+            "harlan-user-abi",
         ],
-    )
+    )?;
+    // The shell's library only. Its binary is `no_std` and `no_main`, and
+    // there is no way to build one of those for the host: it has no panic
+    // strategy. What is testable here is the half that is only logic.
+    run_cargo(root, &["test", "-p", "harlan-shell", "--lib"])
 }
 
 fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
@@ -236,7 +366,23 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "harlan-kernel",
             "-p",
             "xtask",
+            "-p",
+            "harlan-user-abi",
             "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // As above: the library, because the binary cannot be built for the
+    // host. The binary is linted below, for the target it runs on.
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            "harlan-shell",
+            "--lib",
             "--",
             "-D",
             "warnings",
@@ -263,6 +409,37 @@ fn fmt_lint(root: &Path, fix: bool) -> Result<()> {
             "harlan-boot",
             "--target",
             UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // The user program is held to the same standard as the kernel, even
+    // though it is not part of it
+    // (docs/adr/0026-fase4-elf-user-programs.md).
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            USER_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    // And the shell, which is a user program like the other one
+    // (docs/adr/0030-fase4-shell-in-ring-3.md).
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "-p",
+            SHELL_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
             "--",
             "-D",
             "warnings",
@@ -303,10 +480,17 @@ struct QemuConfig {
     ovmf_code: PathBuf,
     ovmf_vars: PathBuf,
     esp_dir: PathBuf,
+    /// A disk for the kernel to find on the PCI bus and, from Fase 4 on,
+    /// to read (docs/adr/0022-fase4-pci-enumeration.md).
+    disk: PathBuf,
     memory: String,
     headless: bool,
     debug_stub: bool,
     debugcon_log: Option<PathBuf>,
+    /// Where COM1 goes. Separate from the debug port on purpose: the two
+    /// are different devices, and a test that reads one proves nothing
+    /// about the other (docs/adr/0032-fase5-serial-console.md).
+    serial_log: Option<PathBuf>,
     /// QEMU's own diagnostics (`-d guest_errors,cpu_reset`), for soak runs.
     qemu_log: Option<PathBuf>,
 }
@@ -336,6 +520,22 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
         format!("if=pflash,format=raw,file={}", cfg.ovmf_vars.display()),
         "-drive".to_string(),
         format!("format=raw,file=fat:rw:{}", cfg.esp_dir.display()),
+        // The disk, as a virtio device rather than an emulated IDE
+        // controller: it is the one the kernel is going to learn to talk
+        // to, and it is the one the ROADMAP calls "almacenamiento
+        // virtual". Nothing boots from it; the firmware boots from the
+        // ESP above.
+        "-drive".to_string(),
+        format!(
+            "format=raw,file={},if=none,id=harlan-disk",
+            cfg.disk.display()
+        ),
+        "-device".to_string(),
+        // Modern-only. While the legacy interface is there the device is
+        // "transitional" and a driver with a mistake can work by the old
+        // path, which would make the test say nothing
+        // (docs/adr/0023-fase4-device-registers.md).
+        "virtio-blk-pci,drive=harlan-disk,disable-legacy=on,disable-modern=off".to_string(),
         // Must match the fixed port the `uefi` crate's `log-debugcon` feature
         // writes to (0xE9, the "debugcon"/Bochs-style debug port), not the
         // Bochs-BIOS-info-port default of 0x402.
@@ -352,6 +552,17 @@ fn build_qemu_args(cfg: &QemuConfig) -> Vec<String> {
             args.push("-debugcon".to_string());
             args.push("stdio".to_string());
         }
+    }
+
+    // COM1. Always attached, so that a build which stopped writing to it
+    // produces an empty file rather than no file — "nothing came out" and
+    // "nowhere to come out of" look the same otherwise.
+    if let Some(serial_path) = &cfg.serial_log {
+        args.push("-serial".to_string());
+        args.push(format!("file:{}", serial_path.display()));
+    } else {
+        args.push("-serial".to_string());
+        args.push("none".to_string());
     }
 
     if cfg.headless {
@@ -378,6 +589,160 @@ fn qemu_binary() -> &'static str {
     "qemu-system-x86_64"
 }
 
+/// How big the disk is. Small on purpose: it is written on every build and
+/// read one sector at a time.
+/// How big the disk is. Sixty-four megabytes, and the size is not a taste:
+/// FAT32 needs more than 65 525 clusters, and below that the specification
+/// says the volume is FAT16 whatever its BPB claims. A disk too small with
+/// a BPB that says FAT32 is exactly the image a careless reader accepts
+/// and `fsck` rejects (docs/adr/0025-fase4-fat32-read-only.md).
+const DISK_BYTES: u64 = 64 * 1024 * 1024;
+const DISK_LABEL: &str = "HARLAN";
+
+/// What goes on it. Three files: one to read, one long enough to be a
+/// chain of clusters rather than a single one, and one empty, because a
+/// directory entry has to name a cluster even when there is nothing in it.
+fn disk_contents(user_program: Vec<u8>, shell: Vec<u8>) -> Vec<fat32::File> {
+    vec![
+        fat32::File {
+            name: USER_ON_DISK,
+            // The program the kernel runs, compiled by the toolchain
+            // rather than written out by hand
+            // (docs/adr/0026-fase4-elf-user-programs.md).
+            contents: user_program,
+        },
+        fat32::File {
+            name: SHELL_ON_DISK,
+            // The shell, which the kernel starts last and which does not
+            // end (docs/adr/0030-fase4-shell-in-ring-3.md).
+            contents: shell,
+        },
+        fat32::File {
+            name: "HELLO.TXT",
+            contents: b"HARLAN reads its own disk.
+"
+            .to_vec(),
+        },
+        fat32::File {
+            name: "LONG.BIN",
+            // Four clusters and a byte, so that reading it has to follow
+            // the chain and stop where the length says rather than where
+            // the clusters do.
+            contents: (0..4 * 512 + 1).map(|n| (n % 251) as u8).collect(),
+        },
+        fat32::File {
+            name: "EMPTY.BIN",
+            contents: Vec::new(),
+        },
+    ]
+}
+
+/// Where the disk is. Running does not create it: it is an output of
+/// `build`, and recreating it before every boot would wipe whatever the
+/// kernel wrote last time — which is the thing persistence means
+/// (docs/adr/0027-fase4-fat32-write.md).
+fn disk_path(root: &Path) -> Result<PathBuf> {
+    let path = root.join("target").join("disk.img");
+    if !path.exists() {
+        bail!(
+            "there is no disk at {}; run `cargo xtask build` first",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Writes the disk QEMU attaches: a real FAT32 volume, laid out here
+/// rather than synthesised by QEMU — whose own FAT32 says it has never
+/// been tested, and a reader verified against an untested implementation
+/// is not verified at all (ADR 0025, point 4).
+///
+/// Written by `build` and by nothing else. Every boot after that reads and
+/// writes the same image, which is how a file written by one boot is there
+/// for the next.
+/// How big the EFI System Partition is.
+///
+/// FAT32 needs 65 525 clusters to be FAT32 at all, so a 512-byte-cluster
+/// volume cannot be smaller than about 33 MB however little is in it. The
+/// bootloader is a few hundred kilobytes; the rest is the price of using
+/// one formatter for both partitions rather than two.
+const ESP_SECTORS: u32 = 70_000;
+
+/// Builds the bootable USB image and answers where it is.
+///
+/// One file. Everything before this — a directory QEMU pretends is a FAT
+/// volume, and a second raw file beside it — is something only an emulator
+/// can boot (docs/adr/0034-fase5-usb-image.md).
+fn usb_image(root: &Path, inventory: bool) -> Result<PathBuf> {
+    let features: &[&str] = if inventory { &["inventory"] } else { &[] };
+    build(root, features)?;
+
+    let efi = root
+        .join("target")
+        .join(UEFI_TARGET)
+        .join("debug")
+        .join("harlan-boot.efi");
+    let bootloader = fs::read(&efi).with_context(|| format!("failed to read {}", efi.display()))?;
+    let disk = prepare_disk(root)?;
+    let data = fs::read(&disk).with_context(|| format!("failed to read {}", disk.display()))?;
+
+    println!(
+        "usb: the bootloader is {} byte(s), the HARLAN volume {} byte(s)",
+        bootloader.len(),
+        data.len()
+    );
+    let image = gpt::usb_image(bootloader, data, ESP_SECTORS)?;
+
+    // A different name, so an inventory stick and an ordinary one cannot
+    // be confused on somebody's desk.
+    let path = root.join("target").join(if inventory {
+        "harlan-inventory.img"
+    } else {
+        "harlan-usb.img"
+    });
+    fs::write(&path, &image).with_context(|| format!("failed to write {}", path.display()))?;
+    println!(
+        "usb: {} is {} byte(s) ({} MiB)",
+        path.display(),
+        image.len(),
+        image.len() / (1024 * 1024)
+    );
+    println!(
+        "usb: write it to a stick with `dd if={} of=/dev/sdX bs=4M status=progress conv=fsync` \
+         — and be certain of which device `sdX` is, because this overwrites it",
+        path.display()
+    );
+    Ok(path)
+}
+
+fn prepare_disk(root: &Path) -> Result<PathBuf> {
+    let path = root.join("target").join("disk.img");
+    let sectors = (DISK_BYTES / fat32::SECTOR_BYTES as u64) as u32;
+    let user_program = build_user_program(root)?;
+    println!(
+        "disk: {USER_ON_DISK} is {} byte(s) of ELF",
+        user_program.len()
+    );
+    let shell = build_program(root, SHELL_PACKAGE, SHELL_BINARY)?;
+    println!("disk: {SHELL_ON_DISK} is {} byte(s) of ELF", shell.len());
+    let (image, geometry) =
+        fat32::format(sectors, 1, DISK_LABEL, &disk_contents(user_program, shell))
+            .map_err(|err| anyhow::anyhow!("the disk image could not be laid out: {err:?}"))?;
+    fs::create_dir_all(path.parent().expect("target has a parent"))
+        .context("failed to create the target directory for the disk")?;
+    fs::write(&path, &image)
+        .with_context(|| format!("failed to write the disk at {}", path.display()))?;
+    println!(
+        "disk: FAT32, {} sectors, {} clusters of {} sector(s), {} sector(s) per table, root at cluster {}",
+        geometry.total_sectors,
+        geometry.clusters,
+        geometry.sectors_per_cluster,
+        geometry.sectors_per_fat,
+        geometry.root_cluster
+    );
+    Ok(path)
+}
+
 fn prepare_qemu_config(
     root: &Path,
     headless: bool,
@@ -386,14 +751,17 @@ fn prepare_qemu_config(
 ) -> Result<QemuConfig> {
     let (ovmf_code, ovmf_vars_template) = fetch_ovmf(root)?;
     let ovmf_vars = prepare_vars_copy(root, &ovmf_vars_template)?;
+    let disk = disk_path(root)?;
     Ok(QemuConfig {
         ovmf_code,
         ovmf_vars,
         esp_dir: root.join("target").join("esp"),
+        disk,
         memory: memory.to_string(),
         headless,
         debug_stub,
         debugcon_log: None,
+        serial_log: None,
         qemu_log: None,
     })
 }
@@ -447,11 +815,15 @@ fn boot_test(
 fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) -> Result<()> {
     let mut cfg = prepare_qemu_config(root, true, false, memory)?;
     let log_path = root.join("target").join("boot-test.log");
+    let serial_path = root.join("target").join("boot-test-serial.log");
     let stderr_path = root.join("target").join("boot-test-qemu-stderr.log");
-    if log_path.exists() {
-        fs::remove_file(&log_path).context("failed to clear previous boot-test log")?;
+    for path in [&log_path, &serial_path] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
+        }
     }
     cfg.debugcon_log = Some(log_path.clone());
+    cfg.serial_log = Some(serial_path.clone());
     let args = build_qemu_args(&cfg);
 
     let stderr_file = fs::File::create(&stderr_path)
@@ -470,10 +842,27 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
 
     let start = Instant::now();
     let found = loop {
-        if log_path
-            .metadata()
-            .is_ok_and(|_| fs::read_to_string(&log_path).is_ok_and(|c| c.contains(marker)))
-        {
+        if log_path.metadata().is_ok_and(|_| {
+            fs::read_to_string(&log_path).is_ok_and(|log| {
+                if marker != DEFAULT_MARKER {
+                    // Somebody is testing one stage; wait for what they
+                    // asked for and nothing else.
+                    return log.contains(marker);
+                }
+                // A boot with a disk produces two things, and the wait
+                // ends when **both** have happened: the shell in ring 3
+                // says it is reading keys, and the program in ring 3
+                // finishes its checks.
+                //
+                // Waiting for either would end the boot at whichever came
+                // first and kill QEMU before the other. The shell comes up
+                // first, so waiting for it alone cut the program off part
+                // way through — a green boot that had checked nothing.
+                let shell = log.contains(RING3_SHELL_MARKER) || log.contains(DEFAULT_MARKER);
+                let program = log.contains(RING3_FILE_MARKER) || log.contains(RING3_FILE_FAILED);
+                shell && program
+            })
+        }) {
             break true;
         }
         if let Some(status) = child.try_wait().context("failed to poll qemu status")? {
@@ -490,14 +879,75 @@ fn boot_test_once(root: &Path, timeout: Duration, marker: &str, memory: &str) ->
     let _ = child.wait();
 
     if found {
-        println!(
-            "boot-test: marker {marker:?} observed after {:?}",
-            start.elapsed()
-        );
+        if marker == DEFAULT_MARKER {
+            // Not the default marker's name: with a disk that one never
+            // appears, and printing it would be saying something untrue
+            // about what was waited for.
+            println!(
+                "boot-test: a shell and the program answered after {:?}",
+                start.elapsed()
+            );
+        } else {
+            println!(
+                "boot-test: marker {marker:?} observed after {:?}",
+                start.elapsed()
+            );
+        }
+        // Only when the boot was not asked to look for something else:
+        // a `--marker` of its own means somebody is testing one stage, and
+        // the ring-3 program may not have run at all.
+        if marker == DEFAULT_MARKER {
+            let log = fs::read_to_string(&log_path).context("failed to re-read the boot log")?;
+            // With a disk — which `boot-test` always gives it — the shell
+            // is the program in ring 3. The kernel's own coming up instead
+            // means the program did not load, and that is the failure this
+            // check exists for: it would otherwise be a green boot with
+            // nothing running in ring 3.
+            if !log.contains(RING3_SHELL_MARKER) {
+                bail!(
+                    "boot-test: {RING3_SHELL_MARKER:?} is not in the log, so the shell in ring 3 did not come up (see {})",
+                    log_path.display()
+                );
+            }
+            println!("boot-test: the shell in ring 3 came up");
+
+            // And the same boot, out of the other device. A kernel that
+            // stopped writing to COM1 would still pass everything above,
+            // and would reach the target PC saying nothing at all
+            // (docs/adr/0032-fase5-serial-console.md).
+            let serial = fs::read_to_string(&serial_path).unwrap_or_default();
+            if !serial.contains(RING3_SHELL_MARKER) {
+                bail!(
+                    "boot-test: the boot did not come out of COM1 (see {}); the debug port is an emulator's, and a kernel that only writes there is silent on real hardware",
+                    serial_path.display()
+                );
+            }
+            println!(
+                "boot-test: {} byte(s) of the same boot came out of COM1",
+                serial.len()
+            );
+            if log.contains(RING3_FILE_FAILED) {
+                let which: Vec<&str> = log
+                    .lines()
+                    .filter(|line| line.contains(RING3_FILE_FAILED))
+                    .collect();
+                bail!(
+                    "boot-test: the program in ring 3 failed a file check:\n  {}",
+                    which.join("\n  ")
+                );
+            }
+            if !log.contains(RING3_FILE_MARKER) {
+                bail!(
+                    "boot-test: {RING3_FILE_MARKER:?} is not in the log, so the program in ring 3 did not finish its file checks (see {})",
+                    log_path.display()
+                );
+            }
+            println!("boot-test: the program in ring 3 passed every file check");
+        }
         Ok(())
     } else {
         bail!(
-            "boot-test: marker {marker:?} NOT observed within {timeout:?} (see {} and {})",
+            "boot-test: no shell came up within {timeout:?} (waiting for {marker:?} or {RING3_SHELL_MARKER:?}; see {} and {})",
             log_path.display(),
             stderr_path.display()
         );
@@ -763,10 +1213,12 @@ mod tests {
             ovmf_code: PathBuf::from("target/ovmf/x64/code.fd"),
             ovmf_vars: PathBuf::from("target/ovmf-vars.fd"),
             esp_dir: PathBuf::from("target/esp"),
+            disk: PathBuf::from("target/disk.img"),
             memory: "256M".to_string(),
             headless: false,
             debug_stub: false,
             debugcon_log: None,
+            serial_log: None,
             qemu_log: None,
         }
     }
@@ -778,6 +1230,34 @@ mod tests {
             args.windows(2).any(|w| w == ["-net", "none"]),
             "expected -net none in {args:?}"
         );
+    }
+
+    /// The disk has to arrive as a virtio device and the drive it names
+    /// has to be the one the device is given, or QEMU starts without it
+    /// and the kernel finds nothing.
+    #[test]
+    fn qemu_args_attach_the_disk_to_a_virtio_device() {
+        let args = build_qemu_args(&sample_config());
+        let drive = args
+            .iter()
+            .find(|a| a.contains("disk.img"))
+            .expect("the disk is attached");
+        assert!(drive.contains("id=harlan-disk"), "{drive}");
+        assert!(
+            drive.contains("if=none"),
+            "not on a bus of its own: {drive}"
+        );
+        let device = args
+            .iter()
+            .find(|a| a.starts_with("virtio-blk-pci"))
+            .expect("the device is there");
+        assert!(device.contains("drive=harlan-disk"), "{device}");
+        assert!(
+            device.contains("disable-legacy=on"),
+            "modern only, so a driver cannot work by the old path: {device}"
+        );
+        // And the ESP is still what the firmware boots from.
+        assert!(args.iter().any(|a| a.contains("fat:rw:")));
     }
 
     #[test]
@@ -984,5 +1464,39 @@ mod tests {
         let args = build_qemu_args(&cfg);
         let idx = args.iter().position(|a| a == "-debugcon").unwrap();
         assert!(args[idx + 1].starts_with("file:"));
+    }
+
+    /// A feature only the bootloader has is given only to the bootloader.
+    ///
+    /// Cargo refuses a `--features` naming one a crate does not have, so
+    /// this is the difference between `usb-image --inventory` working and
+    /// not building at all.
+    #[test]
+    fn a_boot_only_feature_does_not_reach_the_kernel() {
+        let [kernel, boot] = build_commands(&["inventory"]);
+        assert!(
+            !kernel.contains(&"--features".to_string()),
+            "the kernel was given a feature it does not have: {kernel:?}"
+        );
+        assert!(boot.contains(&"inventory".to_string()), "{boot:?}");
+    }
+
+    /// And one both have still reaches both.
+    #[test]
+    fn a_shared_feature_reaches_both() {
+        let [kernel, boot] = build_commands(&["soak"]);
+        for command in [&kernel, &boot] {
+            assert!(command.contains(&"soak".to_string()), "{command:?}");
+        }
+    }
+
+    /// Mixed, each to the crate that has it.
+    #[test]
+    fn each_feature_goes_where_it_belongs() {
+        let [kernel, boot] = build_commands(&["soak", "inventory"]);
+        let at = kernel.iter().position(|a| a == "--features").expect("some");
+        assert_eq!(kernel[at + 1], "soak", "only the shared one");
+        let at = boot.iter().position(|a| a == "--features").expect("some");
+        assert_eq!(boot[at + 1], "soak,inventory");
     }
 }

@@ -3,15 +3,19 @@
 pub mod addr;
 mod console;
 mod cpu;
+pub mod elf;
+pub mod fat;
 pub mod frame;
 pub mod framebuffer;
 mod interrupts;
 pub mod klog;
 pub mod memory_map;
 pub mod paging;
+pub mod pci;
 pub mod pe;
 mod power;
 mod timer;
+pub mod virtio;
 
 pub use console::{Console, ConsoleKey};
 pub use cpu::CpuControl;

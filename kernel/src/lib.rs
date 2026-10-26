@@ -2,10 +2,20 @@
 
 extern crate alloc;
 
+pub mod console;
+#[cfg(target_arch = "x86_64")]
+pub mod devices;
+pub mod events;
+pub mod fs;
 pub mod identity;
+pub mod ipc;
 #[cfg(target_arch = "x86_64")]
 pub mod klog;
 mod memory;
+#[cfg(target_arch = "x86_64")]
+pub mod process;
+#[cfg(target_arch = "x86_64")]
+pub mod scheduler;
 mod shell;
 mod sync;
 #[cfg(target_arch = "x86_64")]
@@ -519,6 +529,22 @@ extern "C" fn continue_in_kernel_space<C: Console + 'static, P: PowerControl + '
 /// back in the pool, and the shell.
 #[cfg(target_arch = "x86_64")]
 fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelContext<C, P>) -> ! {
+    // The console goes to its module, where a syscall can reach it
+    // (docs/adr/0029-fase4-console-and-list-abi.md). Here and not where the
+    // context was built: the trait object formed below carries a vtable
+    // address, and one formed before the kernel moved to the higher half
+    // would name an image that is no longer mapped — which is the reason
+    // `KernelContext` keeps concrete types.
+    //
+    // From this line on, `context.console` is not read again. The module is
+    // the only way to the console, and the kernel's own shell gets it back
+    // through `console::take`.
+    // SAFETY: the console was leaked onto the heap by `kmain`, so it lives
+    // as long as the kernel; this runs after the move to the higher half,
+    // so the vtable address is mapped; and nothing else uses the console
+    // through another reference from here on.
+    unsafe { console::adopt(&raw mut *context.console) };
+
     use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
 
     // What still runs through the identity map: the kernel's own code and
@@ -788,6 +814,187 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         );
     }
 
+    // What is on the bus. Reading only: no BAR is written, no device is
+    // configured (docs/adr/0022-fase4-pci-enumeration.md).
+    // SAFETY: one core, and nothing else in this kernel uses the two
+    // configuration ports.
+    let devices = unsafe { harlan_arch_x86_64::pci::scan() };
+    for found in devices.iter() {
+        info!(
+            "HARLAN: pci {:02x}:{:02x}.{} {:04x}:{:04x} {} (class {:02x}.{:02x})",
+            found.at.bus,
+            found.at.device,
+            found.at.function,
+            found.header.vendor,
+            found.header.device,
+            found.header.class_name(),
+            found.header.class,
+            found.header.subclass
+        );
+    }
+    if devices.lost() > 0 {
+        warn!(
+            "HARLAN: {} more function(s) on the bus than the kernel keeps ({})",
+            devices.lost(),
+            harlan_arch_x86_64::pci::KEPT_AT_MOST
+        );
+    }
+    // The one Fase 4 is going to learn to talk to. Named by vendor, not
+    // by class: the machine also has an emulated IDE controller, and
+    // "the first storage device" would be whichever the scan met first.
+    const VIRTIO_VENDOR: u16 = 0x1AF4;
+    const MASS_STORAGE: u8 = 0x01;
+    match devices
+        .iter()
+        .find(|f| f.header.vendor == VIRTIO_VENDOR && f.header.class == MASS_STORAGE)
+    {
+        Some(disk) => {
+            info!(
+                "HARLAN: a virtio disk at pci {:02x}:{:02x}.{} ({:04x}:{:04x})",
+                disk.at.bus,
+                disk.at.device,
+                disk.at.function,
+                disk.header.vendor,
+                disk.header.device
+            );
+            // Its registers, as the firmware left them. A 64-bit BAR takes
+            // two of the six entries, so the walk steps over the half it
+            // has already read rather than reading it as a BAR of its own.
+            let mut index = 0;
+            while index < 6 {
+                match harlan_hal::pci::decode_bar(&disk.header.bars, index) {
+                    Some(bar) => {
+                        info!("HARLAN:   bar {index}: {bar}");
+                        index += bar.entries();
+                    }
+                    None => index += 1,
+                }
+            }
+        }
+        None => warn!("HARLAN: no virtio storage on the bus"),
+    }
+
+    // And the disk, if the kernel owns its tables: its registers have to
+    // be mapped, which is only the kernel's to do once the firmware's
+    // identity map is gone (docs/adr/0023-fase4-device-registers.md).
+    let disk = if own_tables {
+        // SAFETY: the kernel owns its tables and reaches frames through
+        // its own window, the scan above is of this machine's bus, and
+        // nothing else drives this device.
+        match unsafe {
+            devices::virtio_blk::start(&mut context.mapper, &mut context.frames, &devices)
+        } {
+            Ok(disk) => {
+                info!(
+                    "HARLAN: the disk at pci {:02x}:{:02x}.{} is negotiated: registers from bar {} at {:#x}, offers {:#x}, agreed {:#x}, {} queue(s), queue 0 holds {} descriptor(s) and is notified at {}",
+                    disk.at.bus,
+                    disk.at.device,
+                    disk.at.function,
+                    disk.bar,
+                    disk.registers,
+                    disk.offered,
+                    disk.accepted,
+                    disk.queues,
+                    disk.queue_size,
+                    disk.notify_offset
+                );
+                Some(disk)
+            }
+            Err(err) => {
+                error!("HARLAN: the disk could not be started ({err:?})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // And one sector off it, which is the whole point of the phase
+    // (docs/adr/0024-fase4-dma-and-the-queue.md).
+    // The reader outlives this block: the program the kernel runs comes
+    // off the same disk, further down
+    // (docs/adr/0026-fase4-elf-user-programs.md).
+    if let Some(disk) = disk {
+        // SAFETY: the disk is negotiated and not started, the kernel owns
+        // its tables, and `frames` reaches frames through its window.
+        match unsafe {
+            devices::virtio_blk::start_queue(&disk, &mut context.mapper, &mut context.frames)
+        } {
+            Ok(mut reader) => {
+                // The boot sector, and the copy FAT32 keeps at sector 6.
+                // Reading both checks three things at once: that the BPB
+                // parses, that the sector number reaches the device — six
+                // is not zero — and that the image really has its backup
+                // where it belongs
+                // (docs/adr/0025-fase4-fat32-read-only.md).
+                let mut boot_sector = [0u8; 512];
+                // SAFETY: the reader owns its queue and its request frame,
+                // and nothing else has a request in flight.
+                let first = unsafe { reader.read_sector(&disk, 0, &mut boot_sector) };
+                match first.map(|()| harlan_hal::fat::BootSector::parse(&boot_sector)) {
+                    Ok(Ok(volume)) => {
+                        info!(
+                            "HARLAN: the disk holds FAT32: {} sector(s) of {} byte(s), {} cluster(s) of {} sector(s), {} table(s) of {} sector(s) from sector {}, root at cluster {} (sector {:?}), data from sector {}",
+                            volume.total_sectors,
+                            volume.bytes_per_sector,
+                            volume.clusters,
+                            volume.sectors_per_cluster,
+                            volume.fat_count,
+                            volume.sectors_per_fat,
+                            volume.first_fat_sector(),
+                            volume.root_cluster,
+                            volume.sector_of_cluster(volume.root_cluster),
+                            volume.first_data_sector()
+                        );
+                        // From here the disk belongs to `fs`, where a
+                        // syscall can reach it
+                        // (docs/adr/0028-fase4-file-abi-v0.md). The boot
+                        // reads the rest of its files through the same
+                        // path a program's `open` takes.
+                        let ours = fs::adopt(disk, reader, volume);
+                        events::record(events::What::Disk, u64::from(volume.clusters));
+                        // Said out loud, both ways, and recorded. A kernel
+                        // that quietly declined to write would look exactly
+                        // like one whose disk was broken; a kernel that
+                        // quietly wrote to somebody's disk is the thing
+                        // Fase 5 exists to not do
+                        // (docs/adr/0033-fase5-only-our-disk.md).
+                        match volume.volume_id {
+                            Some(id) if ours => info!(
+                                "HARLAN: this disk is ours ({:?}, serial {:#010x}); it may be written to",
+                                id.label(),
+                                id.serial
+                            ),
+                            Some(id) => {
+                                events::record_with(events::What::NotOurs, 0, id.label());
+                                warn!(
+                                    "HARLAN: this disk says it is {:?} with serial {:#010x}, which is not what this kernel's tooling writes; it will be read and never written",
+                                    id.label(),
+                                    id.serial
+                                )
+                            }
+                            None => {
+                                events::record_with(events::What::NotOurs, 0, "unnamed");
+                                warn!(
+                                    "HARLAN: this disk does not say who it is; it will be read and never written"
+                                )
+                            }
+                        }
+                        check_backup_boot_sector(&volume, &boot_sector);
+                        read_a_file();
+                        count_this_boot();
+                    }
+                    Ok(Err(err)) => {
+                        events::record(events::What::NoDisk, 0);
+                        error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
+                    }
+                    Err(err) => error!("HARLAN: the boot sector could not be read ({err:?})"),
+                }
+            }
+            Err(err) => error!("HARLAN: the disk's queue could not be started ({err:?})"),
+        }
+    }
+
     // Soak builds (`cargo xtask soak-test`) never reach the shell: they run
     // heap stress rounds until QEMU is stopped.
     if cfg!(feature = "soak") {
@@ -807,28 +1014,269 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // clears `IF`), so the two never use it at once.
         // SAFETY: as above.
         unsafe { harlan_arch_x86_64::set_kernel_stack(syscall_stack.top()) };
-        // SAFETY: the lower half is the kernel's since `keep_only`, and
-        // nothing else uses the program's addresses.
-        match unsafe { user::load(&mut context.mapper, &mut context.frames) } {
-            Ok(program) => {
-                info!(
-                    "HARLAN: the program is {} byte(s) at {:#x}, its stack at {:#x}",
-                    user::PROGRAM.len(),
-                    user::PROGRAM_BASE,
-                    user::STACK_BASE
-                );
-                // SAFETY: `init` ran above, `load` mapped the pages, and
-                // `into_the_shell` is a function of this kernel's, safe to
-                // run on the syscall stack.
-                unsafe {
-                    user::enter(
+        // The program that comes off the disk, if there is a disk. Read
+        // before anything is started, because one of the processes is it
+        // (docs/adr/0026-fase4-elf-user-programs.md).
+        let mut elf_bytes = alloc::vec![0u8; 64 * 1024];
+        let elf = load_program(USER_PROGRAM, &mut elf_bytes);
+        // And the shell, which is the one that does not end
+        // (docs/adr/0030-fase4-shell-in-ring-3.md). Its own buffer: both
+        // are loaded before anything is started, so they cannot share one.
+        let mut shell_bytes = alloc::vec![0u8; 64 * 1024];
+        let shell_elf = load_program(SHELL_PROGRAM, &mut shell_bytes);
+
+        // Eight processes, each with a space of its own and a kernel
+        // stack of its own.
+        //
+        // Four do their work: two say who they are and take turns (ADR
+        // 0017 and ADR 0018), and two exchange a message, which is what
+        // Fase 3 set out to show (ADR 0019). The receiver is spawned
+        // **before** the sender on purpose: round robin reaches it first,
+        // it finds an empty mailbox and parks, and the sender is what
+        // wakes it. The other order would never wait.
+        //
+        // The other four try what must not work (ADR 0020). What they
+        // demonstrate is not that each attempt fails, but that the four
+        // above finish their work afterwards, on a machine that is still
+        // running.
+        const RECEIVER_SLOT: u8 = 2;
+        // Kernel memory, named so that the trespassers can aim at it. The
+        // address is the kernel's own code: mapped, with something in it,
+        // and a fault away from ring 3.
+        let kernel_address = user::handle as *const () as u64;
+        match harlan_hal::paging::PageMapper::translate(
+            &context.mapper,
+            harlan_hal::addr::VirtAddr::new(kernel_address),
+        ) {
+            Some(frame) => info!(
+                "HARLAN: {kernel_address:#x} is kernel code, mapped at {frame}; two processes are about to try to reach it"
+            ),
+            None => error!(
+                "HARLAN: {kernel_address:#x} is not mapped, so trying to read it would prove nothing"
+            ),
+        }
+        let talking_one = user::talker_program(b'1');
+        let talking_two = user::talker_program(b'2');
+        let receiving = user::receiver_program();
+        let sending = user::sender_program(RECEIVER_SLOT);
+        let reading_the_kernel = user::reads_kernel_memory(kernel_address);
+        let writing_its_code = user::writes_its_own_code();
+        let running_its_stack = user::runs_its_own_stack();
+        let lying = user::lies_about_a_pointer(kernel_address);
+        // The eight written by hand, and then the one that was compiled.
+        // The order matters: the sender was built naming a slot, so the
+        // new one goes last (docs/adr/0026-fase4-elf-user-programs.md).
+        let mut programs: alloc::vec::Vec<ToStart> = alloc::vec![
+            ToStart::Flat(&talking_one),
+            ToStart::Flat(&talking_two),
+            ToStart::Flat(&receiving),
+            ToStart::Flat(&sending),
+            ToStart::Flat(&reading_the_kernel),
+            ToStart::Flat(&writing_its_code),
+            ToStart::Flat(&running_its_stack),
+            ToStart::Flat(&lying),
+        ];
+        if let Some((program, file)) = &elf {
+            programs.push(ToStart::Elf(program, file));
+        }
+        // The shell is **not** in this list. It does not end, so a round
+        // containing it never finishes, and the frame balance below — the
+        // check that says the processes which ended gave back everything
+        // they took — would stop being measured on every boot. It starts
+        // afterwards, in a round of its own.
+
+        // What the allocator has before any process exists. Everything
+        // taken from here on belongs to a process, and once they are all
+        // gone the number has to come back
+        // (docs/adr/0021-fase3-reclaiming-a-dead-space.md).
+        let free_before_any_process = context.frames.free_frames();
+        let mut next_stack = syscall_stack.top();
+        let mut started = 0;
+        let mut first_entry = None;
+        for (which, program) in programs.iter().enumerate() {
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let Ok(stack) = stack else {
+                error!("HARLAN: no kernel stack for process {which}");
+                break;
+            };
+            next_stack = stack.top();
+            // SAFETY: the kernel owns its tables and reaches frames
+            // through its own window; nothing else uses what this takes.
+            let spawned = unsafe {
+                match program {
+                    ToStart::Flat(bytes) => {
+                        process::spawn(&mut context.mapper, &mut context.frames, bytes, stack)
+                    }
+                    ToStart::Elf(program, file) => process::spawn_elf(
+                        &mut context.mapper,
+                        &mut context.frames,
                         program,
-                        into_the_shell::<C, P>,
-                        (context as *mut KernelContext<C, P>).cast(),
+                        file,
+                        stack,
+                    ),
+                }
+            };
+            match spawned {
+                Ok(process) => {
+                    let entry = process.entry();
+                    let here = process.space.translate(entry);
+                    match (first_entry, here) {
+                        (None, _) => first_entry = here,
+                        (Some(before), Some(now)) if before != now => info!(
+                            "HARLAN: {entry:#x} is {before} in one process and {now} in another: different memory, same address"
+                        ),
+                        (before, now) => error!(
+                            "HARLAN: the processes do not have separate memory at {entry:#x} ({before:?}, {now:?})"
+                        ),
+                    }
+                    let process = alloc::boxed::Box::leak(alloc::boxed::Box::new(process));
+                    // SAFETY: `spawn` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(process) } {
+                        // The sender was built naming a slot, so a
+                        // process that lands somewhere else would be
+                        // sending to a stranger.
+                        Some(slot) if slot == which => {
+                            info!("HARLAN: process {which} runs in slot {slot}");
+                            events::record(events::What::Started, slot as u64);
+                            started += 1;
+                        }
+                        Some(slot) => error!(
+                            "HARLAN: process {which} landed in slot {slot}, not the one it was built for"
+                        ),
+                        None => error!("HARLAN: no room in the scheduler for process {which}"),
+                    }
+                }
+                Err(err) => error!("HARLAN: process {which} could not be started ({err:?})"),
+            }
+        }
+
+        if started > 0 {
+            // The timer gives the CPU away too, not just `yield`.
+            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+            // And a process that faults ends there, rather than taking the
+            // machine with it (ADR 0020). Until this is set, a fault in
+            // ring 3 stops the CPU like one in the kernel.
+            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
+            // SAFETY: the kernel is in its own space, on its own stack,
+            // and no process is running yet.
+            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+            // With the CPU back, what the dead were using can go.
+            let mut returned = 0;
+            // SAFETY: nothing is running on them.
+            for dead in unsafe { scheduler::dead_processes() } {
+                // SAFETY: the process is gone and nothing is on its
+                // stack: this runs on the kernel's own.
+                returned +=
+                    unsafe { process::destroy(&mut context.mapper, &mut context.frames, dead) };
+            }
+            let free_now = context.frames.free_frames();
+            match free_now.cmp(&free_before_any_process) {
+                core::cmp::Ordering::Equal => {
+                    events::record(events::What::Frames, returned);
+                    info!(
+                        "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
                     )
                 }
+                core::cmp::Ordering::Less => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, but {} are still held; {free_now} free",
+                    free_before_any_process - free_now
+                ),
+                core::cmp::Ordering::Greater => error!(
+                    "HARLAN: {returned} frame(s) back from the processes that ended, which is {} more than they ever took; {free_now} free",
+                    free_now - free_before_any_process
+                ),
             }
-            Err(err) => error!("HARLAN: the program could not be loaded ({err:?})"),
+        }
+
+        // The self-test round is over and accounted for, so it is written
+        // down (ADR 0031, point 8). Here and not inside the branch below:
+        // a disk with no `SHELL.ELF` on it still has a disk, and losing a
+        // boot's events because the shell was missing would lose exactly
+        // the boot somebody is asking about.
+        write_events();
+
+        // And now the shell, in a round of its own, because this one does
+        // not end (docs/adr/0030-fase4-shell-in-ring-3.md). Everything
+        // above has finished and been accounted for; from here the machine
+        // belongs to whoever is typing.
+        if let Some((program, file)) = &shell_elf {
+            // A kernel stack of its own, the next one after the ones the
+            // demonstrations used — they are gone, but their stacks were
+            // mapped and this is simpler than reusing one.
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let shell_stack = match stack {
+                Ok(stack) => stack,
+                Err(err) => {
+                    error!("HARLAN: no kernel stack for the shell ({err:?})");
+                    // Never returns: the kernel's own shell takes over.
+                    into_the_shell::<C, P>((context as *mut KernelContext<C, P>).cast())
+                }
+            };
+            // SAFETY: the kernel owns its tables and reaches frames through
+            // its own window; nothing else uses what this takes.
+            match unsafe {
+                process::spawn_elf(
+                    &mut context.mapper,
+                    &mut context.frames,
+                    program,
+                    file,
+                    shell_stack,
+                )
+            } {
+                Ok(shell) => {
+                    let shell = alloc::boxed::Box::leak(alloc::boxed::Box::new(shell));
+                    // SAFETY: `spawn_elf` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(shell) } {
+                        Some(slot) => {
+                            info!("HARLAN: the shell runs in slot {slot}");
+                            events::record(events::What::Shell, slot as u64);
+                            // Again, because the round below does not come
+                            // back while the shell lives: without this the
+                            // line saying a shell started would sit in the
+                            // ring until the machine stopped, which is the
+                            // one moment it cannot be written.
+                            write_events();
+                            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+                            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
+                            // SAFETY: the kernel is in its own space, on
+                            // its own stack, and nothing is running.
+                            //
+                            // This does not come back while the shell is
+                            // alive. It does if the shell exits, and then
+                            // the kernel's own takes over below — which is
+                            // what `exit` at the prompt is for.
+                            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+                            // SAFETY: nothing is running on them.
+                            for dead in unsafe { scheduler::dead_processes() } {
+                                // SAFETY: the process is gone and nothing
+                                // is on its stack.
+                                unsafe {
+                                    process::destroy(&mut context.mapper, &mut context.frames, dead)
+                                };
+                            }
+                            events::record(events::What::ShellGone, 0);
+                            write_events();
+                            info!(
+                                "HARLAN: the shell in ring 3 is gone; the kernel's own takes over"
+                            );
+                        }
+                        None => error!("HARLAN: no room in the scheduler for the shell"),
+                    }
+                }
+                Err(err) => error!("HARLAN: the shell could not be started ({err:?})"),
+            }
         }
     }
 
@@ -843,12 +1291,39 @@ extern "C" fn into_the_shell<C: Console + 'static, P: PowerControl + 'static>(
 ) -> ! {
     use harlan_hal::InterruptControl;
 
+    // SAFETY: the same context `run` was given; nothing else refers to it.
+    let context = unsafe { &mut *context.cast::<KernelContext<C, P>>() };
+    // Out of the process's space and back into the kernel's own, so that
+    // nothing of a program that has exited is mapped any more.
+    // SAFETY: this code, its stack and its heap are in the higher half,
+    // which every space shares, and nothing here points into the lower
+    // half of the space being left.
+    unsafe { context.mapper.activate() };
     // A syscall runs with interrupts off (`FMASK`), and the shell needs
     // the keyboard.
     harlan_arch_x86_64::Cpu.enable();
-    // SAFETY: the same context `run` was given; nothing else refers to it.
-    let context = unsafe { &mut *context.cast::<KernelContext<C, P>>() };
-    let console = &mut *context.console;
+    // Taken rather than borrowed for each line: the shell loops for ever,
+    // and holding the lock across that loop would leave interrupts disabled
+    // for ever — the keyboard IRQ would never fire and the shell would
+    // never get a key.
+    //
+    // One owner at a time: from here on a syscall finds no console, which is
+    // right, because this runs only when nothing is runnable and a syscall
+    // can only come from a process that is running.
+    let Some(console) = console::take() else {
+        // `run` adopts it and nothing else takes it, so this cannot happen.
+        // If it ever does, the kernel has no shell, and saying so is better
+        // than carrying on as if it had one.
+        error!("HARLAN: there is no console to run a shell on");
+        loop {
+            use harlan_hal::CpuControl;
+            harlan_arch_x86_64::Cpu.halt_once();
+        }
+    };
+    // SAFETY: `take` handed over the only way to the console, so this is the
+    // only reference to it; it points at heap the kernel leaked, which
+    // outlives this function (which never returns).
+    let console = unsafe { &mut *console };
     banner(console);
     shell::run_shell(console, context.power)
 }
@@ -865,4 +1340,342 @@ fn banner(console: &mut dyn Console) {
     console.write_str(ARCH_NAME);
     console.write_str("\n");
     console.write_str("Kernel.......... READY\n\n");
+}
+
+/// Counts this boot in a file on the disk, and says what the file said
+/// before.
+///
+/// This is the phase's exit criterion in one function: a file created on
+/// one boot, read on the next, with nothing between them but the disk
+/// (docs/adr/0027-fase4-fat32-write.md). The number only grows because
+/// what was written survived; a disk that forgot would start again at one
+/// every time, and so would a reader that could not find what it wrote.
+fn count_this_boot() {
+    const NAME: &str = "BOOTS.TXT";
+
+    // What the last boot left, if there was one.
+    let before = match fs::find(NAME) {
+        Ok(entry) => {
+            let mut bytes = [0u8; 32];
+            match fs::read_file(&entry, &mut bytes) {
+                Ok(read) => core::str::from_utf8(&bytes[..read])
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok()),
+                Err(err) => {
+                    error!("HARLAN: {NAME} is there and could not be read ({err:?})");
+                    None
+                }
+            }
+        }
+        Err(fs::FileError::NoSuchFile) => None,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+
+    let this = before.unwrap_or(0) + 1;
+    // Up to ten digits and a newline, which is more than a `u32` needs.
+    let mut text = [0u8; 11];
+    let written = write_number(&mut text, this);
+    match fs::write_file(NAME, &text[..written]) {
+        Ok(entry) => {
+            // The boot number is what stands in for a date: without a wall
+            // clock, "boot 7" is the closest thing to *when* this machine
+            // can say (ADR 0031, point 10).
+            events::this_boot(this);
+            events::record(events::What::Boot, u64::from(this));
+            match before {
+                Some(before) => info!(
+                    "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+                None => info!(
+                    "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
+    }
+}
+
+/// Writes the events of this boot onto what the disk already held.
+///
+/// Read, join, write whole: the only shape ADR 0027 allows, and the one
+/// that makes the file the history of the machine rather than of the last
+/// boot (ADR 0031, point 6).
+///
+/// Everything here is on the stack of a kernel that has a 4 MB heap, so the
+/// two buffers are heap-allocated: 32 KB on a kernel stack with a guard
+/// page either side would be most of it.
+fn write_events() {
+    const NAME: &str = "EVENTS.LOG";
+
+    // What this boot has to say.
+    let mut mine = alloc::vec![0u8; events::EVENTS * events::LINE];
+    let mine_len = events::copy_into(&mut mine);
+
+    // What was already there. A missing file is not a failure: the first
+    // boot of a fresh disk has nothing to add to.
+    let mut old = alloc::vec![0u8; events::MAX_FILE];
+    let old_len = match fs::find(NAME) {
+        Ok(entry) => match fs::read_file(&entry, &mut old) {
+            Ok(read) => read,
+            Err(err) => {
+                error!("HARLAN: {NAME} is there and could not be read ({err:?})");
+                0
+            }
+        },
+        Err(fs::FileError::NoSuchFile) => 0,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+
+    let mut joined = alloc::vec![0u8; events::MAX_FILE];
+    let len = events::join(
+        &old[..old_len],
+        &mine[..mine_len],
+        events::MAX_FILE,
+        &mut joined,
+    );
+    match fs::write_file(NAME, &joined[..len]) {
+        Ok(entry) => {
+            let (kept, lost) = events::counted();
+            if lost > 0 {
+                warn!(
+                    "HARLAN: {NAME} is {} byte(s); {kept} event(s) recorded this boot and {lost} lost to the ring before they could be written",
+                    entry.size
+                );
+            } else {
+                // `mine_len` and not the count of events this boot: a
+                // second flush writes only what the first left, and saying
+                // otherwise would be the log describing itself wrongly.
+                info!(
+                    "HARLAN: {NAME} is {} byte(s); {mine_len} new byte(s) appended, {kept} event(s) recorded this boot",
+                    entry.size
+                );
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
+    }
+}
+
+/// Writes `number` into `text` as decimal with a newline, and answers how
+/// many bytes that took. There is no formatter in a `no_std` kernel that
+/// writes into a buffer without allocating, and this is four lines.
+fn write_number(text: &mut [u8; 11], number: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut left = number;
+    loop {
+        digits[count] = b'0' + (left % 10) as u8;
+        count += 1;
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    for (at, digit) in digits[..count].iter().rev().enumerate() {
+        text[at] = *digit;
+    }
+    text[count] = b'\n';
+    count + 1
+}
+
+/// How a process is to be started: from a page of bytes written by hand,
+/// or from a program that was compiled and read off the disk.
+///
+/// Both still exist because they demonstrate different things. A compiler
+/// does not produce a program that writes to its own code (ADR 0020), and
+/// a program written by hand in hexadecimal is not how a shell gets
+/// written (ADR 0026).
+enum ToStart<'a> {
+    Flat(&'a [u8]),
+    Elf(&'a harlan_hal::elf::Program, &'a [u8]),
+}
+
+/// The name of the program that demonstrates the ABI, and of the shell.
+const USER_PROGRAM: &str = "HELLO.ELF";
+const SHELL_PROGRAM: &str = "SHELL.ELF";
+
+/// Reads a program off the disk into `into` and parses it.
+///
+/// One function rather than a block per program: the second copy of a
+/// sequence of checks is where one of them gets left out.
+///
+/// `None`, with a line saying why, for a disk that is not there, a file
+/// that is not there, one too big for the buffer, or one that is not a
+/// program this kernel loads. A kernel that could not load a program
+/// still boots; it just has one process fewer.
+fn load_program<'a>(
+    name: &str,
+    into: &'a mut [u8],
+) -> Option<(harlan_hal::elf::Program, &'a [u8])> {
+    let read = read_program(name, into)?;
+    match harlan_hal::elf::parse(
+        &into[..read],
+        harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
+    ) {
+        Ok(program) => {
+            info!(
+                "HARLAN: {name} is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
+                program.segment_count(),
+                program.entry,
+                program.highest_address()
+            );
+            for segment in program.segments() {
+                info!(
+                    "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
+                    segment.at,
+                    segment.file_size,
+                    segment.memory_size,
+                    if segment.readable() { "r" } else { "-" },
+                    if segment.writable() { "w" } else { "-" },
+                    if segment.executable() { "x" } else { "-" }
+                );
+            }
+            events::record_with(events::What::Loaded, read as u64, name);
+            Some((program, &into[..read]))
+        }
+        Err(err) => {
+            error!("HARLAN: {name} is not a program this kernel loads ({err:?})");
+            None
+        }
+    }
+}
+
+/// Reads the user program off the disk, as bytes.
+///
+/// Answers `None` and says why if it is not there or cannot be read: a
+/// kernel whose disk failed has no user program, and that has to be a line
+/// in the log rather than a boot that carries on as if it had one.
+fn read_program(name: &str, into: &mut [u8]) -> Option<usize> {
+    let entry = match fs::find(name) {
+        Ok(entry) => entry,
+        Err(err) => {
+            error!("HARLAN: {name} cannot be loaded ({err:?})");
+            return None;
+        }
+    };
+    match fs::read_file(&entry, into) {
+        Ok(read) => {
+            info!("HARLAN: {name} is {read} byte(s), read off the disk");
+            Some(read)
+        }
+        Err(err) => {
+            error!("HARLAN: {name} could not be read ({err:?})");
+            None
+        }
+    }
+}
+
+/// Lists the root directory and reads one file off it, which is as far as
+/// a filesystem has to work before a shell can use it.
+fn read_a_file() {
+    let mut files = 0;
+    if let Err(err) = fs::each_name(|entry| {
+        files += 1;
+        info!(
+            "HARLAN:   {} — {} byte(s){}, from cluster {}",
+            entry.name(),
+            entry.size,
+            if entry.is_directory() {
+                ", a directory"
+            } else {
+                ""
+            },
+            entry.first_cluster
+        );
+        true
+    }) {
+        error!("HARLAN: the root directory could not be read ({err:?})");
+        return;
+    }
+    info!("HARLAN: {files} thing(s) in the root directory");
+
+    // One of them, read through its chain and checked against what xtask
+    // put there. "It read something" and "it read the right thing" are
+    // different answers.
+    const NAME: &str = "HELLO.TXT";
+    const EXPECTED: &str = "HARLAN reads its own disk.\n";
+    let entry = match fs::find(NAME) {
+        Ok(entry) => entry,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+    let mut bytes = [0u8; 512];
+    match fs::read_file(&entry, &mut bytes) {
+        Ok(read) => {
+            let text = core::str::from_utf8(&bytes[..read]).unwrap_or("not text");
+            if text == EXPECTED {
+                info!(
+                    "HARLAN: {NAME} is {read} byte(s) and reads {:?}, which is what is in it",
+                    text.trim_end()
+                );
+            } else {
+                error!("HARLAN: {NAME} reads {text:?}, and {EXPECTED:?} is what is in it");
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be read ({err:?})"),
+    }
+
+    // And a longer one, to show the chain really is followed: four
+    // clusters and a byte, so a reader that stopped at a cluster boundary
+    // or ran past the file's length would not match.
+    const LONG: &str = "LONG.BIN";
+    match fs::find(LONG) {
+        Ok(entry) => {
+            let mut bytes = [0u8; 4096];
+            match fs::read_file(&entry, &mut bytes) {
+                Ok(read) => {
+                    let right = read == entry.size as usize
+                        && bytes[..read]
+                            .iter()
+                            .enumerate()
+                            .all(|(at, byte)| *byte == (at % 251) as u8);
+                    if right {
+                        let per_cluster =
+                            fs::boot_sector().map_or(1, |boot| boot.cluster_bytes() as usize);
+                        info!(
+                            "HARLAN: {LONG} is {read} byte(s) across {} cluster(s), every one of them what it should be",
+                            read.div_ceil(per_cluster)
+                        );
+                    } else {
+                        error!("HARLAN: {LONG} read {read} byte(s) and they are not what is in it");
+                    }
+                }
+                Err(err) => error!("HARLAN: {LONG} could not be read ({err:?})"),
+            }
+        }
+        Err(err) => error!("HARLAN: {LONG} could not be looked up ({err:?})"),
+    }
+}
+
+/// Reads the copy of the boot sector FAT32 keeps further in, and checks it
+/// against the one already read.
+///
+/// A volume where the two differ is one where something has been written
+/// to by two readers that disagree; saying so is cheap, and it is also the
+/// only check in this boot that the sector number really travels — the
+/// backup is at sector 6, and a driver that always read sector 0 would be
+/// comparing a sector with itself.
+fn check_backup_boot_sector(volume: &harlan_hal::fat::BootSector, first: &[u8; 512]) {
+    let backup = u32::from(volume.backup_boot_sector);
+    if backup == 0 {
+        warn!("HARLAN: this volume keeps no backup boot sector");
+        return;
+    }
+    let mut copy = [0u8; 512];
+    match fs::read_sector(backup, &mut copy) {
+        Ok(()) if copy == *first => {
+            info!("HARLAN: sector {backup} holds the same boot sector as sector 0, byte for byte")
+        }
+        Ok(()) => error!("HARLAN: sector {backup} should be a copy of the boot sector and is not"),
+        Err(err) => error!("HARLAN: the backup boot sector could not be read ({err:?})"),
+    }
 }

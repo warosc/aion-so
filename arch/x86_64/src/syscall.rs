@@ -7,10 +7,18 @@
 //! stack, the kernel is running on memory the user chose, which is why
 //! `FMASK` clears `IF`: nothing may be delivered in that window.
 //!
-//! `swapgs` is what makes the swap possible: `KERNEL_GS_BASE` holds the
-//! address of this core's `CpuLocal`, so the stub can find a stack without
-//! touching any register the caller owns. With one core a global would do;
-//! this is the shape that survives having two.
+//! The stack it swaps in is the **running process's own** (ADR 0018), so
+//! the kernel can park a process inside a syscall and come back to it.
+//!
+//! It used to find that stack through `swapgs` and `KERNEL_GS_BASE`, the
+//! way a multi-core kernel has to. That broke the moment processes could
+//! be switched: a process can enter the kernel through a syscall — which
+//! swaps `GS` — and leave through the timer's `iretq`, which does not
+//! swap it back, and then the next `swapgs` leaves `GS` pointing at the
+//! user's value and the stub writes through it. With one core the address
+//! can simply be read from a static, RIP-relative. Bringing `swapgs` back
+//! means teaching the interrupt path to swap too, and that belongs with
+//! the rest of the multi-core work.
 //!
 //! The ABI is in docs/adr/0014-fase3-syscall-abi-v0.md.
 
@@ -25,21 +33,14 @@ const EFER_SCE: u64 = 1 << 0;
 /// string instructions in the kernel start forwards) and alignment checks.
 const FMASK: u64 = (1 << 9) | (1 << 10) | (1 << 18);
 
-/// What the entry stub reaches through `gs`. The offsets are part of the
-/// stub's assembly, so the layout is fixed here and nowhere else.
-#[repr(C)]
-pub struct CpuLocal {
-    /// Where the kernel's syscall stack ends. Offset 0.
-    pub kernel_stack_top: u64,
-    /// Where the user's stack pointer is kept while the kernel runs.
-    /// Offset 8.
-    pub user_stack: u64,
-}
+/// The top of the kernel stack of whichever process is running. Written
+/// by `set_kernel_stack` on every switch, read by the entry stub.
+static mut KERNEL_STACK_TOP: u64 = 0;
 
-static mut CPU_LOCAL: CpuLocal = CpuLocal {
-    kernel_stack_top: 0,
-    user_stack: 0,
-};
+/// Where the stub leaves the user's stack pointer for the two
+/// instructions it takes to get onto the kernel's. Interrupts are off
+/// throughout, and there is one core, so nothing can look in between.
+static mut USER_STACK_SCRATCH: u64 = 0;
 
 /// The registers a syscall arrives in, as the stub leaves them on the
 /// kernel stack. `rax` carries the number in and the result out.
@@ -65,6 +66,19 @@ pub type Handler = fn(&mut SyscallFrame);
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
+/// Points the entry stub at the stack of whichever process is about to
+/// run. Called on every switch, because that stack is the process's own
+/// (docs/adr/0018-fase3-context-switch.md).
+///
+/// # Safety
+///
+/// `top` must be the top of a kernel stack that nothing else is using,
+/// and no syscall may be in flight.
+pub unsafe fn set_kernel_stack(top: u64) {
+    // SAFETY: single core, and the caller says no syscall is in flight.
+    unsafe { KERNEL_STACK_TOP = top };
+}
+
 /// Sends syscalls to `handler`.
 pub fn set_handler(handler: Handler) {
     HANDLER.store(handler as usize, Ordering::Release);
@@ -84,8 +98,8 @@ pub fn set_handler(handler: Handler) {
 pub unsafe fn init(kernel_stack_top: u64) {
     // SAFETY: single-threaded init, before any user code exists.
     unsafe {
-        CPU_LOCAL.kernel_stack_top = kernel_stack_top;
-        CPU_LOCAL.user_stack = 0;
+        KERNEL_STACK_TOP = kernel_stack_top;
+        USER_STACK_SCRATCH = 0;
 
         // What `sysretq` will load out of `STAR`, spelled out where it
         // is programmed: this is the only thing tying the GDT's layout to
@@ -105,10 +119,6 @@ pub unsafe fn init(kernel_stack_top: u64) {
         msr::write(msr::IA32_STAR, star);
         msr::write(msr::IA32_LSTAR, syscall_entry as *const () as u64);
         msr::write(msr::IA32_FMASK, FMASK);
-        msr::write(
-            msr::IA32_KERNEL_GS_BASE,
-            (&raw const CPU_LOCAL) as *const _ as u64,
-        );
         msr::write(msr::IA32_EFER, msr::read(msr::IA32_EFER) | EFER_SCE);
     }
 }
@@ -139,10 +149,12 @@ extern "C" fn dispatch(frame: &mut SyscallFrame) {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
-        // The user's `gs` goes away and this core's `CpuLocal` comes in.
-        "swapgs",
-        "mov gs:[8], rsp",
-        "mov rsp, gs:[0]",
+        // Onto the running process's kernel stack, keeping the user's
+        // pointer on that same stack: a global would be overwritten by
+        // whoever runs while this process is parked mid-syscall.
+        "mov [rip + {scratch}], rsp",
+        "mov rsp, [rip + {kernel_top}]",
+        "push [rip + {scratch}]",
         // The frame, from the last field to the first.
         "push r11",
         "push rcx",
@@ -154,12 +166,12 @@ unsafe extern "C" fn syscall_entry() {
         "push rdi",
         "push rax",
         // Microsoft x64: first argument in rcx, 32 bytes of shadow space,
-        // and rsp 16-byte aligned before the call (the call itself pushes
-        // the eighth byte). Nine pushes leave it at 8 mod 16, so 40.
+        // and rsp 16-byte aligned before the call. The stack top is page
+        // aligned and ten pushes are 80 bytes, so it still is.
         "mov rcx, rsp",
-        "sub rsp, 40",
+        "sub rsp, 32",
         "call {dispatch}",
-        "add rsp, 40",
+        "add rsp, 32",
         // Back the way it came in. `rax` carries the result.
         "pop rax",
         "pop rdi",
@@ -170,10 +182,11 @@ unsafe extern "C" fn syscall_entry() {
         "pop r9",
         "pop rcx",
         "pop r11",
-        "mov rsp, gs:[8]",
-        "swapgs",
+        "pop rsp",
         "sysretq",
         dispatch = sym dispatch,
+        scratch = sym USER_STACK_SCRATCH,
+        kernel_top = sym KERNEL_STACK_TOP,
     )
 }
 
@@ -208,18 +221,6 @@ mod tests {
         assert_eq!(at(&frame.r9), 48);
         assert_eq!(at(&frame.user_rip), 56);
         assert_eq!(at(&frame.user_rflags), 64);
-    }
-
-    /// The stub reaches these two through `gs`, by offset.
-    #[test]
-    fn the_per_cpu_offsets_are_the_ones_the_stub_uses() {
-        let local = CpuLocal {
-            kernel_stack_top: 0,
-            user_stack: 0,
-        };
-        let base = &local as *const _ as usize;
-        assert_eq!(&local.kernel_stack_top as *const _ as usize - base, 0);
-        assert_eq!(&local.user_stack as *const _ as usize - base, 8);
     }
 
     #[test]

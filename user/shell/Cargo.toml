@@ -1,0 +1,23 @@
+[package]
+name = "harlan-shell"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# The shell, as a program in ring 3 rather than a function in the kernel
+# (docs/adr/0030-fase4-shell-in-ring-3.md).
+#
+# It gets the console and the disk the same way any other program does:
+# through the syscalls of ADR 0028 and ADR 0029. Nothing it can do is
+# anything the kernel does on its behalf.
+
+[lib]
+name = "harlan_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+harlan-user-abi = { path = "../abi" }

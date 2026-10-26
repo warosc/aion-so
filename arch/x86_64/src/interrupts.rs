@@ -24,7 +24,7 @@
 //! handler below) — a deliberate, documented safety net.
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::gdt::{self, DOUBLE_FAULT_IST_INDEX};
 use crate::idt::{GATE_TYPE_INTERRUPT, Idt, IdtEntry};
@@ -34,6 +34,17 @@ use harlan_hal::{error, info, warn};
 /// Written only by the timer ISR (`VECTOR_TIMER` below); read by
 /// `ticks()`, `hal::TickCounter`'s sole consumer today.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// What the timer calls after counting, if anything. A function pointer,
+/// so that the kernel can set it — and set it again after moving its
+/// image (docs/adr/0018-fase3-context-switch.md).
+static TICK_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Calls `handler` on every tick, from inside the interrupt handler, with
+/// interrupts off.
+pub fn set_tick_handler(handler: unsafe fn()) {
+    TICK_HANDLER.store(handler as usize, Ordering::Release);
+}
 
 /// Current tick count, as observed so far. `Relaxed` is sufficient: this
 /// is a monotonic counter with no other data it needs to synchronize
@@ -145,6 +156,172 @@ stub_no_error_code!(keyboard_stub, VECTOR_KEYBOARD);
 stub_with_error_code!(general_protection_stub, VECTOR_GENERAL_PROTECTION);
 stub_with_error_code!(page_fault_stub, VECTOR_PAGE_FAULT);
 
+/// Every other exception the CPU can raise. Until ring 3 existed, a
+/// vector with no gate meant a bug in the kernel and the `#GP` it turned
+/// into was as good an answer as any. A process can raise most of these
+/// on purpose —`ud2` is two bytes— and an exception with no gate becomes
+/// a `#GP` whose error code names a segment selector that has nothing to
+/// do with anything. So they all get a gate, and the dispatcher says
+/// which one it was.
+///
+/// Which ones the CPU pushes an error code for is not a choice: Intel SDM
+/// Vol. 3 §6.3.1. Getting it wrong shifts the whole frame.
+macro_rules! exception_stubs {
+    ($(($name:ident, $vector:expr, $kind:ident, $with_error_code:expr)),* $(,)?) => {
+        $( $kind!($name, $vector); )*
+        /// The gates `install_gates` adds on top of the named ones, each
+        /// with what its stub assumed about the error code. A test
+        /// compares that against `pushes_error_code`, which says the same
+        /// thing in another shape: the two are written apart on purpose,
+        /// because agreeing by accident is not agreement.
+        const OTHER_EXCEPTION_GATES: &[(u8, unsafe extern "C" fn(), bool)] =
+            &[$(($vector, $name, $with_error_code)),*];
+    };
+}
+
+exception_stubs![
+    (debug_stub, 1, stub_no_error_code, false),
+    (overflow_stub, 4, stub_no_error_code, false),
+    (bound_range_stub, 5, stub_no_error_code, false),
+    (invalid_opcode_stub, 6, stub_no_error_code, false),
+    (device_not_available_stub, 7, stub_no_error_code, false),
+    (coprocessor_overrun_stub, 9, stub_no_error_code, false),
+    (invalid_tss_stub, 10, stub_with_error_code, true),
+    (segment_not_present_stub, 11, stub_with_error_code, true),
+    (stack_segment_stub, 12, stub_with_error_code, true),
+    (reserved_15_stub, 15, stub_no_error_code, false),
+    (x87_stub, 16, stub_no_error_code, false),
+    (alignment_check_stub, 17, stub_with_error_code, true),
+    (machine_check_stub, 18, stub_no_error_code, false),
+    (simd_stub, 19, stub_no_error_code, false),
+    (virtualisation_stub, 20, stub_no_error_code, false),
+    (control_protection_stub, 21, stub_with_error_code, true),
+    (reserved_22_stub, 22, stub_no_error_code, false),
+    (reserved_23_stub, 23, stub_no_error_code, false),
+    (reserved_24_stub, 24, stub_no_error_code, false),
+    (reserved_25_stub, 25, stub_no_error_code, false),
+    (reserved_26_stub, 26, stub_no_error_code, false),
+    (reserved_27_stub, 27, stub_no_error_code, false),
+    (hypervisor_stub, 28, stub_no_error_code, false),
+    (vmm_communication_stub, 29, stub_with_error_code, true),
+    (security_stub, 30, stub_with_error_code, true),
+    (reserved_31_stub, 31, stub_no_error_code, false),
+];
+
+/// Whether the CPU pushes an error code for this vector, from Intel SDM
+/// Vol. 3 §6.3.1 table 6-1. The stubs have to agree: a stub that expects
+/// one where there is none shifts every field of the frame by eight
+/// bytes, and what it reads as `rip` is whatever came before.
+///
+/// It exists to be compared against the stubs, which is a thing only a
+/// test does; the running kernel gets the answer from which stub the
+/// vector is wired to.
+#[cfg(test)]
+const fn pushes_error_code(vector: u8) -> bool {
+    matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
+}
+
+/// What to call a vector in the log. Short, because the point of the line
+/// is the address and the process, not the vocabulary.
+fn exception_name(vector: u8) -> &'static str {
+    match vector {
+        0 => "#DE divide error",
+        1 => "#DB debug",
+        2 => "NMI",
+        3 => "#BP breakpoint",
+        4 => "#OF overflow",
+        5 => "#BR bound range exceeded",
+        6 => "#UD invalid opcode",
+        7 => "#NM device not available",
+        8 => "#DF double fault",
+        10 => "#TS invalid TSS",
+        11 => "#NP segment not present",
+        12 => "#SS stack-segment fault",
+        13 => "#GP general protection",
+        14 => "#PF page fault",
+        16 => "#MF x87 floating-point",
+        17 => "#AC alignment check",
+        18 => "#MC machine check",
+        19 => "#XM SIMD floating-point",
+        20 => "#VE virtualisation",
+        21 => "#CP control protection",
+        28 => "#HV hypervisor injection",
+        29 => "#VC VMM communication",
+        30 => "#SX security",
+        _ => "reserved exception",
+    }
+}
+
+/// What the kernel is told about a fault a process caused.
+#[derive(Debug, Clone, Copy)]
+pub struct UserFault {
+    pub vector: u8,
+    /// What the vector is called, so that the kernel need not keep its
+    /// own copy of the table.
+    pub name: &'static str,
+    /// What the CPU pushed, when the vector pushes one; zero otherwise.
+    pub error_code: u64,
+    /// The address `CR2` held, for `#PF`; zero otherwise.
+    pub address: u64,
+    /// Where in the program it happened.
+    pub rip: u64,
+}
+
+/// What the kernel does with a fault that came from ring 3. Never returns:
+/// the process that caused it does not run again
+/// (docs/adr/0020-fase3-a-fault-belongs-to-the-process.md).
+static USER_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+/// Tells this module what to do when a process faults. Until it is set, a
+/// fault in ring 3 stops the machine, like one in the kernel.
+pub fn set_user_fault_handler(handler: unsafe fn(UserFault) -> !) {
+    USER_FAULT_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+/// Whether the interrupt that pushed this `CS` happened in ring 3.
+///
+/// The low two bits of a pushed code selector are the privilege level the
+/// CPU was running at — its RPL. Ring 3 is the only level a process runs
+/// in, and the kernel's own selector has an RPL of zero. This is the whole
+/// of how the kernel tells "the process did something" from "the kernel
+/// did something", so it is a function with a name and a test rather than
+/// two characters inside a condition.
+fn came_from_ring_3(cs: u64) -> bool {
+    cs & 3 == 3
+}
+
+/// A fault the CPU cannot carry on from.
+///
+/// If it happened in ring 3 it belongs to the process, and the kernel is
+/// handed it so that it can end that process and give the CPU to somebody
+/// else. If it happened in the kernel there is nobody else to blame, and
+/// the machine stops where it is rather than carrying on over whatever
+/// went wrong.
+fn fatal(frame: &InterruptStackFrame, address: u64) -> ! {
+    if came_from_ring_3(frame.cs) {
+        let handler = USER_FAULT_HANDLER.load(Ordering::Acquire);
+        if handler != 0 {
+            let vector = frame.vector as u8;
+            let fault = UserFault {
+                vector,
+                name: exception_name(vector),
+                error_code: frame.error_code,
+                address,
+                rip: frame.rip,
+            };
+            // SAFETY: only `set_user_fault_handler` writes there, and what
+            // it writes is an `unsafe fn(UserFault) -> !`. Interrupts are
+            // off inside this handler, and the handler is written for
+            // exactly that.
+            let handler: unsafe fn(UserFault) -> ! = unsafe { core::mem::transmute(handler) };
+            // SAFETY: as above; it does not come back.
+            unsafe { handler(fault) };
+        }
+        error!("HARLAN: a process faulted before the kernel could take faults");
+    }
+    halt()
+}
+
 /// Shared by every vector in 32-255. Deliberately silent (not routed
 /// through `common_trampoline`, no logging): see the module-level doc
 /// comment for why an interrupt here is an expected, benign race during
@@ -242,7 +419,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
     match frame.vector as u8 {
         VECTOR_DIVIDE_ERROR => {
             error!("HARLAN: #DE divide error at rip={:#x}", frame.rip);
-            halt();
+            fatal(frame, 0);
         }
         VECTOR_NMI => {
             // Non-fatal: NMIs are not masked by `cli`, so one could in
@@ -252,6 +429,13 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             warn!("HARLAN: NMI received (non-fatal)");
         }
         VECTOR_BREAKPOINT => {
+            // The kernel's own self-test breaks on purpose and carries
+            // on. A process that does it has no debugger to talk to, so
+            // for it a breakpoint is the end.
+            if came_from_ring_3(frame.cs) {
+                error!("HARLAN: #BP breakpoint from ring 3 at rip={:#x}", frame.rip);
+                fatal(frame, 0);
+            }
             info!("HARLAN: breakpoint handler OK");
         }
         VECTOR_TIMER => {
@@ -265,6 +449,16 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
             }
             if count.is_multiple_of(100) {
                 info!("HARLAN: ticks={count}");
+            }
+            let handler = TICK_HANDLER.load(Ordering::Acquire);
+            if handler != 0 {
+                // SAFETY: only `set_tick_handler` writes there, and what
+                // it writes is an `unsafe fn()`. Interrupts are off
+                // inside this handler, which is what the handler is
+                // written for.
+                let handler: unsafe fn() = unsafe { core::mem::transmute(handler) };
+                // SAFETY: as above.
+                unsafe { handler() };
             }
         }
         VECTOR_KEYBOARD => {
@@ -282,7 +476,7 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
                 "HARLAN: #GP error_code={:#x} at rip={:#x}",
                 frame.error_code, frame.rip
             );
-            halt();
+            fatal(frame, 0);
         }
         VECTOR_PAGE_FAULT => {
             let faulting_address = read_cr2();
@@ -290,14 +484,16 @@ extern "C" fn rust_interrupt_handler(frame: *mut InterruptStackFrame) {
                 "HARLAN: #PF accessing {:#x}, error_code={:#x}, rip={:#x}",
                 faulting_address, frame.error_code, frame.rip
             );
-            halt();
+            fatal(frame, faulting_address);
         }
         other => {
             error!(
-                "HARLAN: unhandled exception vector={other} at rip={:#x}",
+                "HARLAN: {} (vector={other}) error_code={:#x} at rip={:#x}",
+                exception_name(other),
+                frame.error_code,
                 frame.rip
             );
-            halt();
+            fatal(frame, 0);
         }
     }
 }
@@ -473,6 +669,20 @@ unsafe fn install_gates() {
             GATE_TYPE_INTERRUPT,
         );
 
+        // Everything else the CPU can raise, so that a process cannot
+        // reach a vector with no gate.
+        let mut index = 0;
+        while index < OTHER_EXCEPTION_GATES.len() {
+            let (vector, stub, _) = OTHER_EXCEPTION_GATES[index];
+            IDT.0[vector as usize] = IdtEntry::new(
+                stub as *const () as u64,
+                gdt::KERNEL_CODE_SELECTOR,
+                0,
+                GATE_TYPE_INTERRUPT,
+            );
+            index += 1;
+        }
+
         IDT.0[VECTOR_TIMER as usize] = IdtEntry::new(
             timer_stub as *const () as u64,
             gdt::KERNEL_CODE_SELECTOR,
@@ -566,4 +776,98 @@ pub unsafe fn init_keyboard() -> Result<(), crate::keyboard::InitError> {
         crate::pic::unmask(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// How the kernel tells a process's fault from its own. Pinned against
+    /// the selectors the GDT actually uses, so that moving a descriptor
+    /// cannot quietly change the answer.
+    #[test]
+    fn a_fault_is_the_process_s_only_when_the_cpu_was_in_ring_3() {
+        assert!(came_from_ring_3(u64::from(gdt::USER_CODE_SELECTOR)));
+        assert!(!came_from_ring_3(u64::from(gdt::KERNEL_CODE_SELECTOR)));
+        // Not the descriptor: the privilege bits. The user code descriptor
+        // read with an RPL of zero is not ring 3, and never appears.
+        assert!(!came_from_ring_3(u64::from(gdt::USER_CODE_SELECTOR & !3)));
+        assert!(!came_from_ring_3(0));
+        // Ring 1 and 2 exist and nothing in this kernel runs in them.
+        assert!(!came_from_ring_3(
+            u64::from(gdt::USER_CODE_SELECTOR & !3) | 1
+        ));
+        assert!(!came_from_ring_3(
+            u64::from(gdt::USER_CODE_SELECTOR & !3) | 2
+        ));
+    }
+
+    /// A vector with no gate is a vector a process can reach, and what it
+    /// gets instead is a `#GP` naming a segment selector that has nothing
+    /// to do with what happened. Every exception the CPU defines has to
+    /// have one.
+    #[test]
+    fn every_exception_vector_has_a_gate() {
+        let named = [
+            VECTOR_DIVIDE_ERROR,
+            VECTOR_NMI,
+            VECTOR_BREAKPOINT,
+            VECTOR_DOUBLE_FAULT,
+            VECTOR_GENERAL_PROTECTION,
+            VECTOR_PAGE_FAULT,
+        ];
+        let mut covered = [false; 32];
+        for vector in named {
+            assert!(!covered[vector as usize], "vector {vector} twice");
+            covered[vector as usize] = true;
+        }
+        for (vector, _, _) in OTHER_EXCEPTION_GATES {
+            assert!(*vector < 32, "vector {vector} is not an exception");
+            assert!(!covered[*vector as usize], "vector {vector} twice");
+            covered[*vector as usize] = true;
+        }
+        for (vector, has_gate) in covered.iter().enumerate() {
+            assert!(has_gate, "vector {vector} has no gate");
+        }
+    }
+
+    /// The other half of that: a stub has to know whether the CPU pushed
+    /// an error code, because everything above it in the frame moves by
+    /// eight bytes if it is wrong.
+    #[test]
+    fn the_stubs_agree_with_the_manual_about_error_codes() {
+        for (vector, _, with_error_code) in OTHER_EXCEPTION_GATES {
+            assert_eq!(
+                *with_error_code,
+                pushes_error_code(*vector),
+                "vector {vector}"
+            );
+        }
+        // And the named ones, which are wired by hand above.
+        assert!(!pushes_error_code(VECTOR_DIVIDE_ERROR));
+        assert!(!pushes_error_code(VECTOR_NMI));
+        assert!(!pushes_error_code(VECTOR_BREAKPOINT));
+        assert!(pushes_error_code(VECTOR_DOUBLE_FAULT));
+        assert!(pushes_error_code(VECTOR_GENERAL_PROTECTION));
+        assert!(pushes_error_code(VECTOR_PAGE_FAULT));
+        // Nothing outside the exception range does.
+        assert!(!pushes_error_code(VECTOR_TIMER));
+        assert!(!pushes_error_code(VECTOR_KEYBOARD));
+    }
+
+    /// The log has to name what happened. A vector with no name would
+    /// still be handled, but the line it prints would not say what it was.
+    #[test]
+    fn every_exception_the_cpu_defines_has_a_name() {
+        for vector in 0..32u8 {
+            let name = exception_name(vector);
+            let reserved = matches!(vector, 9 | 15 | 22..=27 | 31);
+            assert_eq!(
+                name == "reserved exception",
+                reserved,
+                "vector {vector} is named {name}"
+            );
+        }
+        assert_eq!(exception_name(6), "#UD invalid opcode");
+        assert_eq!(exception_name(14), "#PF page fault");
+    }
 }
