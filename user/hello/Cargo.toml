@@ -13,3 +13,4 @@ name = "hello"
 path = "src/main.rs"
 
 [dependencies]
+harlan-user-abi = { path = "../abi" }

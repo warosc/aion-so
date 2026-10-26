@@ -6,10 +6,487 @@ diez arranques seguidos sobre el mismo disco contando cuántos van. Desde el
 Incremento 33 eso lo puede hacer también un programa en ring 3, por el ABI
 del ADR 0028.
 
+**Los cuatro bullets de la fase están cerrados** en el Incremento 36.
+
 Decisiones de alcance tomadas al abrir la fase: **virtio-blk** como primer
 driver de almacenamiento, **FAT32 empezando por solo lectura**, y **ELF64
 estático** como formato ejecutable —el ADR 0014 dejó el binario plano
 incrustado explícitamente como provisional "hasta que haya filesystem"—.
+
+## Incremento 36 — El registro de eventos del sistema
+
+`docs/adr/0031-fase4-system-event-log.md`. El último bullet de Fase 4.
+
+### Lo que decide su forma no está en el ROADMAP
+
+Está en `ARCHITECTURE.md`:
+
+> Las operaciones destructivas o de alto impacto exigen confirmación y deben
+> dejar **auditoría**.
+
+Eso no describe un log de depuración. Describe un rastro que alguien va a
+mirar **después**, para saber qué hizo la máquina, y que por tanto tiene que
+sobrevivir a que la máquina se pare.
+
+`klog` no es eso, y no por estar mal hecho: se va con la máquina —existe
+porque un emulador copia el puerto 0xE9 a un fichero—, no lo puede leer el
+sistema, y es prosa libre escrita para quien esté depurando ahora. Un
+registro de auditoría tiene que ser las tres cosas que `klog` no es. Son dos
+herramientas distintas: una es el microscopio y la otra es el acta.
+
+### Qué es
+
+Un anillo de líneas de tamaño fijo en `.bss`, sin asignar nada. Cuando se
+llena se pierde lo más viejo: parar de registrar escondería lo que acaba de
+pasar, que es normalmente lo que importa.
+
+**Líneas de texto, no registros binarios**, y eso es una decisión. La regla
+de verificación de este proyecto (ADR 0025, punto 5) es que lo que
+escribimos lo lee otro: un fichero de texto lo lee `cat` desde la shell, lo
+extrae 7-Zip, y lo lee una persona. Un formato propio solo lo lee nuestro
+propio analizador, que es exactamente la posición que `EMPTY.BIN` enseñó a
+desconfiar en el Incremento 29.
+
+Acaba en `EVENTS.LOG`, y **se acumula entre arranques**: el kernel lee lo que
+hay, le añade lo de este arranque y lo escribe entero. Es lo único que el ADR
+0027 permite —no hay escritura parcial— y además es lo que hace que el
+fichero sea la historia de la máquina y no la del último arranque.
+
+### Sin syscall nueva
+
+La shell lo lee con el `cat` que ya tiene, porque es un fichero de texto en
+el directorio raíz. Un ABI nuevo para leer algo que ya se puede leer sería
+ABI de más, y el ADR 0014 punto 8 avisa de que cada llamada añadida es una
+que habrá que mantener o romper.
+
+### Dos defectos que solo enseñó el registro de verdad
+
+Ninguna prueba los había pedido porque no se me había ocurrido pedirlos.
+
+**`exited 12884901888`.** Había empaquetado el slot y el código de salida en
+un `u64` con un desplazamiento. Compila, va y vuelve sin perder nada, y **no
+significa nada para quien lo lee** — que es la razón entera de que este
+registro sea texto. Dos números, dos columnas: `exited 3 0` es el slot 3 con
+código 0.
+
+**Las primeras líneas de cada arranque decían `0`.** El número de arranque
+sale del disco, así que el disco tiene que montarse primero, así que las
+líneas más tempranas se escriben cuando todavía no se sabe. El anillo está
+vacío al principio de cada arranque, así que **todo lo que hay en él es de
+este arranque**: cuando el número llega, se rellena en las líneas ya
+escritas. No es reescribir la historia, es terminar un campo que aún no se
+sabía.
+
+Los dos están ahora sujetos por una prueba cada uno, con la línea exacta que
+salió mal en el comentario.
+
+### Y un tercero que solo enseñó un número
+
+El registro se escribe dos veces por arranque: una cuando acaba la ronda de
+autotest, y otra en cuanto arranca la shell —porque esa ronda no vuelve
+mientras la shell viva, y sin la segunda escritura la línea que dice que
+arrancó una shell se quedaría en memoria hasta que la máquina parase, que es
+el único momento en que no se puede escribir—.
+
+Pero `write_events` leía el fichero, le añadía **todo** el anillo y lo
+escribía entero. Llamada dos veces, la segunda leía un fichero que ya tenía
+las líneas de este arranque y se las añadía otra vez: **el registro decía que
+todo había pasado dos veces**.
+
+Nada falló. Ninguna prueba lo pidió. Lo delató que diez arranques daban
+16 945 bytes donde una escritura por arranque daba 8 400 — exactamente el
+doble, que es lo único que llamó la atención. Ahora el anillo recuerda qué ha
+entregado y cada escritura se lleva solo lo nuevo; diez arranques son 8 820
+bytes, y hay exactamente un `boot`, un `frames` y un `shell` por arranque.
+
+La lección es la misma que la de los ocho segundos del FSInfo en el
+Incremento 32, y me ha vuelto a pasar: **un cambio correcto es un cambio de
+comportamiento hasta que se mira el número**.
+
+### Y dos que sí encontraron las pruebas, antes de tocar un disco
+
+- **`join` escribía fragmentos de línea.** Con un tope de un byte producía
+  `"d"` — un registro de una letra, al que el siguiente arranque habría
+  añadido. Lo encontró el bucle que comprueba que el resultado son siempre
+  líneas enteras.
+- **Y tiraba una línea entera de más** cuando el corte caía justo en el
+  principio de una. Lo encontró la prueba que pedía exactamente la última
+  línea y recibía nada.
+
+Un registro cortado a mitad de línea miente sobre el primer evento que
+conserva, y el siguiente arranque construye encima de esa mentira. Por eso
+vale la pena que esto esté probado al nivel de la aritmética y no solo al
+final.
+
+### Lo que se ve
+
+Desde fuera (7-Zip) y desde la shell (`cat events.log`), lo mismo:
+
+```
+    3      250 loaded     24168 HELLO.ELF
+    3      251 loaded     34808 SHELL.ELF
+    3      251 started    0
+    3      253 exited     3 0
+    3      253 faulted    4 #PF page fault
+    3      254 wrote      20 RING3.TXT
+    3      256 frames     95
+    3      256 shell      9
+    4      232 disk       129022
+    4      234 wrote      2 BOOTS.TXT
+    4      234 boot       4
+```
+
+### Lo que este ADR deja abierto a sabiendas
+
+**Cualquiera puede sobrescribir el registro desde la shell** con
+`write EVENTS.LOG ...`. Un registro de auditoría en el que el auditado
+escribe no es auditoría. No se arregla aquí porque arreglarlo exige decidir
+de quién es un fichero, que es la pregunta de las capacidades — Fase 6.
+Queda anotado como lo que es: una cosa que la shell puede hacer y no debería.
+
+Y hay una ventana de pérdida entre un evento y la escritura, porque escribir
+en cada evento sería un recorrido de la FAT y dos tablas por cada proceso que
+termina. Este kernel no promete un registro síncrono; promete que **lo
+escrito está completo**.
+
+### Verificación ejecutada
+
+- 390 pruebas de host (376 + 14: el formato de la línea campo por campo, el
+  recorte a líneas enteras con todos los topes de 1 a 40, y qué se lleva una
+  escritura cuando ya hubo otra).
+- `fmt-lint` limpio, arranques en verde con las dos señales, FSInfo cuadrando.
+- **El tope de 32 KB, de extremo a extremo**: 42 arranques seguidos sobre el
+  mismo disco, que es lo que hace falta para cruzarlo de verdad en vez de
+  solo en una prueba unitaria. El fichero se queda en 32 760 bytes, acaba en
+  salto de línea, y sus 1 013 líneas son todas del formato: los arranques 1 a
+  3 se fueron **enteros** por el principio y la primera línea que queda es
+  una línea completa, no un fragmento.
+- Y por fuera: 7-Zip extrae el registro y `cat events.log` desde la shell en
+  ring 3 enseña lo mismo, sin que haya hecho falta una syscall nueva.
+
+### Fase 4 queda cerrada
+
+Los cuatro bullets del ROADMAP:
+
+- driver inicial de almacenamiento virtual — virtio-blk (ADR 0022–0024);
+- VFS y filesystem seleccionado mediante ADR — FAT32 (ADR 0025, 0027);
+- shell de usuario y utilidades básicas — en ring 3 (ADR 0028–0030);
+- registro de eventos del sistema — este.
+
+Y la salida de fase —crear, leer y persistir un archivo entre reinicios— está
+demostrada desde el Incremento 32 y ahora la hace también un programa sin
+privilegios.
+
+## Incremento 35 — La shell, en ring 3
+
+`docs/adr/0030-fase4-shell-in-ring-3.md`. El último bullet grande de Fase 4.
+
+No es una reorganización de código. Es la prueba de que el límite de
+privilegio sirve para algo: una shell es el primer programa que una persona
+conduce, y **una shell que necesitara privilegios que nadie más recibe sería
+un límite con un agujero con forma de shell**.
+
+### Qué sabe hacer
+
+Seis comandos, y todos salen de lo que el ABI ya permite: `help`, `ls`,
+`cat NAME`, `write NAME TEXT`, `echo TEXT` y `exit`. Ni `reboot` ni
+`shutdown`: apagar necesita una syscall que no existe, e inventarla aquí
+sería inventar ABI sin ADR.
+
+`cat` lee en trozos de 64 bytes, mucho menores que los ficheros del disco.
+Un descriptor existe precisamente para que un fichero no tenga que caber en
+un buffer (ADR 0028, punto 1); leerlo de golpe sería tener descriptores y no
+usarlos para nada.
+
+Los errores se dicen con palabras: `cat: nope.txt: no such file`, no `-9`.
+El número es el ABI y la frase es la interfaz.
+
+### Un binding del ABI, no dos
+
+Dos programas hacen ahora las mismas once llamadas. Dos juegos de envolturas
+son dos copias de un contrato, y una copia de un contrato es una copia que se
+separa — el mismo fallo que este kernel ya tuvo con un `CURRENT`
+desactualizado, con una cuenta de clusters libres llevada a mano, y con un
+formateador y una prueba que compartían un malentendido.
+
+`user/abi` es la única traducción. Lo que **no** entra ahí son las sondas de
+puntero crudo: existen para hacer lo que las envolturas tipadas hacen
+imposible —entregar al kernel una dirección que no es un slice que el
+programa pudiera prestar— y un binding que lo pusiera fácil sería un binding
+que pone fácil el error.
+
+### Dos cosas que solo se vieron conduciéndola
+
+**La consola es por orden de llegada entre procesos.** Hay una cola de teclas
+y no tiene dueño: el que pregunta primero se la lleva. Se encontró de la peor
+manera posible — en la primera sesión escrita a mano, el `help` salió como
+`elp` y la shell contestó `unknown command: elp`. La `h` se la había comido el
+programa de pruebas, que seguía sondeando el teclado desde su propia espera.
+
+No es un fallo de la shell; es una propiedad real del diseño, y está anotada
+en el ADR. Aquí se resolvió quitando esa sonda —que además costaba un segundo
+de cada arranque—; de verdad se resuelve cuando la consola sea algo que se
+entrega, que es la pregunta de Fase 6.
+
+**`boot-test` aceptaba un arranque a medias.** Mataba QEMU en cuanto veía un
+marcador, y la shell de ring 3 sube **antes** de que el programa de pruebas
+acabe sus trece comprobaciones. El resultado: un arranque verde en el que el
+programa se había cortado por la mitad. Ahora espera a las **dos** señales.
+
+### La shell arranca después de la comprobación de marcos, no a la vez
+
+Esto empezó como un fallo silencioso y acabó siendo la decisión más
+interesante del incremento.
+
+Un proceso que no termina nunca devuelve sus marcos, así que con la shell en
+la primera ronda `run_until_empty` no vuelve — y la línea que dice *"los
+procesos que terminaron devolvieron todo lo que tomaron"* **dejó de
+imprimirse en todos los arranques**. Esa comprobación ha cazado fugas reales
+(el Incremento 33 arregló una en `spawn_elf`), y perderla sin quererlo a
+cambio de una funcionalidad es el tipo de cambio que nadie decide hacer.
+
+Lo encontré porque el `grep` de verificación dejó de encontrar la línea, no
+porque nada fallara: el arranque seguía en verde.
+
+La solución son dos rondas. Las nueve demostraciones son un autotest: corren,
+terminan, y el balance se mide. Después arranca la shell, en una ronda suya,
+y esa no termina — porque eso es lo que una shell es.
+
+```
+HARLAN: 95 frame(s) back from the processes that ended; the allocator has the 62719 it started with
+HARLAN: the shell runs in slot 9
+```
+
+### Lo que se ve al conducirla
+
+```
+harlan$ help
+help            what you are reading
+ls              what is on the disk
+cat NAME        print a file
+write NAME TEXT write a file, replacing it
+echo TEXT       print TEXT
+exit            stop this shell
+harlan$ ls
+HELLO.ELF      24168
+SHELL.ELF      34808
+HELLO.TXT         27
+LONG.BIN        2049
+EMPTY.BIN          0
+BOOTS.TXT          2
+RING3.TXT         20
+harlan$ cat hello.txt
+HARLAN reads its own disk.
+harlan$ write ring3.txt typed at the shell
+wrote ring3.txt
+harlan$ cat ring3.txt
+typed at the shell
+harlan$ nosuch
+unknown command: nosuch
+harlan$ cat nope.txt
+cat: nope.txt: no such file
+```
+
+Escrito con `sendkey` por el monitor de QEMU y fotografiado con `screendump`,
+porque la pantalla es el único sitio donde salen las respuestas: la shell
+imprime por `console_write`, que dibuja en el framebuffer, no por `log`.
+
+### El camino de reserva, comprobado
+
+El kernel tiene que arrancar sin disco (CLAUDE.md), y sin disco no hay
+`SHELL.ELF`. Comprobado por el camino más barato —marcando la entrada de
+`SHELL.ELF` como borrada en una copia de la imagen— en vez de dando por hecho
+que funciona:
+
+```
+HARLAN: SHELL.ELF cannot be loaded (NoSuchFile)
+HARLAN: from ring 3: HARLAN: ring3-file ALL OK
+HARLAN-PHASE1-SHELL-READY
+```
+
+### Verificación ejecutada
+
+- 376 pruebas de host (365 + 11: el troceado de líneas de la shell y el lado
+  del programa del registro de directorio). Las dos mitades puras de los
+  programas de usuario pasan a comprobarse en host, lo que obligó a separar
+  la lógica de la shell en una librería: un binario `no_std` no se puede
+  construir para el host —no tiene estrategia de pánico— así que se comprueba
+  la librería en host y el binario en el objetivo donde corre.
+- `fmt-lint` limpio, `boot-test --repeat 10` 10/10 con las dos señales en
+  cada uno, contador de arranques a 10, 95 marcos devueltos cada vez y FSInfo
+  cuadrando con las dos tablas.
+- Sesión interactiva con siete comandos, y el camino de reserva.
+
+### Lo que queda de Fase 4
+
+Solo **registro de eventos del sistema**. Los otros tres bullets están.
+
+### Deuda que esto crea
+
+- **Una espera activa permanente** mientras nadie escribe: la shell pregunta,
+  cede y vuelve a preguntar, porque `console_read` no bloquea. Es la misma
+  deuda de Fase 5 que el ADR 0028 anotó para la E/S.
+- **La consola no tiene dueño.** Cualquier proceso puede llevarse una tecla
+  destinada a otro. Fase 6.
+- **No hay `exec`.** Una shell que no puede lanzar programas es media shell, y
+  lanzar uno necesita que un proceso cree otro, lo que necesita decidir qué
+  hereda — y ahí es donde el descriptor se convierte en capacidad.
+
+## Incremento 34 — La consola y el directorio, desde ring 3
+
+`docs/adr/0029-fase4-console-and-list-abi.md`. Lo que le faltaba a un
+programa para poder ser una shell.
+
+### Hacían falta tres cosas, no una
+
+El ADR 0028 dejó dicho que `list` no estaba porque "es una decisión con sus
+propios casos raros". Al ir a mover la shell a ring 3 resultó que `list` era
+la menor de las tres:
+
+1. **Listar el directorio.** `ls` es lo primero que hace una shell.
+2. **Escribir en la consola.** `log` escribe en el registro del kernel, que
+   sale por debugcon. El prompt tiene que salir por el framebuffer, que es
+   **otro dispositivo**. Confundirlos sería imprimir el prompt donde nadie lo
+   ve.
+3. **Leer una tecla.** Carácter a carácter, porque la shell maneja el
+   retroceso y hace eco.
+
+### `list`: una entrada por llamada
+
+Una llamada da **una** entrada, la de la posición `índice`, y un índice
+pasado del final es `ERR_NO_SUCH_FILE`.
+
+La alternativa —rellenar un buffer con todas las que quepan— obliga al
+programa a decir cuántas caben y al kernel a decir cuántas puso, y **sigue
+sin resolver lo que parece resolver**: un directorio que cambia entre dos
+llamadas da una vista a medias de todas formas. Con una entrada por llamada,
+cada llamada es verdad por separado, que es lo máximo que se puede prometer
+sin bloquear el volumen entero mientras alguien lista.
+
+El coste se nombra en vez de esconderse: listar *n* ficheros son *n*
+recorridos del directorio. Es honesto sobre lo que FAT es —un directorio sin
+índice— y para un raíz de media docena de ficheros no se mide.
+
+El registro es de 20 bytes y **es ABI**: nombre de 12 relleno con espacios,
+atributos tal como FAT los guarda, 3 bytes reservados, y el tamaño
+little-endian alineado a cuatro. Un buffer de 19 se rechaza: entregar un
+nombre sin su tamaño sería peor que no entregar nada.
+
+### `console_read` no bloquea, y eso no es una comodidad
+
+El manejador de syscalls corre con las interrupciones desactivadas
+(ADR 0014, punto 2) y la tecla llega por la IRQ 1 del teclado. Una llamada
+que esperase dentro del manejador **esperaría a una interrupción que no puede
+llegar, con el reloj parado**: un bloqueo de la máquina entera, no de un
+proceso. Quien quiera esperar hace `yield` y vuelve a preguntar, que es lo
+que la shell del kernel ya hace con `hlt`.
+
+El precio es una espera activa mientras no haya nada más ejecutable. Se
+acepta y se anota; desaparece cuando el scheduler sepa dormir a un proceso
+hasta que llegue una tecla, que es Fase 5 junto con la E/S que bloquea.
+
+### La consola pasa a tener un solo dueño
+
+El kernel ya la poseía: `kmain` la recibe por valor. Lo que cambia es dónde
+vive. Moverla a `kernel/src/console.rs` tras un `IrqLock` —como el disco en
+el ADR 0028— y **dejar de leerla desde `KernelContext`** significa un único
+camino a ella, en vez de un campo en el contexto *más* una forma de llegar
+desde un manejador, que serían dos caminos a un mismo `&mut`.
+
+Dos detalles que no eran obvios:
+
+- **El objeto de rasgo se forma tarde, a propósito.** `KernelContext` ya
+  documentaba por qué evita `dyn`: el puntero a vtable de un objeto de rasgo
+  se escribe al formarlo y nombra la imagen tal como estaba mapeada entonces,
+  y el kernel se muda a la mitad alta mientras la baja pasa a ser espacio de
+  usuario (ADR 0012, ADR 0013). Un `Box<dyn Console>` construido donde se
+  construye el contexto llevaría una dirección de vtable que deja de existir.
+  Se forma en `run`, después de la mudanza y justo antes de que ningún
+  proceso pueda hacer una syscall. Esto compila igual de bien de las dos
+  maneras; solo una arranca.
+- **La shell del kernel se la lleva entera**, no la pide línea a línea. El
+  bucle de la shell no termina nunca, y tener el cerrojo cogido durante ese
+  bucle dejaría las interrupciones desactivadas para siempre: la IRQ del
+  teclado no llegaría nunca y la shell no recibiría ninguna tecla. Desde que
+  se la lleva, una syscall no encuentra consola — que es correcto, porque la
+  shell del kernel solo corre cuando no hay nada ejecutable y una syscall
+  solo puede venir de algo que esté corriendo.
+
+### Lo que el arranque desatendido no puede probar
+
+Seis comprobaciones nuevas pasan solas (13 en total):
+
+```
+HARLAN: ring3-file OK: listed the directory and found HELLO.TXT with its size
+HARLAN: ring3-file OK: refused a buffer too small for one entry
+HARLAN: ring3-file OK: refused a listing into its own code
+HARLAN: ring3-file OK: wrote to the console the person reads
+HARLAN: ring3-file OK: refused console bytes that are not text
+HARLAN: ring3-file OK: asked for a key, was told there is none, and came back
+```
+
+Pero dos mitades no se pueden comprobar sin alguien delante:
+
+- que `console_write` **dibuje de verdad** en el framebuffer —ninguna línea
+  del registro lo puede probar, porque el registro sale por otro
+  dispositivo—;
+- que `console_read` devuelva una tecla que alguien ha pulsado.
+
+Las dos se comprobaron a mano, con el monitor de QEMU: `sendkey k` en bucle
+durante el arranque —la ventana del programa es de un segundo dentro de un
+arranque de seis, así que hicieron falta 218 pulsaciones para acertar— y un
+`screendump` al final. La captura dice las dos cosas a la vez:
+
+```
+HARLAN: a program in ring 3 wrote this line.
+HARLAN: ring3-key got the character: k
+HARLAN OS 0.0.1
+Computing with intent.
+...
+Harlan> kkkkkkkkkkkkkkkkkkkkkkk
+```
+
+Las dos primeras líneas las dibujó el programa **antes** del banner del
+kernel: texto que nunca pasó por `log`. La `k` es la que mandé. Y el
+`Harlan> kkkk...` de abajo, que no buscaba, confirma de paso que la shell del
+kernel sigue leyendo teclas después de que el módulo le devolviera la
+consola.
+
+Un detalle de coste: la ventana de espera por una tecla empezó en 400 000
+intentos y **añadía seis segundos a cada arranque y a cada corrida de CI**.
+Cada intento es una syscall y un `yield`. Bajada a 60 000, cuesta un segundo
+y sigue siendo fácil de acertar con un bucle de `sendkey`.
+
+### Verificación ejecutada
+
+- 365 pruebas de host (358 + 7: el formato del registro campo por campo y la
+  codificación de teclas), `fmt-lint` limpio.
+- `boot-test --repeat 10` 10/10 sobre el mismo disco, las trece
+  comprobaciones en verde en cada uno, contador de arranques a 10, 95 marcos
+  devueltos cada vez y FSInfo cuadrando con las dos tablas.
+- Mutación: 13 sobre el ABI nuevo. Once detectadas por pruebas de host, dos
+  solo por el arranque —quitar `owns_writable` de `list` hace que el kernel
+  falle escribiendo en el código del programa y no arranque; quitar el
+  control de tamaño lo dice la sonda por su nombre—.
+- Y **una equivalente**, anotada en el código en vez de disimulada: el
+  `.min(ENTRY_NAME_LEN)` al copiar el nombre no se puede matar porque
+  `DirectoryEntry::name` es `[u8; 12]` y nunca es más largo que el campo.
+  Se queda porque es un índice de slice y porque los dos doces viven en
+  crates distintos.
+
+### Lo que hay que saber para el siguiente incremento
+
+- **La shell ya se puede escribir en ring 3.** Tiene `list`, `console_write`,
+  `console_read`, `open`/`read`/`close`/`write_file` y `yield`. Lo que falta
+  es el programa y colocarlo en el disco como un segundo ejecutable, que es
+  trabajo de `xtask`.
+- **La shell del kernel se queda.** El kernel tiene que arrancar sin disco
+  (CLAUDE.md), y sin disco no hay programa de shell. Pasa a ser el camino de
+  reserva, y el marcador que `boot-test` busca sigue siendo suyo para que un
+  arranque sin disco siga siendo comprobable.
+- **Una shell en ring 3 será una espera activa** mientras no haya nada más
+  ejecutable. Medible en el soak, y la deuda que lo arregla es la misma de
+  Fase 5.
 
 ## Incremento 33 — Un programa que abre, lee y escribe ficheros
 

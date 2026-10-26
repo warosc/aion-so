@@ -10,7 +10,14 @@
 /// How many functions the kernel will keep. Enumerating is not allocating
 /// (ADR 0022, point 5): running out is something to say, not something to
 /// grow a `Vec` for in the middle of the boot.
-pub const MAX_DEVICES: usize = 32;
+/// How many PCI functions a scan keeps.
+///
+/// Thirty-two was enough for what QEMU emulates. A real desktop has more —
+/// root ports, several USB controllers, audio, the chipset's own functions
+/// — and an inventory that silently stopped at thirty-two would send
+/// somebody looking for a driver for a device that is not the one they
+/// have. `Devices::lost` says when even this was not enough.
+pub const MAX_DEVICES: usize = 96;
 
 /// A vendor of `0xFFFF` is how the bus says "nothing here": the read is
 /// unclaimed and the bus returns all ones.

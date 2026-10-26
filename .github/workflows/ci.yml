@@ -76,6 +76,27 @@ jobs:
       # (docs/adr/0027-fase4-fat32-write.md, point 10).
       - name: The disk the kernel wrote is still a FAT32 volume
         run: fsck.vfat -n -V target/disk.img
+      # And the event log, read by something that is not this kernel
+      # (docs/adr/0031-fase4-system-event-log.md). `mcopy` is dosfstools'
+      # neighbour in mtools; if the lines are not whole lines, or the ten
+      # boots are not all in there, this is where it shows.
+      - name: The event log is ten boots of whole lines
+        run: |
+          sudo apt-get install -y mtools
+          mcopy -i target/disk.img ::EVENTS.LOG events.log
+          echo "--- the last twelve lines ---"
+          tail -n 12 events.log
+          # Every line is `<boot> <ticks> <word> ...`, and the file ends
+          # where a line ends. A log that stops mid-line lies about the
+          # last event it holds.
+          [ -s events.log ] || { echo "the log is empty"; exit 1; }
+          [ "$(tail -c 1 events.log | xxd -p)" = "0a" ] || {
+            echo "the log does not end at a line break"; exit 1; }
+          grep -qE '^ +10 +[0-9]+ boot +10$' events.log || {
+            echo "boot 10 is not in the log"; exit 1; }
+          grep -vqE '^ +[0-9]+ +[0-9]+ [a-z-]+ ' events.log && {
+            echo "a line is not in the format"; exit 1; } || true
+          echo "lines: $(wc -l < events.log)"
       # Quoted: an unquoted ": " inside the marker would break the YAML.
       - run: 'cargo xtask boot-test --timeout-secs 120 --heap-stress --marker "HARLAN: heap stress complete, 200000 cycles"'
 

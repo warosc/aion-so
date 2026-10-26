@@ -2,8 +2,10 @@
 
 extern crate alloc;
 
+pub mod console;
 #[cfg(target_arch = "x86_64")]
 pub mod devices;
+pub mod events;
 pub mod fs;
 pub mod identity;
 pub mod ipc;
@@ -527,6 +529,22 @@ extern "C" fn continue_in_kernel_space<C: Console + 'static, P: PowerControl + '
 /// back in the pool, and the shell.
 #[cfg(target_arch = "x86_64")]
 fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelContext<C, P>) -> ! {
+    // The console goes to its module, where a syscall can reach it
+    // (docs/adr/0029-fase4-console-and-list-abi.md). Here and not where the
+    // context was built: the trait object formed below carries a vtable
+    // address, and one formed before the kernel moved to the higher half
+    // would name an image that is no longer mapped — which is the reason
+    // `KernelContext` keeps concrete types.
+    //
+    // From this line on, `context.console` is not read again. The module is
+    // the only way to the console, and the kernel's own shell gets it back
+    // through `console::take`.
+    // SAFETY: the console was leaked onto the heap by `kmain`, so it lives
+    // as long as the kernel; this runs after the move to the higher half,
+    // so the vtable address is mapped; and nothing else uses the console
+    // through another reference from here on.
+    unsafe { console::adopt(&raw mut *context.console) };
+
     use harlan_arch_x86_64::paging::DEFAULT_IDENTITY_LIMIT;
 
     // What still runs through the identity map: the kernel's own code and
@@ -933,12 +951,41 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         // (docs/adr/0028-fase4-file-abi-v0.md). The boot
                         // reads the rest of its files through the same
                         // path a program's `open` takes.
-                        fs::adopt(disk, reader, volume);
+                        let ours = fs::adopt(disk, reader, volume);
+                        events::record(events::What::Disk, u64::from(volume.clusters));
+                        // Said out loud, both ways, and recorded. A kernel
+                        // that quietly declined to write would look exactly
+                        // like one whose disk was broken; a kernel that
+                        // quietly wrote to somebody's disk is the thing
+                        // Fase 5 exists to not do
+                        // (docs/adr/0033-fase5-only-our-disk.md).
+                        match volume.volume_id {
+                            Some(id) if ours => info!(
+                                "HARLAN: this disk is ours ({:?}, serial {:#010x}); it may be written to",
+                                id.label(),
+                                id.serial
+                            ),
+                            Some(id) => {
+                                events::record_with(events::What::NotOurs, 0, id.label());
+                                warn!(
+                                    "HARLAN: this disk says it is {:?} with serial {:#010x}, which is not what this kernel's tooling writes; it will be read and never written",
+                                    id.label(),
+                                    id.serial
+                                )
+                            }
+                            None => {
+                                events::record_with(events::What::NotOurs, 0, "unnamed");
+                                warn!(
+                                    "HARLAN: this disk does not say who it is; it will be read and never written"
+                                )
+                            }
+                        }
                         check_backup_boot_sector(&volume, &boot_sector);
                         read_a_file();
                         count_this_boot();
                     }
                     Ok(Err(err)) => {
+                        events::record(events::What::NoDisk, 0);
                         error!("HARLAN: the disk does not hold a FAT32 volume ({err:?})")
                     }
                     Err(err) => error!("HARLAN: the boot sector could not be read ({err:?})"),
@@ -971,38 +1018,12 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
         // before anything is started, because one of the processes is it
         // (docs/adr/0026-fase4-elf-user-programs.md).
         let mut elf_bytes = alloc::vec![0u8; 64 * 1024];
-        let elf = read_user_program(&mut elf_bytes)
-            .and_then(|read| {
-                match harlan_hal::elf::parse(
-                    &elf_bytes[..read],
-                    harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
-                ) {
-                    Ok(program) => {
-                        info!(
-                            "HARLAN: it is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
-                            program.segment_count(),
-                            program.entry,
-                            program.highest_address()
-                        );
-                        for segment in program.segments() {
-                            info!(
-                                "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
-                                segment.at,
-                                segment.file_size,
-                                segment.memory_size,
-                                if segment.readable() { "r" } else { "-" },
-                                if segment.writable() { "w" } else { "-" },
-                                if segment.executable() { "x" } else { "-" }
-                            );
-                        }
-                        Some(program)
-                    }
-                    Err(err) => {
-                        error!("HARLAN: what came off the disk is not a program this kernel loads ({err:?})");
-                        None
-                    }
-                }
-            });
+        let elf = load_program(USER_PROGRAM, &mut elf_bytes);
+        // And the shell, which is the one that does not end
+        // (docs/adr/0030-fase4-shell-in-ring-3.md). Its own buffer: both
+        // are loaded before anything is started, so they cannot share one.
+        let mut shell_bytes = alloc::vec![0u8; 64 * 1024];
+        let shell_elf = load_program(SHELL_PROGRAM, &mut shell_bytes);
 
         // Eight processes, each with a space of its own and a kernel
         // stack of its own.
@@ -1055,9 +1076,14 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             ToStart::Flat(&running_its_stack),
             ToStart::Flat(&lying),
         ];
-        if let Some(program) = &elf {
-            programs.push(ToStart::Elf(program, &elf_bytes));
+        if let Some((program, file)) = &elf {
+            programs.push(ToStart::Elf(program, file));
         }
+        // The shell is **not** in this list. It does not end, so a round
+        // containing it never finishes, and the frame balance below — the
+        // check that says the processes which ended gave back everything
+        // they took — would stop being measured on every boot. It starts
+        // afterwards, in a round of its own.
 
         // What the allocator has before any process exists. Everything
         // taken from here on belongs to a process, and once they are all
@@ -1117,6 +1143,7 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                         // sending to a stranger.
                         Some(slot) if slot == which => {
                             info!("HARLAN: process {which} runs in slot {slot}");
+                            events::record(events::What::Started, slot as u64);
                             started += 1;
                         }
                         Some(slot) => error!(
@@ -1150,9 +1177,12 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
             }
             let free_now = context.frames.free_frames();
             match free_now.cmp(&free_before_any_process) {
-                core::cmp::Ordering::Equal => info!(
-                    "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
-                ),
+                core::cmp::Ordering::Equal => {
+                    events::record(events::What::Frames, returned);
+                    info!(
+                        "HARLAN: {returned} frame(s) back from the processes that ended; the allocator has the {free_now} it started with"
+                    )
+                }
                 core::cmp::Ordering::Less => error!(
                     "HARLAN: {returned} frame(s) back from the processes that ended, but {} are still held; {free_now} free",
                     free_before_any_process - free_now
@@ -1161,6 +1191,91 @@ fn run<C: Console + 'static, P: PowerControl + 'static>(context: &mut KernelCont
                     "HARLAN: {returned} frame(s) back from the processes that ended, which is {} more than they ever took; {free_now} free",
                     free_now - free_before_any_process
                 ),
+            }
+        }
+
+        // The self-test round is over and accounted for, so it is written
+        // down (ADR 0031, point 8). Here and not inside the branch below:
+        // a disk with no `SHELL.ELF` on it still has a disk, and losing a
+        // boot's events because the shell was missing would lose exactly
+        // the boot somebody is asking about.
+        write_events();
+
+        // And now the shell, in a round of its own, because this one does
+        // not end (docs/adr/0030-fase4-shell-in-ring-3.md). Everything
+        // above has finished and been accounted for; from here the machine
+        // belongs to whoever is typing.
+        if let Some((program, file)) = &shell_elf {
+            // A kernel stack of its own, the next one after the ones the
+            // demonstrations used — they are gone, but their stacks were
+            // mapped and this is simpler than reusing one.
+            let stack = memory::stacks::map_with_guard(
+                &mut context.mapper,
+                &mut context.frames,
+                harlan_hal::paging::Page::containing_address(next_stack),
+                memory::stacks::SYSCALL_STACK_PAGES,
+            );
+            let shell_stack = match stack {
+                Ok(stack) => stack,
+                Err(err) => {
+                    error!("HARLAN: no kernel stack for the shell ({err:?})");
+                    // Never returns: the kernel's own shell takes over.
+                    into_the_shell::<C, P>((context as *mut KernelContext<C, P>).cast())
+                }
+            };
+            // SAFETY: the kernel owns its tables and reaches frames through
+            // its own window; nothing else uses what this takes.
+            match unsafe {
+                process::spawn_elf(
+                    &mut context.mapper,
+                    &mut context.frames,
+                    program,
+                    file,
+                    shell_stack,
+                )
+            } {
+                Ok(shell) => {
+                    let shell = alloc::boxed::Box::leak(alloc::boxed::Box::new(shell));
+                    // SAFETY: `spawn_elf` built it, and its kernel stack is
+                    // its own.
+                    match unsafe { scheduler::add(shell) } {
+                        Some(slot) => {
+                            info!("HARLAN: the shell runs in slot {slot}");
+                            events::record(events::What::Shell, slot as u64);
+                            // Again, because the round below does not come
+                            // back while the shell lives: without this the
+                            // line saying a shell started would sit in the
+                            // ring until the machine stopped, which is the
+                            // one moment it cannot be written.
+                            write_events();
+                            harlan_arch_x86_64::interrupts::set_tick_handler(scheduler::on_tick);
+                            harlan_arch_x86_64::interrupts::set_user_fault_handler(user::on_fault);
+                            // SAFETY: the kernel is in its own space, on
+                            // its own stack, and nothing is running.
+                            //
+                            // This does not come back while the shell is
+                            // alive. It does if the shell exits, and then
+                            // the kernel's own takes over below — which is
+                            // what `exit` at the prompt is for.
+                            unsafe { scheduler::run_until_empty(context.mapper.root()) };
+                            // SAFETY: nothing is running on them.
+                            for dead in unsafe { scheduler::dead_processes() } {
+                                // SAFETY: the process is gone and nothing
+                                // is on its stack.
+                                unsafe {
+                                    process::destroy(&mut context.mapper, &mut context.frames, dead)
+                                };
+                            }
+                            events::record(events::What::ShellGone, 0);
+                            write_events();
+                            info!(
+                                "HARLAN: the shell in ring 3 is gone; the kernel's own takes over"
+                            );
+                        }
+                        None => error!("HARLAN: no room in the scheduler for the shell"),
+                    }
+                }
+                Err(err) => error!("HARLAN: the shell could not be started ({err:?})"),
             }
         }
     }
@@ -1187,7 +1302,28 @@ extern "C" fn into_the_shell<C: Console + 'static, P: PowerControl + 'static>(
     // A syscall runs with interrupts off (`FMASK`), and the shell needs
     // the keyboard.
     harlan_arch_x86_64::Cpu.enable();
-    let console = &mut *context.console;
+    // Taken rather than borrowed for each line: the shell loops for ever,
+    // and holding the lock across that loop would leave interrupts disabled
+    // for ever — the keyboard IRQ would never fire and the shell would
+    // never get a key.
+    //
+    // One owner at a time: from here on a syscall finds no console, which is
+    // right, because this runs only when nothing is runnable and a syscall
+    // can only come from a process that is running.
+    let Some(console) = console::take() else {
+        // `run` adopts it and nothing else takes it, so this cannot happen.
+        // If it ever does, the kernel has no shell, and saying so is better
+        // than carrying on as if it had one.
+        error!("HARLAN: there is no console to run a shell on");
+        loop {
+            use harlan_hal::CpuControl;
+            harlan_arch_x86_64::Cpu.halt_once();
+        }
+    };
+    // SAFETY: `take` handed over the only way to the console, so this is the
+    // only reference to it; it points at heap the kernel leaked, which
+    // outlives this function (which never returns).
+    let console = unsafe { &mut *console };
     banner(console);
     shell::run_shell(console, context.power)
 }
@@ -1243,16 +1379,86 @@ fn count_this_boot() {
     let mut text = [0u8; 11];
     let written = write_number(&mut text, this);
     match fs::write_file(NAME, &text[..written]) {
-        Ok(entry) => match before {
-            Some(before) => info!(
-                "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
-                entry.size, entry.first_cluster
-            ),
-            None => info!(
-                "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
-                entry.size, entry.first_cluster
-            ),
+        Ok(entry) => {
+            // The boot number is what stands in for a date: without a wall
+            // clock, "boot 7" is the closest thing to *when* this machine
+            // can say (ADR 0031, point 10).
+            events::this_boot(this);
+            events::record(events::What::Boot, u64::from(this));
+            match before {
+                Some(before) => info!(
+                    "HARLAN: this is boot {this}; {NAME} said {before} and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+                None => info!(
+                    "HARLAN: this is boot {this}; {NAME} was not there and now says {this}, in {} byte(s) from cluster {}",
+                    entry.size, entry.first_cluster
+                ),
+            }
+        }
+        Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
+    }
+}
+
+/// Writes the events of this boot onto what the disk already held.
+///
+/// Read, join, write whole: the only shape ADR 0027 allows, and the one
+/// that makes the file the history of the machine rather than of the last
+/// boot (ADR 0031, point 6).
+///
+/// Everything here is on the stack of a kernel that has a 4 MB heap, so the
+/// two buffers are heap-allocated: 32 KB on a kernel stack with a guard
+/// page either side would be most of it.
+fn write_events() {
+    const NAME: &str = "EVENTS.LOG";
+
+    // What this boot has to say.
+    let mut mine = alloc::vec![0u8; events::EVENTS * events::LINE];
+    let mine_len = events::copy_into(&mut mine);
+
+    // What was already there. A missing file is not a failure: the first
+    // boot of a fresh disk has nothing to add to.
+    let mut old = alloc::vec![0u8; events::MAX_FILE];
+    let old_len = match fs::find(NAME) {
+        Ok(entry) => match fs::read_file(&entry, &mut old) {
+            Ok(read) => read,
+            Err(err) => {
+                error!("HARLAN: {NAME} is there and could not be read ({err:?})");
+                0
+            }
         },
+        Err(fs::FileError::NoSuchFile) => 0,
+        Err(err) => {
+            error!("HARLAN: {NAME} could not be looked up ({err:?})");
+            return;
+        }
+    };
+
+    let mut joined = alloc::vec![0u8; events::MAX_FILE];
+    let len = events::join(
+        &old[..old_len],
+        &mine[..mine_len],
+        events::MAX_FILE,
+        &mut joined,
+    );
+    match fs::write_file(NAME, &joined[..len]) {
+        Ok(entry) => {
+            let (kept, lost) = events::counted();
+            if lost > 0 {
+                warn!(
+                    "HARLAN: {NAME} is {} byte(s); {kept} event(s) recorded this boot and {lost} lost to the ring before they could be written",
+                    entry.size
+                );
+            } else {
+                // `mine_len` and not the count of events this boot: a
+                // second flush writes only what the first left, and saying
+                // otherwise would be the log describing itself wrongly.
+                info!(
+                    "HARLAN: {NAME} is {} byte(s); {mine_len} new byte(s) appended, {kept} event(s) recorded this boot",
+                    entry.size
+                );
+            }
+        }
         Err(err) => error!("HARLAN: {NAME} could not be written ({err:?})"),
     }
 }
@@ -1291,27 +1497,76 @@ enum ToStart<'a> {
     Elf(&'a harlan_hal::elf::Program, &'a [u8]),
 }
 
+/// The name of the program that demonstrates the ABI, and of the shell.
+const USER_PROGRAM: &str = "HELLO.ELF";
+const SHELL_PROGRAM: &str = "SHELL.ELF";
+
+/// Reads a program off the disk into `into` and parses it.
+///
+/// One function rather than a block per program: the second copy of a
+/// sequence of checks is where one of them gets left out.
+///
+/// `None`, with a line saying why, for a disk that is not there, a file
+/// that is not there, one too big for the buffer, or one that is not a
+/// program this kernel loads. A kernel that could not load a program
+/// still boots; it just has one process fewer.
+fn load_program<'a>(
+    name: &str,
+    into: &'a mut [u8],
+) -> Option<(harlan_hal::elf::Program, &'a [u8])> {
+    let read = read_program(name, into)?;
+    match harlan_hal::elf::parse(
+        &into[..read],
+        harlan_arch_x86_64::paging::KERNEL_SPACE_START.as_u64(),
+    ) {
+        Ok(program) => {
+            info!(
+                "HARLAN: {name} is an ELF with {} loadable segment(s), entry {:#x}, reaching {:#x}",
+                program.segment_count(),
+                program.entry,
+                program.highest_address()
+            );
+            for segment in program.segments() {
+                info!(
+                    "HARLAN:   segment at {:#x}, {} byte(s) of file and {} of memory, {}{}{}",
+                    segment.at,
+                    segment.file_size,
+                    segment.memory_size,
+                    if segment.readable() { "r" } else { "-" },
+                    if segment.writable() { "w" } else { "-" },
+                    if segment.executable() { "x" } else { "-" }
+                );
+            }
+            events::record_with(events::What::Loaded, read as u64, name);
+            Some((program, &into[..read]))
+        }
+        Err(err) => {
+            error!("HARLAN: {name} is not a program this kernel loads ({err:?})");
+            None
+        }
+    }
+}
+
 /// Reads the user program off the disk, as bytes.
 ///
 /// Answers `None` and says why if it is not there or cannot be read: a
 /// kernel whose disk failed has no user program, and that has to be a line
 /// in the log rather than a boot that carries on as if it had one.
-fn read_user_program(into: &mut [u8]) -> Option<usize> {
-    const NAME: &str = "HELLO.ELF";
-    let entry = match fs::find(NAME) {
+fn read_program(name: &str, into: &mut [u8]) -> Option<usize> {
+    let entry = match fs::find(name) {
         Ok(entry) => entry,
         Err(err) => {
-            error!("HARLAN: no program can be loaded: {NAME} ({err:?})");
+            error!("HARLAN: {name} cannot be loaded ({err:?})");
             return None;
         }
     };
     match fs::read_file(&entry, into) {
         Ok(read) => {
-            info!("HARLAN: {NAME} is {read} byte(s), read off the disk");
+            info!("HARLAN: {name} is {read} byte(s), read off the disk");
             Some(read)
         }
         Err(err) => {
-            error!("HARLAN: {NAME} could not be read ({err:?})");
+            error!("HARLAN: {name} could not be read ({err:?})");
             None
         }
     }

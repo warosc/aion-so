@@ -301,6 +301,14 @@ pub enum ReadError {
     Failed { status: u8 },
     /// It said it wrote a different number of bytes than were asked for.
     ShortRead { written: u32 },
+    /// Nothing was sent: this is not a disk this kernel writes to
+    /// (docs/adr/0033-fase5-only-our-disk.md).
+    ///
+    /// Here, at the device, and not only where files are written. The file
+    /// layer has its own check and a better message, and this is the one
+    /// that cannot be gone around: every byte that would reach a platter
+    /// passes through `write_sector`.
+    NotOurDisk,
 }
 
 /// A disk with a queue, ready to be asked for sectors.

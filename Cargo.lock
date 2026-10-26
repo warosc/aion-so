@@ -292,6 +292,9 @@ version = "0.0.1"
 [[package]]
 name = "harlan-hello"
 version = "0.0.1"
+dependencies = [
+ "harlan-user-abi",
+]
 
 [[package]]
 name = "harlan-kernel"
@@ -300,6 +303,17 @@ dependencies = [
  "harlan-arch-x86_64",
  "harlan-hal",
 ]
+
+[[package]]
+name = "harlan-shell"
+version = "0.0.1"
+dependencies = [
+ "harlan-user-abi",
+]
+
+[[package]]
+name = "harlan-user-abi"
+version = "0.0.1"
 
 [[package]]
 name = "heck"
